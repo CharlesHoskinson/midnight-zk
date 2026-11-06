@@ -147,8 +147,7 @@ impl<F: CircuitField> RangeCheckChip<F> {
     /// - in `(3T, 4T]`, or
     /// - a multiple of `4T`.
     pub fn is_supported_bound(&self, n: usize) -> bool {
-        let t = self.config.max_bit_len;
-        n <= t || (3 * t < n && n <= 4 * t) || n.is_multiple_of(4 * t)
+        is_supported_bound(self.config.max_bit_len, n)
     }
 
     /// Asserts that `x` lies in `[0, 2^n)`.
@@ -641,6 +640,13 @@ struct Group<F: CircuitField> {
     lanes: Vec<AssignedNative<F>>,
     out: AssignedNative<F>,
     link: bool,
+}
+
+/// Whether a chip of the given `max_bit_len` takes the bound `2^n`, see
+/// [RangeCheckChip::is_supported_bound].
+pub fn is_supported_bound(max_bit_len: usize, n: usize) -> bool {
+    let t = max_bit_len;
+    n <= t || (3 * t < n && n <= 4 * t) || n.is_multiple_of(4 * t)
 }
 
 /// The value of the bits of `x` from position `from` on: `len` of them if
