@@ -84,6 +84,11 @@ impl<F: CircuitField> Blake2bWrapper<F> {
         key: &[AssignedByte<F>],
         output_size: usize,
     ) -> Result<[AssignedByte<F>; 64], Error> {
+        // The external chip takes cells, so bytes that are not assigned to a cell
+        // yet are assigned first.
+        let bytes: Vec<AssignedNative<F>> =
+            input.iter().chain(key).map(AssignedNative::from).collect();
+        self.native_gadget.native_chip.materialize(layouter, &bytes)?;
         let to_cell = |b: &AssignedByte<F>| AssignedCell::from(&AssignedNative::from(b));
         let input = &input.iter().map(to_cell).collect::<Vec<_>>();
         let key = &key.iter().map(to_cell).collect::<Vec<_>>();

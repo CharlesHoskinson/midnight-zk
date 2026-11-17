@@ -300,10 +300,13 @@ impl<F: CircuitField> ComposableChip<F> for RangeCheckChip<F> {
             vec![(tags, t_tag), (vals, t_val)]
         });
 
-        // Every group `k` enforces
-        //   out_k = l_{4k} + b l_{4k+1} + b^2 l_{4k+2} + b^3 l_{4k+3} + link_k * out_{k+1},
-        // where `out_G` is `out_0` of the next row. The sum is computed in Horner
-        // form, from the last lane down.
+        // Every group `k` enforces the identity of the module documentation:
+        //
+        //   out_k = l_{4k} + b l_{4k+1} + b^2 l_{4k+2} + b^3 l_{4k+3}
+        //         + link_k * out_{k+1},
+        //
+        // where `out_G` is `out_0` of the next row. The sum of the lanes is
+        // computed in Horner form, from the last lane down.
         meta.create_gate("range-check groups", |meta| {
             let b = meta.query_fixed(base, Rotation::cur());
             let ids = (0..num_groups)
