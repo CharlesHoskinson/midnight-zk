@@ -22,9 +22,7 @@ use blake2b::{
 };
 use midnight_circuits::{CircuitField, ComposableChip, field::AssignedNative, types::AssignedByte};
 #[cfg(test)]
-use midnight_circuits::{
-    field::decomposition::chip::P2RDecompositionConfig, testing_utils::FromScratch,
-};
+use midnight_circuits::{field::NativeGadgetConfig, testing_utils::FromScratch};
 #[cfg(test)]
 use midnight_proofs::plonk::Instance;
 use midnight_proofs::{
@@ -121,7 +119,7 @@ impl<F: CircuitField> Blake2bWrapper<F> {
 
 #[cfg(test)]
 impl<F: CircuitField> FromScratch<F> for Blake2bWrapper<F> {
-    type Config = (Blake2bConfig, P2RDecompositionConfig);
+    type Config = (Blake2bConfig, NativeGadgetConfig);
 
     fn new_from_scratch(config: &Self::Config) -> Self {
         let native_gadget = NG::new_from_scratch(&config.1);
@@ -285,7 +283,7 @@ mod test {
                 AssignedByte<Fq>,
                 [AssignedByte<Fq>; 64],
                 Blake2b512<Fq>,
-                NativeGadget<Fq, _, _>,
+                NativeGadget<Fq>,
             >(cost_model, "Blake2b_512", input_size);
         }
 
@@ -318,7 +316,7 @@ mod test {
                 AssignedByte<Fq>,
                 [AssignedByte<Fq>; 32],
                 Blake2b256<Fq>,
-                NativeGadget<Fq, _, _>,
+                NativeGadget<Fq>,
             >(cost_model, "Blake2b_256", input_size);
         }
 
