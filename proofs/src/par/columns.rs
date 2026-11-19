@@ -11,8 +11,10 @@
 // See the License for the specific language governing permissions and
 // limitations under the License.
 
-//! Column-wise passes over whole polynomials: the inversion of assigned
-//! rational columns and the delta encodings of Lagrange columns.
+//! Column-wise passes over whole polynomials: the cut of
+//! `crate::utils::arithmetic::parallelize`, the inversion of assigned
+//! rational columns, the delta encodings of Lagrange columns, and (with the
+//! feature `gpu`) the copy of the quotient into its erasing limbs.
 //!
 //! Every output element is computed from the inputs alone, independently of
 //! the other output elements, so splitting the columns into chunks across
@@ -24,36 +26,32 @@ use rayon::{
     slice::{ParallelSlice, ParallelSliceMut},
 };
 
+use super::{PARALLELIZE_CHUNKS_PER_THREAD, PARALLELIZE_MIN_CHUNK};
 use crate::{
     poly::{LagrangeCoeff, Polynomial},
     utils::rational::Rational,
 };
 
-/// Rows per parallel task.
-const ROWS: usize = 1 << 12;
+/// Rows per task.
+pub(super) const CHUNK: usize = 1 << 12;
 
-/// Shorter columns are delta-encoded by the stock code.
-pub(crate) const PAR_MIN_LEN: usize = 1 << 14;
-
-/// Chunks per thread of [`parallelize`].
-const CHUNKS_PER_THREAD: usize = 4;
-
-/// The shortest chunk of [`parallelize`].
-const MIN_CHUNK: usize = 1 << 10;
+/// Elements per task of [`copy_from_slice`].
+#[cfg(feature = "gpu")]
+const COPY_CHUNK: usize = 1 << 14;
 
 /// `crate::utils::arithmetic::parallelize` on a long slice: calls `f` on
 /// consecutive chunks of `v` with the offset of each chunk, as the stock
-/// function does, but with [`CHUNKS_PER_THREAD`] chunks per thread of the
-/// pool instead of one, so that a thread that finishes early (a faster
-/// core, or one not shared with another process) takes over more chunks.
-/// Every element is passed to `f` exactly once, with its offset, so a
-/// callback that is correct for the stock cut, which varies with the
-/// thread count, gives the same values. Returns `false`, having done
-/// nothing, when `v` is too short to cut into chunks of [`MIN_CHUNK`]
-/// elements (the stock cut is used then).
+/// function does, with [`PARALLELIZE_CHUNKS_PER_THREAD`] chunks per thread
+/// of the pool instead of one. Every element is passed to `f` exactly once,
+/// with its offset, so a callback that is correct for the stock cut (which
+/// itself varies with the thread count) gives the same values.
+///
+/// Returns `false`, having done nothing, when the pool has one thread or the
+/// chunks would be shorter than [`PARALLELIZE_MIN_CHUNK`]: the caller then
+/// takes the stock cut.
 pub(crate) fn parallelize<T: Send, F: Fn(&mut [T], usize) + Sync>(v: &mut [T], f: &F) -> bool {
-    let chunks = rayon::current_num_threads() * CHUNKS_PER_THREAD;
-    if chunks <= CHUNKS_PER_THREAD || v.len() < chunks * MIN_CHUNK {
+    let chunks = rayon::current_num_threads() * PARALLELIZE_CHUNKS_PER_THREAD;
+    if chunks <= PARALLELIZE_CHUNKS_PER_THREAD || v.len() < chunks * PARALLELIZE_MIN_CHUNK {
         return false;
     }
     let chunk = v.len().div_ceil(chunks);
@@ -62,17 +60,16 @@ pub(crate) fn parallelize<T: Send, F: Fn(&mut [T], usize) + Sync>(v: &mut [T], f
 }
 
 /// `crate::poly::batch_invert_rational`, over the BLS12-381 scalar field
-/// (the caller checks the field; see `crate::par::invert`).
+/// (the caller checks the field, see `crate::par::invert`).
 ///
-/// Stock inverts the denominators of all columns in one batch and then
-/// multiplies each numerator by the inverse of its denominator, or by one
-/// when the value has no denominator. Here each chunk of `ROWS` rows of a
-/// column inverts its own denominators in one batch: an inverse is unique
-/// and a zero denominator stays zero (as in `ff::BatchInvert`), so every
-/// inverse is the stock one. A value without a denominator keeps its
-/// numerator, which is the stock product `numerator * 1` (multiplication by
-/// one is exact in a prime field and the field keeps reduced
-/// representations, so the limbs are the same too).
+/// The stock function inverts the denominators of all columns in one batch,
+/// then multiplies each numerator by the inverse of its denominator, or by
+/// one when the value has no denominator. Here each chunk of [`CHUNK`] rows
+/// of a column inverts its own denominators in one batch. An inverse is
+/// unique and a zero denominator stays zero (as in `ff::BatchInvert`), so
+/// every inverse is the stock one. A value without a denominator keeps its
+/// numerator, which equals the stock product `numerator * 1`; the field keeps
+/// reduced representations, so the limbs are the same too.
 pub(crate) fn batch_invert_rational<F: Field>(
     assigned: Vec<Polynomial<Rational<F>, LagrangeCoeff>>,
 ) -> Vec<Polynomial<F, LagrangeCoeff>> {
@@ -80,7 +77,7 @@ pub(crate) fn batch_invert_rational<F: Field>(
         .par_iter()
         .map(|poly| {
             let mut values: Vec<F> = poly.values.par_iter().map(Rational::numerator).collect();
-            values.par_chunks_mut(ROWS).zip(poly.values.par_chunks(ROWS)).for_each_init(
+            values.par_chunks_mut(CHUNK).zip(poly.values.par_chunks(CHUNK)).for_each_init(
                 Vec::new,
                 |denoms: &mut Vec<F>, (out, rationals)| {
                     denoms.clear();
@@ -107,11 +104,11 @@ pub(crate) fn batch_invert_rational<F: Field>(
 }
 
 /// `Polynomial::to_delta`, in parallel chunks: element `i` is the stock
-/// expression `a_i - a_{i-1}` (and `a_0` first).
+/// expression `a_i - a_{i-1}` (`a_0` for the first).
 pub(crate) fn to_delta<F: Field>(a: &[F]) -> Vec<F> {
     let mut out: Vec<F> = a.par_iter().map(|_| F::ZERO).collect();
-    out.par_chunks_mut(ROWS).enumerate().for_each(|(c, chunk)| {
-        let start = c * ROWS;
+    out.par_chunks_mut(CHUNK).enumerate().for_each(|(c, chunk)| {
+        let start = c * CHUNK;
         for (j, out) in chunk.iter_mut().enumerate() {
             let i = start + j;
             *out = if i == 0 { a[0] } else { a[i] - a[i - 1] };
@@ -121,12 +118,12 @@ pub(crate) fn to_delta<F: Field>(a: &[F]) -> Vec<F> {
 }
 
 /// `Polynomial::to_double_delta`, in parallel chunks: element `i` is the
-/// stock expression `a_i - 2 a_{i-1} + a_{i-2}` (and `a_0`, `a_1 - 2 a_0`
-/// first), evaluated in the stock order.
+/// stock expression `a_i - 2 a_{i-1} + a_{i-2}` (`a_0` and `a_1 - 2 a_0` for
+/// the first two), evaluated in the stock order.
 pub(crate) fn to_double_delta<F: Field>(a: &[F]) -> Vec<F> {
     let mut out: Vec<F> = a.par_iter().map(|_| F::ZERO).collect();
-    out.par_chunks_mut(ROWS).enumerate().for_each(|(c, chunk)| {
-        let start = c * ROWS;
+    out.par_chunks_mut(CHUNK).enumerate().for_each(|(c, chunk)| {
+        let start = c * CHUNK;
         for (j, out) in chunk.iter_mut().enumerate() {
             let i = start + j;
             *out = match i {
@@ -139,37 +136,42 @@ pub(crate) fn to_double_delta<F: Field>(a: &[F]) -> Vec<F> {
     out
 }
 
+/// Copies `src` into `dst` in parallel chunks of [`COPY_CHUNK`] elements.
+///
+/// # Panics
+///
+/// If the lengths differ, as `slice::copy_from_slice`.
+#[cfg(feature = "gpu")]
+pub(crate) fn copy_from_slice<T: Copy + Send + Sync>(dst: &mut [T], src: &[T]) {
+    assert_eq!(
+        dst.len(),
+        src.len(),
+        "copy between slices of different lengths"
+    );
+    dst.par_chunks_mut(COPY_CHUNK)
+        .zip(src.par_chunks(COPY_CHUNK))
+        .for_each(|(dst, src)| dst.copy_from_slice(src));
+}
+
 #[cfg(test)]
 mod tests {
     use std::marker::PhantomData;
 
-    use ff::{BatchInvert, Field};
+    use ff::Field;
     use midnight_curves::Fq;
     use rand_chacha::ChaCha20Rng;
     use rand_core::{RngCore, SeedableRng};
 
     use super::*;
-
-    /// The stock code of `crate::poly::batch_invert_rational`, verbatim.
-    fn stock_batch_invert_rational<F: Field>(
-        assigned: Vec<Polynomial<Rational<F>, LagrangeCoeff>>,
-    ) -> Vec<Polynomial<F, LagrangeCoeff>> {
-        let mut assigned_denominators: Vec<_> = assigned
-            .iter()
-            .map(|f| f.iter().map(|value| value.denominator()).collect::<Vec<_>>())
-            .collect();
-        assigned_denominators
-            .iter_mut()
-            .flat_map(|f| f.iter_mut().filter_map(|d| d.as_mut()))
-            .batch_invert();
-        assigned
-            .iter()
-            .zip(assigned_denominators)
-            .map(|(poly, inv_denoms)| {
-                poly.invert(inv_denoms.into_iter().map(|d| d.unwrap_or(F::ONE)))
-            })
-            .collect()
-    }
+    use crate::{
+        par::{
+            DELTA_MIN_LEN,
+            testing::{
+                in_pool, stock_batch_invert_rational, stock_to_delta, stock_to_double_delta,
+            },
+        },
+        poly::batch_invert_rational as dispatched_batch_invert_rational,
+    };
 
     fn random_rational(rng: &mut ChaCha20Rng, mix: u32) -> Rational<Fq> {
         match rng.next_u32() % mix {
@@ -183,10 +185,9 @@ mod tests {
         }
     }
 
-    fn in_pool<R: Send>(threads: usize, f: impl FnOnce() -> R + Send) -> R {
-        rayon::ThreadPoolBuilder::new().num_threads(threads).build().unwrap().install(f)
-    }
-
+    /// Columns of every kind of value (zero denominators included), across
+    /// chunk boundaries, with one and many threads, and through the crate
+    /// function that dispatches here.
     #[test]
     fn batch_invert_rational_matches_stock() {
         let mut rng = ChaCha20Rng::seed_from_u64(0x1a);
@@ -194,10 +195,10 @@ mod tests {
             (0usize, 0usize, 7u32),
             (1, 1, 7),
             (3, 17, 7),
-            (2, ROWS - 1, 7),
-            (4, ROWS + 3, 7),
-            (3, 3 * ROWS + 5, 2),
-            (2, 2 * ROWS, 1),
+            (2, CHUNK - 1, 7),
+            (4, CHUNK + 3, 7),
+            (3, 3 * CHUNK + 5, 2),
+            (2, 2 * CHUNK, 1),
             (5, 20_000, 7),
         ] {
             let assigned: Vec<Polynomial<Rational<Fq>, LagrangeCoeff>> = (0..cols)
@@ -214,25 +215,21 @@ mod tests {
                     assert_eq!(p.values, s.values, "cols {cols} n {n} threads {threads}");
                 }
             }
-            // and through the crate function, which dispatches here
-            let dispatched = crate::poly::batch_invert_rational(assigned);
+            let dispatched = dispatched_batch_invert_rational(assigned);
             for (p, s) in dispatched.iter().zip(&stock) {
                 assert_eq!(p.values, s.values);
             }
         }
     }
 
+    /// Every element is passed once with its offset, on both sides of the
+    /// floor and with one and many threads, here and through the crate
+    /// function that dispatches here.
     #[test]
     fn parallelize_passes_every_element_once_with_its_offset() {
         for threads in [1usize, 2, 7, 16] {
-            for n in [
-                0usize,
-                1,
-                100,
-                threads * CHUNKS_PER_THREAD * MIN_CHUNK - 1,
-                threads * CHUNKS_PER_THREAD * MIN_CHUNK,
-                300_017,
-            ] {
+            let floor = threads * PARALLELIZE_CHUNKS_PER_THREAD * PARALLELIZE_MIN_CHUNK;
+            for n in [0usize, 1, 100, floor - 1, floor, 300_017] {
                 let mut v = vec![(0usize, 0u32); n];
                 let took = in_pool(threads, || {
                     parallelize(&mut v, &|part: &mut [(usize, u32)], start: usize| {
@@ -246,7 +243,6 @@ mod tests {
                 } else {
                     assert!(v.iter().all(|x| x.1 == 0));
                 }
-                // through the crate function, at every length
                 let mut w = vec![(0usize, 0u32); n];
                 in_pool(threads, || {
                     crate::utils::arithmetic::parallelize(&mut w, |part, start| {
@@ -260,6 +256,9 @@ mod tests {
         }
     }
 
+    /// Both encodings across chunk boundaries and the floor, with one and
+    /// many threads, here and through the `Polynomial` methods that dispatch
+    /// here.
     #[test]
     fn delta_encodings_match_stock() {
         let mut rng = ChaCha20Rng::seed_from_u64(0x1b);
@@ -268,31 +267,17 @@ mod tests {
             1,
             2,
             3,
-            ROWS - 1,
-            ROWS,
-            ROWS + 1,
-            2 * ROWS + 2,
+            CHUNK - 1,
+            CHUNK,
+            CHUNK + 1,
+            2 * CHUNK + 2,
+            DELTA_MIN_LEN - 1,
+            DELTA_MIN_LEN,
             50_001,
         ] {
             let values: Vec<Fq> = (0..n).map(|_| Fq::random(&mut rng)).collect();
-            // the stock bodies, verbatim
-            let mut delta = Vec::with_capacity(n);
-            if n >= 1 {
-                delta.push(values[0]);
-            }
-            for i in 1..n {
-                delta.push(values[i] - values[i - 1]);
-            }
-            let mut double = Vec::with_capacity(n);
-            if n >= 1 {
-                double.push(values[0]);
-            }
-            if n >= 2 {
-                double.push(values[1] - values[0].double());
-            }
-            for i in 2..n {
-                double.push(values[i] - values[i - 1].double() + values[i - 2]);
-            }
+            let delta = stock_to_delta(&values);
+            let double = stock_to_double_delta(&values);
             for threads in [1, 5] {
                 assert_eq!(in_pool(threads, || to_delta(&values)), delta, "n {n}");
                 assert_eq!(

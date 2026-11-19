@@ -5,7 +5,8 @@ use rayon::iter::{
     IndexedParallelIterator, IntoParallelIterator, IntoParallelRefIterator, ParallelIterator,
 };
 
-#[cfg_attr(feature = "prover-par", allow(unused_imports))]
+#[cfg(not(feature = "prover-par"))]
+use crate::utils::arithmetic::eval_polynomial;
 use crate::{
     plonk::{
         AbsorbedVk, ConstraintSystem, Error,
@@ -16,7 +17,6 @@ use crate::{
         ProverQuery, Rotation, commitment::PolynomialCommitmentScheme,
     },
     transcript::{Hashable, Transcript},
-    utils::arithmetic::eval_polynomial,
 };
 
 #[derive(Debug)]
@@ -232,13 +232,9 @@ impl<F: PrimeField> Committed<F, Coeff> {
             })
             .collect();
         // With the feature `prover-par`, all evaluations of the group are
-        // computed at once, in tasks of bounded size, and gathered in the
-        // same map: the same values (see `crate::par::open`).
-        //
-        // As the stock `zip`, only the labels that have a polynomial are
-        // evaluated (the pairs stop at the shorter of the two lists), and
-        // each point takes the evaluation of its own job: `eval_many`
-        // returns one value per job, in order.
+        // computed at once, in tasks of bounded size (see `crate::par::open`).
+        // As with the stock `zip`, only the labels that have a polynomial are
+        // evaluated; `eval_many` returns one value per job, in order.
         #[cfg(feature = "prover-par")]
         let evals_map: BTreeMap<PolynomialLabel, Vec<Evaluation<F>>> = {
             type Pair<'p, F> = (&'p PolynomialLabel, &'p Polynomial<F, Coeff>, Vec<F>);

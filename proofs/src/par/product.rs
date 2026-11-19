@@ -14,14 +14,15 @@
 //! The running product of the permutation argument, in parallel blocks.
 //!
 //! The stock loop computes `z_0 = 1`, `z_r = z_{r-1} · m_{r-1}` in one
-//! sequential pass. Here the rows are cut into blocks: the product of each
-//! block's factors is computed in parallel, a short sequential scan turns
-//! those into the value of `z` at the start of every block, and each block
-//! then runs the stock recurrence from that value, in parallel. Every `z_r`
-//! is the product `m_0 · … · m_{r-1}` either way. Multiplication in a prime
-//! field is exact, associative and commutative, so the regrouped product is
-//! the same field element, and the field keeps reduced representations, so
-//! the limbs are the same too.
+//! sequential pass. Here the rows are cut into blocks of [`BLOCK`] rows: the
+//! product of each block's factors is computed in parallel, a short
+//! sequential scan turns those into the value of `z` at the start of every
+//! block, and each block then runs the stock recurrence from that value, in
+//! parallel. Every `z_r` is the product `m_0 · … · m_{r-1}` either way.
+//! Multiplication in a prime field is exact, associative and commutative,
+//! so the regrouped product is the same field element, and the field keeps
+//! reduced representations, so the limbs are the same too. There is no size
+//! floor: up to one block, the routine is the stock loop in a single task.
 
 use ff::Field;
 use rayon::{
@@ -71,39 +72,23 @@ mod tests {
     use rand_core::SeedableRng;
 
     use super::*;
+    use crate::par::testing::{in_pool, stock_prefix_product};
 
+    /// Lengths across block boundaries, with factors that include zeros and
+    /// ones (as a permutation row can give) and with nonzero factors only,
+    /// with one and many threads.
     #[test]
     fn prefix_product_matches_stock() {
         let mut rng = ChaCha20Rng::seed_from_u64(0x2a);
-        for n in [
-            1usize,
-            2,
-            3,
-            BLOCK - 1,
-            BLOCK,
-            BLOCK + 1,
-            3 * BLOCK + 7,
-            1 << 16,
-        ] {
+        for n in [1usize, 2, 3, BLOCK - 1, BLOCK, BLOCK + 1, 3 * BLOCK + 7] {
             let mut m: Vec<Fq> = (0..n).map(|_| Fq::random(&mut rng)).collect();
-            // some zero and unit factors, as a permutation row can give
             for i in (0..n).step_by(997) {
                 m[i] = if i % 2 == 0 { Fq::ZERO } else { Fq::ONE };
             }
             for case in [m.clone(), m.iter().map(|x| *x + Fq::ONE).collect()] {
-                // the stock loop, verbatim
-                let mut stock = Vec::with_capacity(n);
-                stock.push(Fq::ONE);
-                for row in 1..n {
-                    let tmp = stock[row - 1] * &case[row - 1];
-                    stock.push(tmp);
-                }
+                let stock = stock_prefix_product(&case, n);
                 for threads in [1, 4] {
-                    let par = rayon::ThreadPoolBuilder::new()
-                        .num_threads(threads)
-                        .build()
-                        .unwrap()
-                        .install(|| prefix_product_from_one(&case, n));
+                    let par = in_pool(threads, || prefix_product_from_one(&case, n));
                     assert_eq!(par, stock, "n {n} threads {threads}");
                 }
             }

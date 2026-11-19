@@ -64,24 +64,25 @@ struct SendPtr(*mut u8);
 unsafe impl Send for SendPtr {}
 
 /// Zeroes `bytes` bytes at `ptr` with volatile writes that the compiler
-/// cannot remove.
+/// cannot remove: the zeroed memory is not read again before it is freed,
+/// so plain writes to it could be removed as dead stores.
 ///
 /// The writes are 8-byte words where the address is aligned (single bytes
 /// at the unaligned ends). A range of at least [`PAR_ZERO_BYTES`] is cut
 /// into contiguous parts, one per thread, of at least [`PAR_ZERO_BYTES`]
 /// each, cut at multiples of [`ZERO_TASK_BYTES`]; the calling thread zeroes
-/// the first part and threads of its own (scoped OS threads, at most
-/// [`MAX_ZERO_THREADS`] in all, never the rayon pool) zero the others. Every
-/// write is volatile and followed by a compiler fence on its thread, and
-/// this function returns only once every thread has been joined (the join
-/// orders their writes before the return), so the whole range is zero when
-/// it returns, as with one thread. A part whose thread cannot be spawned is
-/// zeroed on the calling thread; no part is skipped and nothing panics.
+/// the first part and scoped OS threads of its own (at most
+/// [`MAX_ZERO_THREADS`] in all) zero the others. Every write is volatile and
+/// followed by a compiler fence on its thread, and this function returns
+/// only once every thread has been joined (the join orders their writes
+/// before the return), so the whole range is zero when it returns, as with
+/// one thread. A part whose thread cannot be spawned is zeroed on the
+/// calling thread; no part is skipped and nothing panics.
 ///
-/// The parallel zeroing does not use the rayon pool: this runs in `Drop`,
-/// where the dropping thread may hold a lock. Waiting on pool tasks would
-/// let the dropping thread, a pool worker, run other pending pool tasks
-/// (work stealing) that may take the same lock, and would let the zeroing
+/// The zeroing does not use the rayon pool: this runs in `Drop`, where the
+/// dropping thread may hold a lock. Waiting on pool tasks would let the
+/// dropping thread, if it is a pool worker, run other pending pool tasks
+/// (work stealing) that may take the same lock, and would make the zeroing
 /// wait for workers that are themselves blocked on that lock. The threads
 /// here run only the zeroing and take no lock.
 ///
@@ -589,14 +590,14 @@ mod tests {
         }
     }
 
-    /// An erasure from a pool worker that holds a lock, with a task of the
-    /// same pool that takes that lock queued behind it, completes, and the
-    /// task runs once the lock is released. (Whether an erasure on the pool
-    /// would run the task while waiting depends on scheduling, so this
-    /// exercises the case rather than proving its absence; the erasure takes
-    /// no pool thread by construction, see `zero_bytes`.)
+    /// Called from the only worker of a pool while it holds a lock that a
+    /// task queued on that pool takes, the zeroing completes and the task
+    /// runs once the lock is released. This pins that the zeroing does not
+    /// wait on the pool; it cannot show that the pool would steal the task
+    /// (that depends on scheduling), which `zero_bytes` avoids by not using
+    /// the pool at all.
     #[test]
-    fn zero_bytes_under_a_lock_does_not_run_pool_tasks() {
+    fn zero_bytes_on_a_pool_worker_holding_a_lock() {
         use std::sync::{Mutex, mpsc};
 
         static LOCK: Mutex<()> = Mutex::new(());
@@ -615,19 +616,6 @@ mod tests {
             drop(guard);
         });
         done_rx.recv().unwrap();
-        assert!(buf.iter().all(|b| *b == 0));
-    }
-
-    /// From inside a pool of one thread too (no other worker to run the
-    /// tasks), the zeroing completes.
-    #[test]
-    fn zero_bytes_in_a_single_thread_pool() {
-        let bytes = 2 * super::PAR_ZERO_BYTES + 3;
-        let mut buf = vec![0xffu8; bytes];
-        rayon::ThreadPoolBuilder::new().num_threads(1).build().unwrap().install(|| {
-            // SAFETY: the whole buffer.
-            unsafe { zero_bytes(buf.as_mut_ptr(), bytes) };
-        });
         assert!(buf.iter().all(|b| *b == 0));
     }
 }

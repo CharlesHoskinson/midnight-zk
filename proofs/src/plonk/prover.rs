@@ -11,16 +11,17 @@ use rayon::iter::{
     IndexedParallelIterator, IntoParallelIterator, IntoParallelRefIterator, ParallelIterator,
 };
 
-#[cfg_attr(feature = "prover-par", allow(unused_imports))]
+#[cfg(not(feature = "prover-par"))]
+use super::circuit::FloorPlanner;
 use super::{
     Error, ProvingKey,
     circuit::{
-        Advice, Any, Assignment, Circuit, Column, ConstraintSystem, Fixed, FloorPlanner, Instance,
-        Selector,
+        Advice, Any, Assignment, Circuit, Column, ConstraintSystem, Fixed, Instance, Selector,
     },
     logup,
 };
-#[cfg_attr(feature = "prover-par", allow(unused_imports))]
+#[cfg(not(feature = "prover-par"))]
+use crate::utils::arithmetic::eval_polynomial;
 use crate::{
     circuit::Value,
     plonk::{ProofField, argument, traces::ProverTrace},
@@ -29,10 +30,7 @@ use crate::{
         ProverQuery, Rotation, batch_invert_rational, commitment::PolynomialCommitmentScheme,
     },
     transcript::{Hashable, Transcript},
-    utils::{
-        arithmetic::{eval_polynomial, eval_polynomial_seq},
-        rational::Rational,
-    },
+    utils::{arithmetic::eval_polynomial_seq, rational::Rational},
 };
 
 #[cfg(feature = "committed-instances")]
@@ -416,8 +414,8 @@ where
         quotient_committed.poly(&h0).expect("a quotient limb h_0"),
         x,
     );
-    // With the feature `prover-par`, the same evaluation in tasks of bounded
-    // size (see `crate::par::open`).
+    // With the feature `prover-par`, in tasks of bounded size (see
+    // `crate::par::open`).
     #[cfg(feature = "prover-par")]
     let h0_eval = crate::par::open::eval_many(&[(
         &quotient_committed.poly(&h0).expect("a quotient limb h_0").values[..],
@@ -596,10 +594,9 @@ where
         pk.region_starts.as_deref(),
     )?;
     // With the feature `prover-par`, a key without a layout from keygen
-    // (read from bytes) takes the layout its first proof measures, and
-    // later proofs whose circuit matches it skip the shape pass as with a
-    // key from keygen. A proof whose circuit does not match it starts over
-    // from an empty witness with the stock synthesis.
+    // stores the layout its first proof measures, and later proofs reuse it
+    // when their circuit matches it, region by region; otherwise the witness
+    // is emptied and synthesized again as above (see `crate::par::layout`).
     #[cfg(feature = "prover-par")]
     crate::par::layout::synthesize(
         &mut witness,
@@ -809,28 +806,19 @@ where
     // blinding coefficients appended below, within the same capacity.
     // The stock `resize` of the whole `h` and the per-limb `to_vec`
     // copies, which reallocate and leave unzeroed copies, do not happen.
-    // The limbs are allocated in parallel and filled in parallel chunks
-    // (plain copies of the coefficients).
+    // The limbs are allocated and filled in parallel.
+    let h: &[F] = &h_poly;
     let mut h_limbs: Vec<_> = (0..nb_limbs)
         .into_par_iter()
-        .map(|_| crate::gpu::erasing::ErasingVec::with_capacity_zeroed(limb_len + 2, limb_len))
-        .collect();
-    {
-        use rayon::{
-            iter::IntoParallelRefMutIterator,
-            slice::{ParallelSlice, ParallelSliceMut},
-        };
-        const COPY_CHUNK: usize = 1 << 14;
-        let h: &[F] = &h_poly;
-        h_limbs.par_iter_mut().enumerate().for_each(|(k, limb)| {
+        .map(|k| {
+            let mut limb =
+                crate::gpu::erasing::ErasingVec::with_capacity_zeroed(limb_len + 2, limb_len);
             let start = k * limb_len;
             let avail = h.len().saturating_sub(start).min(limb_len);
-            limb[..avail]
-                .par_chunks_mut(COPY_CHUNK)
-                .zip(h[start..start + avail].par_chunks(COPY_CHUNK))
-                .for_each(|(dst, src)| dst.copy_from_slice(src));
-        });
-    }
+            crate::par::columns::copy_from_slice(&mut limb[..avail], &h[start..start + avail]);
+            limb
+        })
+        .collect();
     drop(h_poly);
 
     blind_quotient_limbs_erasing(&mut h_limbs);

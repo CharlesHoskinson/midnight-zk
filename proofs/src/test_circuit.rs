@@ -386,8 +386,8 @@ pub(crate) fn prove(
     (proof, ok)
 }
 
-/// A chain of squarings, as the circuit of the rc1 benchmark of the prover
-/// service, with seeded proofs (tests only).
+/// A chain of squarings with seeded proofs, for the tests of the reuse of a
+/// layout by a key read from bytes and for the golden digests at scale.
 #[cfg(test)]
 pub(crate) mod chain {
     use ff::Field;
@@ -416,9 +416,8 @@ pub(crate) mod chain {
         x.square() + Fq::from(3)
     }
 
-    /// A chain of squarings over four advice columns, as the circuit of the
-    /// rc1 benchmark, with a second region holding a fixed column so that
-    /// the layout has more than one region.
+    /// A chain of squarings over four advice columns, with a second region
+    /// holding a fixed column so that the layout has more than one region.
     #[derive(Clone)]
     pub(crate) struct Chain {
         pub(crate) rows: usize,
@@ -697,11 +696,13 @@ mod tests {
     /// `crate::par::layout`) never changes the proof of a circuit that does
     /// not match it, and a circuit that matches it keeps reusing it.
     mod layout_reuse {
-        use super::super::chain::{
-            Chain, Reshape, Reshaped, chain_setup, prove_circuit_seeded, prove_seeded, read_back,
-            verifies,
+        use super::{
+            super::chain::{
+                Chain, Reshape, Reshaped, chain_setup, prove_circuit_seeded, prove_seeded,
+                read_back, verifies,
+            },
+            *,
         };
-        use super::*;
 
         /// The proofs of this thread since the last call that did not
         /// match the stored layout and synthesized again (0 without the
@@ -887,9 +888,10 @@ mod tests {
             }
         }
 
-        /// A circuit whose synthesis fails after a layout is stored returns
-        /// the error of the stock prover, and the next proof of the key's
-        /// circuit still reuses the layout.
+        /// A circuit whose synthesis fails returns the error of the stock
+        /// prover: as the first proof of a key read from bytes, storing no
+        /// layout, and after a layout is stored, after which the key's
+        /// circuit still reuses it.
         #[test]
         fn failing_synthesis_after_layout() {
             #[derive(Clone)]
@@ -930,8 +932,10 @@ mod tests {
             retries();
             let reference = prove_seeded(&f.params, &f.pk, &f.right, 4);
             let inst = f.right.instance();
-            let stock_err = prove_circuit_seeded(&f.params, &read_back(&f.pk), &Failing, &inst, 4)
+            let fresh = read_back(&f.pk);
+            let stock_err = prove_circuit_seeded(&f.params, &fresh, &Failing, &inst, 4)
                 .expect_err("the stock prover fails");
+            assert_eq!(stored(&fresh), None);
 
             let read = read_back(&f.pk);
             assert_eq!(prove_seeded(&f.params, &read, &f.right, 4), reference);
@@ -962,11 +966,12 @@ mod tests {
     const GOLDEN: &str = "5177fc0d3371a3ee809efe70428114afb17eddddc866a104b37e6369c5da96f2";
 
     /// Seeded proofs at `2^14` rows have the same digests in every build:
-    /// the digests below were taken from a build without the feature
+    /// the digests below are those of a build without the feature
     /// `prover-par`. At this size the column paths of the feature take over
-    /// (parallel encodings and inversions, from `2^14` rows) and the
-    /// evaluations run in chunks, but the parallel divisions of the
-    /// multi-open do not (`crate::par::open::PAR_MIN_LEN` is `2^15`): see
+    /// (parallel encodings from `crate::par::DELTA_MIN_LEN = 2^14` rows,
+    /// parallel inversions) and the evaluations run in chunks, but the
+    /// parallel divisions of the multi-open do not
+    /// (`crate::par::DIVISION_MIN_LEN` is `2^15`): see
     /// [`seeded_proof_digests_at_division_size`]. The random circuit has
     /// lookups, a trash argument and copy constraints; the chain circuit is
     /// proved with its key from keygen and with the same key read back from
@@ -1010,15 +1015,15 @@ mod tests {
 
     /// Seeded proofs at `2^16` rows, where the multi-open of the feature
     /// `prover-par` divides in parallel blocks (`divide_by_roots` and
-    /// `kate_division` of `crate::par::open`, from `PAR_MIN_LEN = 2^15`
-    /// coefficients), have the same digests in every build: the digests
-    /// below were taken from a build without the feature. With the feature
-    /// the test also checks that both parallel divisions ran. The inner
-    /// product of the multi-open takes its parallel path only from `2^19`
-    /// coefficients, out of reach here; its unit test crosses that floor
-    /// against the stock helper. The chain is proved with its key from
-    /// keygen and with the same key read back from bytes (first and second
-    /// proof, the second reusing the stored layout).
+    /// `kate_division` of `crate::par::open`, from
+    /// `crate::par::DIVISION_MIN_LEN = 2^15` coefficients), have the same
+    /// digests in every build: the digests below are those of a build
+    /// without the feature. With the feature the test also checks that both
+    /// parallel divisions ran. The inner product of the multi-open takes its
+    /// parallel path only from `2^19` coefficients, out of reach here; its
+    /// unit test crosses that floor against the stock helper. The chain is
+    /// proved with its key from keygen and with the same key read back from
+    /// bytes (first and second proof, the second reusing the stored layout).
     #[test]
     fn seeded_proof_digests_at_division_size() {
         use super::chain::{Chain, chain_setup, prove_seeded, read_back, verifies};
@@ -1028,7 +1033,7 @@ mod tests {
         };
         let k = 16;
         #[cfg(feature = "prover-par")]
-        assert!(1usize << k >= crate::par::open::PAR_MIN_LEN);
+        assert!(1usize << k >= crate::par::DIVISION_MIN_LEN);
         #[cfg(feature = "prover-par")]
         let before = crate::par::open::reached::counts();
         let mut digests = Vec::new();
@@ -1060,17 +1065,13 @@ mod tests {
         #[cfg(feature = "prover-par")]
         {
             let after = crate::par::open::reached::counts();
-            let reached = [0, 1, 2].map(|i| after[i] - before[i]);
+            let reached = [0, 1].map(|i| after[i] - before[i]);
             // `kate_division` divides through `divide_by_roots`: the
             // multi-open's own divisions are the calls beyond those.
             assert!(reached[1] > 0, "kate_division in parallel blocks");
             assert!(
                 reached[0] > reached[1],
                 "divide_by_roots in parallel blocks"
-            );
-            eprintln!(
-                "parallel paths reached at 2^{k} (divide_by_roots, kate_division, \
-                 poly_inner_product): {reached:?}"
             );
         }
         assert_eq!(digests, GOLDEN_AT_DIVISION_SIZE, "proof bytes changed");

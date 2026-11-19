@@ -131,8 +131,8 @@ impl Argument {
                     let tmp = z[row - 1] * &modified_values[row - 1];
                     z.push(tmp);
                 }
-                // With the feature `prover-par`, the same products in
-                // parallel blocks (see `crate::par::product`).
+                // With the feature `prover-par`, in parallel blocks (see
+                // `crate::par::product`).
                 #[cfg(feature = "prover-par")]
                 let z = crate::par::product::prefix_product_from_one(&modified_values, n);
                 let mut z = domain.lagrange_from_vec(z);

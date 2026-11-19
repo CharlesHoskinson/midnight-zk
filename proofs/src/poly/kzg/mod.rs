@@ -34,7 +34,8 @@ use group::Group;
 use midnight_curves::{msm::msm_pippenger, pairing::MultiMillerLoop, serde::SerdeObject};
 use rand_core::OsRng;
 
-#[cfg_attr(feature = "prover-par", allow(unused_imports))]
+#[cfg(not(feature = "prover-par"))]
+use crate::utils::arithmetic::{eval_polynomial, kate_division};
 use crate::{
     poly::{
         Coeff, Error, Polynomial, PolynomialRepresentation, ProverQuery,
@@ -50,9 +51,8 @@ use crate::{
     transcript::{Hashable, Transcript, TranscriptField},
     utils::{
         arithmetic::{
-            CurveAffine, CurveExt, divide_by_roots, eval_interpolant, eval_polynomial,
-            evals_inner_product, inner_product, kate_division, parallelize, powers, truncate,
-            truncated_powers,
+            CurveAffine, CurveExt, divide_by_roots, eval_interpolant, evals_inner_product,
+            inner_product, parallelize, powers, truncate, truncated_powers,
         },
         helpers::{ProcessedSerdeObject, SerdeFormat},
     },
@@ -280,10 +280,10 @@ impl<E: KZGEngine> PolynomialCommitmentScheme<E::Fr> for KZGCommitmentScheme<E> 
             polys: &[&Polynomial<F, Coeff>],
             scalars: impl IntoIterator<Item = F>,
         ) -> Polynomial<F, Coeff> {
-            // With the feature `prover-par`, the same sums of long
-            // polynomials in tasks of bounded size (see `crate::par::open`).
+            // With the feature `prover-par`, long polynomials are summed in
+            // tasks of bounded size (see `crate::par::open`).
             #[cfg(feature = "prover-par")]
-            if polys.iter().map(|p| p.len()).max().unwrap_or(0) >= crate::par::open::SUM_PAR_MIN_LEN
+            if polys.iter().map(|p| p.len()).max().unwrap_or(0) >= crate::par::INNER_PRODUCT_MIN_LEN
             {
                 return crate::par::open::poly_inner_product(polys, scalars);
             }
@@ -377,8 +377,8 @@ impl<E: KZGEngine> PolynomialCommitmentScheme<E::Fr> for KZGCommitmentScheme<E> 
         #[cfg(not(feature = "prover-par"))]
         let q_evals: Vec<E::Fr> =
             q_polys.par_iter().map(|q_poly| eval_polynomial(&q_poly.values, x3)).collect();
-        // With the feature `prover-par`, the same evaluations in tasks of
-        // bounded size (see `crate::par::open`).
+        // With the feature `prover-par`, in tasks of bounded size (see
+        // `crate::par::open`).
         #[cfg(feature = "prover-par")]
         let q_evals: Vec<E::Fr> = crate::par::open::eval_many(
             &q_polys.iter().map(|q_poly| (&q_poly.values[..], x3)).collect::<Vec<_>>(),
@@ -411,10 +411,10 @@ impl<E: KZGEngine> PolynomialCommitmentScheme<E::Fr> for KZGCommitmentScheme<E> 
                 PolynomialLabel::Custom("kzg_proof".into()),
             )
         };
-        // With the feature `prover-par`, the same quotient by `X - x3`,
-        // divided in parallel blocks from `final_poly` itself: the quotient
-        // does not depend on the constant coefficient, so neither `v` nor
-        // the copy `final_poly - v` is needed (see `crate::par::open`).
+        // With the feature `prover-par`, the quotient by `X - x3` is divided
+        // from `final_poly` itself, in parallel blocks: it does not depend on
+        // the constant coefficient, so neither `v` nor the copy
+        // `final_poly - v` is needed (see `crate::par::open`).
         #[cfg(feature = "prover-par")]
         let pi = {
             let pi_poly = Polynomial::<_, Coeff> {

@@ -660,11 +660,10 @@ pub trait FloorPlanner {
     }
 
     /// With the feature `prover-par` (see `crate::par::layout`): the
-    /// synthesis of the stock prover for a key without a layout
-    /// ([`synthesize_with_cached_regions`] with `None`), also returning the
-    /// measured layout of the synthesis when the planner supports it and
-    /// the layout can be checked by [`synthesize_checking_layout`]. `None`
-    /// otherwise: the default, which only runs that synthesis.
+    /// synthesis of [`synthesize_with_cached_regions`] without cached
+    /// regions, also returning the layout it measures when the planner can
+    /// check that layout in [`synthesize_checking_layout`]. The default
+    /// measures nothing and returns `None`.
     ///
     /// [`synthesize_with_cached_regions`]: Self::synthesize_with_cached_regions
     /// [`synthesize_checking_layout`]: Self::synthesize_checking_layout
@@ -687,11 +686,10 @@ pub trait FloorPlanner {
     /// `layout` at its index and that it opens as many regions.
     ///
     /// Returns `true` when the synthesis succeeded and matched `layout`:
-    /// then `cs` holds the assignment of the stock synthesis. Returns
-    /// `false` otherwise (any mismatch, or any error of the synthesis):
-    /// then `cs` holds a partial assignment that must be discarded. Never
-    /// panics on a mismatch. The default returns `false` without touching
-    /// `cs`.
+    /// `cs` then holds the assignment of the stock synthesis. Returns
+    /// `false` on any mismatch or error, without panicking: `cs` then holds
+    /// a partial assignment that the caller must discard. The default
+    /// returns `false` without touching `cs`.
     ///
     /// [`synthesize_measuring_layout`]: Self::synthesize_measuring_layout
     #[cfg(feature = "prover-par")]

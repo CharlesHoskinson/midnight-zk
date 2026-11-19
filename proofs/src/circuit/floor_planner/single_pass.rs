@@ -408,7 +408,7 @@ impl<'a, F: Field, CS: Assignment<F> + 'a + SyncDeps> SingleChipLayouter<'a, F, 
                     .max()
                     .unwrap_or(0);
                 if stock_start != *start
-                    || !expected.matches(entry, &measured, constants_to_assign.len())
+                    || !region_matches(expected, entry, &measured, constants_to_assign.len())
                 {
                     state.mismatch = true;
                     return Err(Self::layout_mismatch());
@@ -441,10 +441,11 @@ impl<'a, F: Field, CS: Assignment<F> + 'a + SyncDeps> SingleChipLayouter<'a, F, 
                     self.assign_measured(region_index, name, &mut assignment)?;
 
                 state.regions += 1;
-                if !measured.same_shape(&shape) {
+                if measured.row_count != shape.row_count || measured.columns != shape.columns {
                     state.mismatch = true;
                 }
-                let columns = shape.sorted_columns();
+                let mut columns: Vec<RegionColumn> = shape.columns.iter().copied().collect();
+                columns.sort();
                 let next = state.layout.column_sets.len();
                 let index = *state.column_sets.entry(columns).or_insert_with_key(|columns| {
                     state.layout.column_sets.push(columns.clone());
@@ -491,15 +492,13 @@ impl<'a, F: Field, CS: Assignment<F> + 'a + SyncDeps> SingleChipLayouter<'a, F, 
 
     /// The assignment of the region `region_index` at its start in
     /// `self.regions`, as in the stock `assign_region_impl`, measured as the
-    /// shape pass measures. Returns the closure's result, the measured
-    /// shape and the constants to assign.
-    #[allow(clippy::type_complexity)]
+    /// shape pass measures.
     fn assign_measured<A, AR, N, NR>(
         &mut self,
         region_index: usize,
         name: N,
         assignment: &mut A,
-    ) -> Result<(AR, RegionShape, Vec<(Rational<F>, Cell)>), Error>
+    ) -> Result<MeasuredAssignment<F, AR>, Error>
     where
         A: FnMut(Region<'_, F>) -> Result<AR, Error>,
         N: Fn() -> NR,
@@ -521,6 +520,30 @@ impl<'a, F: Field, CS: Assignment<F> + 'a + SyncDeps> SingleChipLayouter<'a, F, 
         self.cs.exit_region();
         Ok((result, measured, constants_to_assign))
     }
+}
+
+/// With the feature `prover-par`: the result of the closure of a region, the
+/// shape of its assignment, and the constants it assigns.
+#[cfg(feature = "prover-par")]
+type MeasuredAssignment<F, AR> = (AR, RegionShape, Vec<(Rational<F>, Cell)>);
+
+/// With the feature `prover-par`: whether `region` of `layout` has the
+/// columns, the row count and the number of constants of the assignment
+/// `measured`, which assigns `constants` constants.
+#[cfg(feature = "prover-par")]
+fn region_matches(
+    layout: &MeasuredLayout,
+    region: &MeasuredRegion,
+    measured: &RegionShape,
+    constants: usize,
+) -> bool {
+    let Some(columns) = layout.column_sets.get(region.columns) else {
+        return false;
+    };
+    region.row_count == measured.row_count
+        && region.constants == constants
+        && columns.len() == measured.columns.len()
+        && columns.iter().all(|c| measured.columns.contains(c))
 }
 
 /// With the feature `prover-par`: a region that forwards every call to
