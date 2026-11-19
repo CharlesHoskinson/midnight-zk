@@ -48,5 +48,6 @@ rand_core = { workspace = true }
 ff = { workspace = true }
 group = { workspace = true }
 midnight-curves = { path = "../curves" }
+midnight-circuits = { path = "../circuits" }
 midnight-proofs = { path = "../proofs", features = ["gpu-test", "circuit-params"] }
 rayon = { workspace = true }

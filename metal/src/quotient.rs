@@ -11,22 +11,305 @@
 // See the License for the specific language governing permissions and
 // limitations under the License.
 
-//! The quotient on the device (not written yet: every call declines with
-//! `not-implemented`).
+//! The quotient on the device, and the resident proving-key copies: a port of
+//! the CUDA crate's `gpu/src/quotient.rs` and `gpu/cuda/quotient.cuh`.
 //!
 //! [`crate::quotient`] has checked that `job` is not null and that a device
-//! is usable before it calls [`quotient`]. Everything else (the ABI version
-//! and layout of `midnight_proofs::gpu::abi::QuotientJobAbi`, the size
-//! against `min_k`, reduction of the job's scalars, the memory need) is this
-//! module's. It ends with exactly one of `account::served` or
-//! `account::decline`, and writes `out` only with the complete result.
+//! is usable before it calls [`quotient`]. Everything else is this module's:
+//! the ABI version and layout of `midnight_proofs::gpu::abi::QuotientJobAbi`
+//! (a copy in [`abi`]), the size against `min_k`, the job's shape, the
+//! reduction of its scalars and the memory need. It ends with exactly one of
+//! `account::served` or `account::decline`, and writes `out` only with the
+//! complete result.
+//!
+//! # Steps
+//!
+//! 1. Checks on the header and the tables ([`checked`], [`tables`]), in the
+//!    order and with the reasons of the CUDA crate.
+//! 2. The proving-key polynomials: served from the resident copy of a
+//!    registered handle ([`keys`]) or uploaded for the call.
+//! 3. The proof's polynomials (advice, instance, permutation accumulators,
+//!    lookup aggregators, multiplicities and helpers, trash) to the extended
+//!    coset: each one is copied into a buffer of `2^k` coefficients (checked
+//!    reduced on the way; the copy of the next one runs on the CPU while the
+//!    device transforms this one), moved to the coset by
+//!    `ntt::coeff_to_extended_dev`, then copied into its place in the flat
+//!    buffer of the proof's cosets.
+//! 4. The numerator kernel (`shaders/quotient.metal`) over row ranges, one
+//!    command buffer per range, each about [`TARGET_NANOS`] of GPU time.
+//! 5. The division by the vanishing polynomial (`ntt::encode_mul_periodic`
+//!    with the job's `t_inv`), the inverse transform and the removal of the
+//!    coset factors (`ntt::extended_to_coeff_dev`). Meanwhile a CPU thread
+//!    zeroes and releases the cosets, the uploads and the scratch slots; it
+//!    ends before the call returns.
+//! 6. The first `len` coefficients are copied into `out`. No extended-domain
+//!    vector goes back.
+//!
+//! Every buffer that holds a witness-dependent value is zeroed when it is
+//! released: the transform scratch is per-request scratch (`quotient-tmp`,
+//! zeroed by [`crate::end_request`]), every other buffer is owned by the call
+//! and zeroed on drop.
+//!
+//! # Departures from the CUDA backend
+//!
+//! - A Metal kernel takes at most 31 buffer arguments (Metal feature set
+//!   tables, every Apple family) and the device context binds buffers, not GPU
+//!   addresses, so the CUDA job's tables of device pointers are flat buffers
+//!   with index tables: the proof's cosets one buffer, the proving-key
+//!   polynomials two (the lent resident copy, the uploads of the call), the
+//!   programs and descriptors a buffer of words, the uniforms a buffer of
+//!   field elements (see `shaders/include/quotient.h`). A job whose flat
+//!   buffer would exceed `maxBufferLength` declines `memory`.
+//! - `ntt::coeff_to_extended_dev` writes a whole buffer from its start, so
+//!   each coset is transformed into a staging buffer and copied into its place
+//!   in the flat buffer: one extra pass over `2^ext_k` values per polynomial
+//!   (0.5 ms against 6.3 ms for the transform at `2^21` on an M4 Max).
+//! - The CUDA kernel runs one grid-stride launch over the whole domain; here
+//!   the domain is split into row ranges of about [`TARGET_NANOS`] of GPU time
+//!   each (the first range sized from an estimate, the next ones from the
+//!   measured time per row), so no command buffer runs long.
+//! - The scratch of the programs' intermediates is the CUDA layout
+//!   (`scratch[slot * threads + thread]`) with [`threads`] threads per
+//!   dispatch (`MIDNIGHT_METAL_QUOTIENT_THREADS`, the counterpart of
+//!   `MIDNIGHT_GPU_QUOTIENT_THREADS`).
+//! - The proving-key polynomials are checked reduced when they are copied (the
+//!   CUDA crate checks only the proof's polynomials); an unreduced one
+//!   declines `unreduced`.
+//! - A resident copy is one buffer per [`KeyHandle`]; a job whose key
+//!   polynomials are registered under several handles reads the handle with
+//!   the most of them from its copy and uploads the others for the call.
+//! - The memory limit is the device's free working set
+//!   (`recommendedMaxWorkingSetSize - currentAllocatedSize`) and
+//!   `maxBufferLength` for each buffer, or a test limit.
 
-use std::ffi::c_void;
+pub mod abi;
+mod keys;
+mod tables;
 
-use crate::{
-    Scalar,
-    account::{self, Class, Reason},
+use std::{
+    ffi::c_void,
+    sync::{
+        Mutex,
+        atomic::{AtomicU32, AtomicU64, Ordering::Relaxed},
+    },
+    time::Instant,
 };
+
+use blst::{blst_fr, blst_fr_mul, blst_fr_sqr};
+pub use keys::{
+    KeyHandle, evict_key_copies, keep_resident, key_stale, keys_registered, register_key,
+    set_keep_resident,
+};
+pub(crate) use keys::{begin_request, end_request};
+
+use self::{abi::QuotientJobAbi, keys::Place, tables::Tables};
+use crate::{
+    MAX_LOG_N, Scalar,
+    account::{self, Class, Reason},
+    ctx::{self, Arg, Buffer, Ctx, Error, Pod},
+    field,
+    ntt::{self, Dir},
+};
+
+const SCALAR_BYTES: usize = 32;
+
+/// The GPU time one command buffer of the numerator aims at.
+pub const TARGET_NANOS: u64 = 250_000_000;
+
+/// The Montgomery form of one (`2^256 mod r`).
+const ONE: Scalar = [
+    0x0000_0001_ffff_fffe,
+    0x5884_b7fa_0003_4802,
+    0x998c_4fef_ecbc_4ff5,
+    0x1824_b159_acc5_056f,
+];
+
+fn mul(a: &Scalar, b: &Scalar) -> Scalar {
+    let mut r = blst_fr::default();
+    // SAFETY: valid pointers to blst_fr values.
+    unsafe { blst_fr_mul(&mut r, &blst_fr { l: *a }, &blst_fr { l: *b }) };
+    r.l
+}
+
+fn square(a: &Scalar) -> Scalar {
+    let mut r = blst_fr::default();
+    // SAFETY: as `mul`.
+    unsafe { blst_fr_sqr(&mut r, &blst_fr { l: *a }) };
+    r.l
+}
+
+fn pow(b: &Scalar, mut e: u64) -> Scalar {
+    let (mut r, mut b) = (ONE, *b);
+    while e != 0 {
+        if e & 1 == 1 {
+            r = mul(&r, &b);
+        }
+        b = square(&b);
+        e >>= 1;
+    }
+    r
+}
+
+// ---------------------------------------------------------------------------
+// Counters and settings
+
+static RUNS: AtomicU64 = AtomicU64::new(0);
+static DECLINES: AtomicU64 = AtomicU64::new(0);
+static THREADS: AtomicU32 = AtomicU32::new(0);
+static MEMORY_LIMIT: AtomicU64 = AtomicU64::new(u64::MAX);
+static TARGET: AtomicU64 = AtomicU64::new(TARGET_NANOS);
+
+/// (quotients computed on the device, quotient jobs declined) since process
+/// start.
+pub fn quotient_counts() -> (u64, u64) {
+    (RUNS.load(Relaxed), DECLINES.load(Relaxed))
+}
+
+/// The default of [`threads`]. Numerator GPU time at `2^21` rows on an M4
+/// Max (40 GPU cores, rc1 chain circuit): 53 ms with 2^12 threads, 18.8 ms
+/// with 2^14, 15.5 ms with 2^16, 14.4 ms with 2^18, 17.4 ms with 2^20; 2^16
+/// is within 8% of the best and keeps the scratch at `nslots * 2 MiB`.
+const DEFAULT_THREADS: u32 = 1 << 16;
+
+/// The threads of one numerator dispatch, the stride of the scratch slots:
+/// `MIDNIGHT_METAL_QUOTIENT_THREADS`, else 2^16; a multiple of 256 in
+/// `[256, 2^24]`.
+pub fn threads() -> u32 {
+    let t = THREADS.load(Relaxed);
+    if t != 0 {
+        return t;
+    }
+    let t = std::env::var("MIDNIGHT_METAL_QUOTIENT_THREADS")
+        .ok()
+        .and_then(|e| e.trim().parse::<u64>().ok())
+        .map_or(DEFAULT_THREADS, |t| {
+            (t / 256 * 256).clamp(256, 1 << 24) as u32
+        });
+    let _ = THREADS.compare_exchange(0, t, Relaxed, Relaxed);
+    THREADS.load(Relaxed)
+}
+
+/// The dispatch threads (the scratch stride) for an extended domain of
+/// `2^ext_k` rows.
+fn stride(ext_k: u32) -> usize {
+    (threads() as usize).min(1usize << ext_k)
+}
+
+/// The device bytes one quotient job needs at its peak (the numerator): the
+/// extended cosets of the proof's polynomials and of the proving-key
+/// polynomials (resident or uploaded), the numerator, the transform scratch,
+/// and the programs' scratch slots (`nslots * stride * 32`, stride the
+/// dispatch threads, [`threads`] capped at `2^ext_k`):
+///
+/// `(proof_polys + key_polys + 1) * 2^ext_k * 32 + ntt_scratch(ext_k)
+///  + max(nslots * stride * 32, 2^ext_k * 32)`
+///
+/// `ntt_scratch` is `2^ext_k * 32` above `2^10`, else 0. The last term covers
+/// the two coefficient buffers of the coset phase (`2 * 2^k * 32`, at most
+/// `2^ext_k * 32` when `k < ext_k`, as for every job with a quotient of
+/// degree 2 or more). The job's tables (programs, uniforms, `t_inv`) come on
+/// top: a few KiB to a few MiB. The arguments are the fields of
+/// `midnight_proofs::gpu::QuotientShape`.
+pub fn need_bytes(ext_k: u32, proof_polys: usize, key_polys: usize, nslots: u32) -> usize {
+    let e = SCALAR_BYTES << ext_k;
+    let slots = nslots as usize * stride(ext_k) * SCALAR_BYTES;
+    (proof_polys + key_polys + 1) * e + ntt::scratch_bytes(ext_k) + slots.max(e)
+}
+
+// ---------------------------------------------------------------------------
+// Measurement and test support
+
+/// Wall and GPU nanoseconds of the stages of the last quotient served.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub struct QuotientStages {
+    /// Checks, tables, key placement and allocations (wall).
+    pub prepare: u64,
+    /// Proving-key uploads and resident copies (wall; on the CPU while the
+    /// coset transforms run).
+    pub keys: u64,
+    /// The proof's polynomials to the extended coset: copies, transforms and
+    /// placement (wall).
+    pub cosets: u64,
+    /// The numerator kernel (wall).
+    pub numerator: u64,
+    /// The division by the vanishing polynomial (wall).
+    pub divide: u64,
+    /// The inverse transform and the coset factors (wall).
+    pub inverse: u64,
+    /// The read-back of `len` coefficients and the release of the buffers
+    /// (wall).
+    pub readback: u64,
+    /// GPU time of the coset transforms and placement.
+    pub gpu_cosets: u64,
+    /// GPU time of the numerator.
+    pub gpu_numerator: u64,
+    /// GPU time of the division.
+    pub gpu_divide: u64,
+    /// GPU time of the inverse transform.
+    pub gpu_inverse: u64,
+    /// Command buffers of the numerator.
+    pub numerator_runs: u32,
+    /// Device bytes this module allocated at the peak of the call.
+    pub peak_bytes: u64,
+    /// Proving-key polynomials read from a resident copy.
+    pub resident_polys: u32,
+    /// Proving-key polynomials uploaded for the call.
+    pub uploaded_polys: u32,
+    /// Slots of the resident copy filled by this call.
+    pub key_copies_made: u32,
+}
+
+static LAST_STAGES: Mutex<Option<QuotientStages>> = Mutex::new(None);
+
+/// Test and measurement support (not a stable interface).
+pub mod test_support {
+    use super::*;
+
+    /// The stages of the last quotient served.
+    pub fn last_stages() -> Option<QuotientStages> {
+        *LAST_STAGES.lock().unwrap_or_else(|e| e.into_inner())
+    }
+
+    /// A device-memory limit in bytes for the quotient's admission (`None`:
+    /// the device's free working set).
+    pub fn set_memory_limit(limit: Option<u64>) {
+        MEMORY_LIMIT.store(limit.unwrap_or(u64::MAX), Relaxed);
+    }
+
+    /// Sets the GPU time a numerator command buffer aims at (`None`:
+    /// [`TARGET_NANOS`]), so that a test can split a small domain.
+    pub fn set_target_nanos(ns: Option<u64>) {
+        TARGET.store(ns.unwrap_or(TARGET_NANOS).max(1), Relaxed);
+    }
+
+    /// Sets the dispatch threads ([`threads`]); `None` restores the default.
+    pub fn set_threads(t: Option<u32>) {
+        THREADS.store(
+            t.map_or(0, |t| (t / 256 * 256).clamp(256, 1 << 24)),
+            Relaxed,
+        );
+    }
+
+    /// The numerator of a job on the device, all `2^ext_k` values read back
+    /// (a test of the kernel against `QuotientJob::numerator_reference`; the
+    /// hook never reads it back). `Err`: the decline reason.
+    ///
+    /// # Safety
+    /// As [`crate::quotient`].
+    pub unsafe fn numerator(job: *const c_void) -> Result<Vec<Scalar>, &'static str> {
+        if job.is_null() || !crate::device() {
+            return Err("no-device");
+        }
+        // SAFETY: the caller's contract.
+        let j = unsafe { &*(job as *const QuotientJobAbi) };
+        let mut nu = Vec::new();
+        // SAFETY: as above.
+        unsafe { run(j, &mut [], Some(&mut nu)) }.map(|_| nu).map_err(|r| r.name())
+    }
+}
+
+// ---------------------------------------------------------------------------
+// The entry point
 
 /// The first `out.len()` coefficients of the quotient of `job`. `false`:
 /// declined, `out` unchanged.
@@ -34,6 +317,536 @@ use crate::{
 /// # Safety
 /// `job` points to a valid `QuotientJobAbi` whose pointers live for the call.
 pub(crate) unsafe fn quotient(job: *const c_void, out: &mut [Scalar]) -> bool {
-    let _ = (job, out);
-    account::decline(Class::Quotient, Reason::NotImplemented)
+    // SAFETY: the caller's contract.
+    let j = unsafe { &*(job as *const QuotientJobAbi) };
+    // SAFETY: as above.
+    match unsafe { run(j, out, None) } {
+        Ok(ns) => {
+            RUNS.fetch_add(1, Relaxed);
+            account::served(Class::Quotient, ns);
+            true
+        }
+        Err(r) => {
+            DECLINES.fetch_add(1, Relaxed);
+            account::decline(Class::Quotient, r)
+        }
+    }
+}
+
+/// The coset shift is a primitive cube root of unity `z` (`z != 1`,
+/// `z^3 = 1`), the job gives `[z, z^2]` into the coset and `[z^2, z]` out of
+/// it (the CUDA crate's `cube_root_shift`).
+fn cube_root_shift(zeta: [Scalar; 2], zeta_out: [Scalar; 2]) -> bool {
+    let z = zeta[0];
+    let z2 = square(&z);
+    z != ONE && mul(&z2, &z) == ONE && zeta[1] == z2 && zeta_out == [z2, z]
+}
+
+/// The header checks of the CUDA crate, in its order: the ABI version and
+/// sizes (`shape`), the coset shift (`shape`), the minimum size
+/// (`below-min-k`), then the roots, lengths and counts (`shape`) and the
+/// reduction of the job's scalars (`unreduced`).
+fn checked(j: &QuotientJobAbi, out_len: Option<usize>) -> Result<(), Reason> {
+    if j.abi != abi::QUOTIENT_ABI || j.k < 1 || j.k > j.ext_k || j.ext_k > MAX_LOG_N {
+        return Err(Reason::Shape);
+    }
+    let scalars = [
+        j.zeta[0],
+        j.zeta[1],
+        j.y,
+        j.beta,
+        j.gamma,
+        j.delta_start,
+        j.delta,
+        j.divisor,
+        j.zeta_out[0],
+        j.zeta_out[1],
+    ];
+    // the shift check multiplies: only on reduced values
+    if !field::all_reduced(&scalars[..2]) || !field::all_reduced(&scalars[8..]) {
+        return Err(Reason::Shape);
+    }
+    if !cube_root_shift(j.zeta, j.zeta_out) {
+        return Err(Reason::Shape);
+    }
+    if j.ext_k < crate::min_k() {
+        return Err(Reason::BelowMinK);
+    }
+    let en = 1usize << j.ext_k;
+    let ok = Some(j.extended_omega) == ntt::std_root(j.ext_k, Dir::Forward)
+        && Some(j.omega_inv) == ntt::std_root(j.ext_k, Dir::Inverse)
+        && out_len.is_none_or(|l| l == j.len)
+        && j.len <= en
+        && j.nt_inv.is_power_of_two()
+        && j.nt_inv <= en
+        && j.gates.noutputs == 1
+        && j.perm_nsets <= j.perm_ncolumns.max(1)
+        && (j.perm_nsets == 0) == (j.perm_ncolumns == 0)
+        && j.perm_chunk_len as usize * j.perm_nsets >= j.perm_ncolumns
+        && j.nslots <= abi::INDEX_MASK;
+    if !ok {
+        return Err(Reason::Shape);
+    }
+    if !field::all_reduced(&scalars) {
+        return Err(Reason::Unreduced);
+    }
+    Ok(())
+}
+
+// ---------------------------------------------------------------------------
+// Host copies
+
+/// Copies `src` into the start of `dst` on several threads; `false` when an
+/// element is not reduced (the copy may then be partial).
+fn copy_checked(dst: &mut [Scalar], src: &[Scalar]) -> bool {
+    const PART: usize = 1 << 16;
+    let dst = &mut dst[..src.len()];
+    let one = |d: &mut [Scalar], s: &[Scalar]| {
+        d.copy_from_slice(s);
+        s.iter().all(field::is_reduced)
+    };
+    if src.len() <= 2 * PART {
+        return one(dst, src);
+    }
+    let threads = std::thread::available_parallelism().map_or(4, |t| t.get()).min(8);
+    let per = src.len().div_ceil(threads).max(PART);
+    std::thread::scope(|s| {
+        let hs: Vec<_> = dst
+            .chunks_mut(per)
+            .zip(src.chunks(per))
+            .map(|(d, c)| s.spawn(move || one(d, c)))
+            .collect();
+        hs.into_iter().all(|h| h.join().unwrap_or(false))
+    })
+}
+
+/// Copies `src` into `dst` (equal lengths) on several threads.
+fn par_copy(dst: &mut [Scalar], src: &[Scalar]) {
+    const PART: usize = 1 << 16;
+    if src.len() <= 2 * PART {
+        dst.copy_from_slice(src);
+        return;
+    }
+    let threads = std::thread::available_parallelism().map_or(4, |t| t.get()).min(8);
+    let per = src.len().div_ceil(threads).max(PART);
+    std::thread::scope(|s| {
+        for (d, c) in dst.chunks_mut(per).zip(src.chunks(per)) {
+            s.spawn(move || d.copy_from_slice(c));
+        }
+    });
+}
+
+// ---------------------------------------------------------------------------
+// The device run
+
+/// One dispatch of the numerator (`quotient::Params` of
+/// `shaders/include/quotient.h`).
+#[repr(C)]
+#[derive(Clone, Copy, Debug, Default)]
+struct Params {
+    ext_k: u32,
+    log_scale: u32,
+    mask: u32,
+    row0: u32,
+    row_end: u32,
+    threads: u32,
+    gates: u32,
+    perm_nsets: u32,
+    perm_ncolumns: u32,
+    perm_chunk_len: u32,
+    perm_last_rotation: i32,
+    perm: u32,
+    nlookups: u32,
+    lookups: u32,
+    ntrash: u32,
+    trash: u32,
+    l0: u32,
+    l_last: u32,
+    l_active: u32,
+    pad: [u32; 5],
+    y: Scalar,
+    beta: Scalar,
+    gamma: Scalar,
+    delta_start: Scalar,
+    delta: Scalar,
+    omega: Scalar,
+    omega_step: Scalar,
+}
+// SAFETY: `repr(C)`, 24 four-byte fields then seven `[u64; 4]` (offset 96, a
+// multiple of 8): no padding, every bit pattern valid.
+unsafe impl Pod for Params {}
+const _: () = assert!(size_of::<Params>() == 96 + 7 * 32);
+
+/// Bytes the device allows this call to allocate.
+fn memory_limit() -> u64 {
+    let free = ctx::mem_info().map_or(0, |(free, _)| free as u64);
+    free.min(MEMORY_LIMIT.load(Relaxed))
+}
+
+fn err(e: Error) -> Reason {
+    Reason::of(&e)
+}
+
+/// The quotient of `j` into `out`, or with `numerator` the whole numerator
+/// read back into it (and `out` untouched). Returns the GPU time.
+///
+/// # Safety
+/// The job's contract.
+unsafe fn run(
+    j: &QuotientJobAbi,
+    out: &mut [Scalar],
+    mut numerator: Option<&mut Vec<Scalar>>,
+) -> Result<u64, Reason> {
+    let t_start = Instant::now();
+    let mut st = QuotientStages::default();
+    checked(j, numerator.is_none().then_some(out.len()))?;
+    // SAFETY: the job's contract.
+    let mut tab = unsafe { Tables::new(j)? };
+    // SAFETY: the job's contract.
+    let t_inv = unsafe { abi::slice(j.t_inv, j.nt_inv) };
+    if !field::all_reduced(t_inv) {
+        return Err(Reason::Unreduced);
+    }
+    let (k, ext_k) = (j.k, j.ext_k);
+    let (n, en) = (1usize << k, 1usize << ext_k);
+    let ebytes = SCALAR_BYTES << ext_k;
+    let nproof = tab.proof.len();
+    let nslots = j.nslots as usize;
+    let threads = stride(ext_k);
+
+    let mut s = ctx::lock().map_err(err)?;
+    let c: &'static Ctx = s.ctx();
+    let info = crate::present().ok_or(Reason::NoDevice)?;
+
+    // the proving-key polynomials: resident or uploaded
+    let (places, mut lent) = keys::place(&tab.keys);
+    let ntemp = places.iter().filter(|p| **p == Place::Temp).count();
+    let mut bank_of = Vec::with_capacity(places.len());
+    let mut ti = 0;
+    for p in &places {
+        bank_of.push(match p {
+            Place::Resident(slot) => (tables::BANK_KEY_RES, *slot),
+            Place::Temp => {
+                ti += 1;
+                (tables::BANK_KEY_TMP, ti - 1)
+            }
+        });
+    }
+    let lagrange = tab.place_keys(&bank_of);
+    st.uploaded_polys = ntemp as u32;
+    st.resident_polys = (places.len() - ntemp) as u32;
+    st.key_copies_made = places
+        .iter()
+        .filter(
+            |p| matches!(p, Place::Resident(s) if lent.as_ref().is_some_and(|l| !l.present[*s])),
+        )
+        .count() as u32;
+    let res_new = lent.as_ref().map_or(0, |l| {
+        if l.buf.is_none() {
+            l.npolys * ebytes
+        } else {
+            0
+        }
+    });
+
+    // memory: what this call allocates at its peak (the numerator)
+    let tmp_have = s.get_scratch("quotient-tmp").map_or(0, |b| b.len_bytes());
+    let tmp_need = ntt::scratch_bytes(ext_k);
+    let slots_bytes = nslots.max(1) * threads * SCALAR_BYTES;
+    let tables_bytes =
+        tab.words.len() * 4 + tab.uniforms.len() * SCALAR_BYTES + t_inv.len() * SCALAR_BYTES;
+    let peak = (nproof + ntemp + 1) * ebytes
+        + res_new
+        + tmp_need.saturating_sub(tmp_have)
+        + slots_bytes.max(2 * n * SCALAR_BYTES)
+        + tables_bytes;
+    let biggest = [nproof * ebytes, ntemp * ebytes, res_new, slots_bytes]
+        .into_iter()
+        .max()
+        .unwrap_or(0);
+    if peak as u64 > memory_limit() || biggest as u64 > info.max_buffer_length {
+        if let Some(l) = lent.take() {
+            l.give_back();
+        }
+        return Err(Reason::Memory);
+    }
+    let bytes0 = ctx::device_bytes().0;
+    st.prepare = t_start.elapsed().as_nanos() as u64;
+
+    let r = (|| -> Result<u64, Reason> {
+        let mut gpu = 0u64;
+        // transform scratch (per request: it holds witness values)
+        if tmp_need > 0 {
+            s.scratch("quotient-tmp", tmp_need).map_err(err)?;
+        }
+        let proof_buf = c.alloc(nproof.max(1) * ebytes).map_err(err)?;
+        let stage = c.alloc(ebytes).map_err(err)?;
+        let mut src_a = c.alloc(n * SCALAR_BYTES).map_err(err)?;
+        let mut src_b = c.alloc(n * SCALAR_BYTES).map_err(err)?;
+        let mut key_tmp = c.alloc(ntemp * ebytes).map_err(err)?;
+        if let Some(l) = lent.as_mut()
+            && l.buf.is_none()
+        {
+            l.buf = Some(c.alloc(l.npolys * ebytes).map_err(err)?);
+        }
+        let tmp_ref: Option<&Buffer> = if tmp_need > 0 {
+            s.get_scratch("quotient-tmp")
+        } else {
+            None
+        };
+        let tmp = tmp_ref.unwrap_or(&stage);
+
+        // keys on a CPU thread, cosets on the device
+        let t_cos = Instant::now();
+        let keys_list = &tab.keys;
+        let places_ref = &places;
+        let lent_ref = &mut lent;
+        let key_tmp_ref = &mut key_tmp;
+        let proof_list = &tab.proof;
+        let zeta = j.zeta;
+        let (keys_ok, cos) = std::thread::scope(|sc| {
+            let kh = sc.spawn(move || -> (bool, u64) {
+                let t = Instant::now();
+                let tmp_slice = key_tmp_ref.as_mut_slice::<Scalar>();
+                let mut ti = 0;
+                let mut ok = true;
+                for (p, pl) in keys_list.iter().zip(places_ref) {
+                    match pl {
+                        Place::Temp => {
+                            ok &= copy_checked(&mut tmp_slice[ti * en..(ti + 1) * en], p);
+                            ti += 1;
+                        }
+                        Place::Resident(slot) => {
+                            let l = lent_ref.as_mut().expect("a lent copy");
+                            if !l.present[*slot] {
+                                let b = l.buf.as_mut().expect("allocated").as_mut_slice::<Scalar>();
+                                let good = copy_checked(&mut b[slot * en..(slot + 1) * en], p);
+                                l.present[*slot] = good;
+                                ok &= good;
+                            }
+                        }
+                    }
+                    if !ok {
+                        break;
+                    }
+                }
+                (ok, t.elapsed().as_nanos() as u64)
+            });
+            let cos = (|| -> Result<u64, Reason> {
+                if proof_list.is_empty() {
+                    return Ok(0);
+                }
+                if !copy_checked(src_a.as_mut_slice::<Scalar>(), proof_list[0]) {
+                    return Err(Reason::Unreduced);
+                }
+                // the copy of the second polynomial runs on the CPU while the
+                // device transforms the first
+                let (first, copied) = std::thread::scope(|sc2| {
+                    let h = proof_list
+                        .get(1)
+                        .map(|f| sc2.spawn(|| copy_checked(src_b.as_mut_slice::<Scalar>(), f)));
+                    let r = ntt::coeff_to_extended_dev(c, &src_a, &stage, tmp, k, ext_k, &zeta);
+                    (r, h.is_none_or(|h| h.join().unwrap_or(false)))
+                });
+                let mut ns = first.map_err(err)?;
+                if !copied {
+                    return Err(Reason::Unreduced);
+                }
+                let place = |i: usize| -> Result<u64, Error> {
+                    let (pb, st) = (&proof_buf, &stage);
+                    Ok(c.run(|cmd| {
+                        cmd.dispatch(
+                            "quotient_copy",
+                            en,
+                            &[Arg::Buffer(st), Arg::BufferAt(pb, i * ebytes)],
+                        )
+                    })?
+                    .1)
+                };
+                ns += place(0).map_err(err)?;
+                for i in 1..proof_list.len() {
+                    let (cur, next) = if i % 2 == 1 {
+                        (&src_b, &mut src_a)
+                    } else {
+                        (&src_a, &mut src_b)
+                    };
+                    // the copy of the next polynomial runs on the CPU while
+                    // the device transforms this one
+                    let following = proof_list.get(i + 1).copied();
+                    let (r, copied) = std::thread::scope(|sc2| {
+                        let h = following.map(|f| {
+                            sc2.spawn(move || copy_checked(next.as_mut_slice::<Scalar>(), f))
+                        });
+                        let r = ntt::coeff_to_extended_dev(c, cur, &stage, tmp, k, ext_k, &zeta)
+                            .and_then(|a| Ok(a + place(i)?));
+                        (r, h.is_none_or(|h| h.join().unwrap_or(false)))
+                    });
+                    ns += r.map_err(err)?;
+                    if !copied {
+                        return Err(Reason::Unreduced);
+                    }
+                }
+                Ok(ns)
+            })();
+            let k = kh.join().unwrap_or((false, 0));
+            (k, cos)
+        });
+        st.keys = keys_ok.1;
+        gpu += cos?;
+        st.gpu_cosets = gpu;
+        if !keys_ok.0 {
+            return Err(Reason::Unreduced);
+        }
+        st.peak_bytes = ctx::device_bytes().0.saturating_sub(bytes0);
+        drop(src_a);
+        drop(src_b);
+        st.cosets = t_cos.elapsed().as_nanos() as u64;
+
+        // the numerator, into `stage`
+        let t_num = Instant::now();
+        let nu = stage;
+        let scratch = c.alloc(nslots.max(1) * threads * SCALAR_BYTES).map_err(err)?;
+        let words = c.upload(&tab.words).map_err(err)?;
+        let unis = if tab.uniforms.is_empty() {
+            c.alloc(0)
+        } else {
+            c.upload(&tab.uniforms)
+        }
+        .map_err(err)?;
+        let dummy = c.alloc(0).map_err(err)?;
+        let key_res: &Buffer = lent.as_ref().and_then(|l| l.buf.as_ref()).unwrap_or(&dummy);
+        let key_tmp_b: &Buffer = if ntemp > 0 { &key_tmp } else { &dummy };
+        let omega = j.extended_omega;
+        let mut p = Params {
+            ext_k,
+            log_scale: ext_k - k,
+            mask: (en - 1) as u32,
+            threads: threads as u32,
+            gates: tab.gates,
+            perm_nsets: j.perm_nsets as u32,
+            perm_ncolumns: j.perm_ncolumns as u32,
+            perm_chunk_len: j.perm_chunk_len,
+            perm_last_rotation: j.perm_last_rotation,
+            perm: tab.perm,
+            nlookups: j.nlookups as u32,
+            lookups: tab.lookups,
+            ntrash: j.ntrash as u32,
+            trash: tab.trash,
+            l0: lagrange[0],
+            l_last: lagrange[1],
+            l_active: lagrange[2],
+            y: j.y,
+            beta: j.beta,
+            gamma: j.gamma,
+            delta_start: j.delta_start,
+            delta: j.delta,
+            omega,
+            omega_step: pow(&omega, threads as u64),
+            ..Default::default()
+        };
+        // rows per command buffer: a first estimate at about 0.5 ns per
+        // field multiplication of a row, then from the measured time per row
+        let cost = tab.cost_per_row.max(1) + 8;
+        let target = TARGET.load(Relaxed);
+        let mut rows = ((target / 2) / cost).max(threads as u64) as usize;
+        let mut row0 = 0usize;
+        let mut ns_num = 0u64;
+        while row0 < en {
+            let rows_now = rows.min(en - row0).div_ceil(threads) * threads;
+            let end = (row0 + rows_now).min(en);
+            p.row0 = row0 as u32;
+            p.row_end = end as u32;
+            let disp = threads.min(end - row0);
+            let pp = p;
+            let ns = c
+                .run(|cmd| {
+                    cmd.dispatch(
+                        "quotient_numerator",
+                        disp,
+                        &[
+                            Arg::Buffer(&proof_buf),
+                            Arg::Buffer(key_res),
+                            Arg::Buffer(key_tmp_b),
+                            Arg::Buffer(&words),
+                            Arg::Buffer(&unis),
+                            Arg::Buffer(&nu),
+                            Arg::Buffer(&scratch),
+                            Arg::value(&pp),
+                        ],
+                    )
+                })
+                .map_err(err)?
+                .1;
+            ns_num += ns;
+            st.numerator_runs += 1;
+            let per_row = (ns as f64 / (end - row0) as f64).max(0.01);
+            let want = (target as f64 / per_row) as usize;
+            rows = want.clamp(threads, rows.saturating_mul(8).max(threads));
+            row0 = end;
+        }
+        gpu += ns_num;
+        st.gpu_numerator = ns_num;
+        st.peak_bytes = st.peak_bytes.max(ctx::device_bytes().0.saturating_sub(bytes0));
+        if let Some(l) = lent.take() {
+            l.give_back();
+        }
+        // The buffers of the cosets are zeroed (on drop, on the CPU) while
+        // the device divides and transforms; the zeroing ends before this
+        // call returns.
+        let release = std::thread::spawn(move || drop((scratch, proof_buf, key_tmp, words, unis)));
+        let joined = move |r: Result<u64, Reason>| -> Result<u64, Reason> {
+            let _ = release.join();
+            r
+        };
+        st.numerator = t_num.elapsed().as_nanos() as u64;
+
+        let rest = (|| -> Result<(), Reason> {
+            if let Some(v) = numerator.as_mut() {
+                v.clear();
+                v.extend_from_slice(&nu.as_slice::<Scalar>()[..en]);
+                return Ok(());
+            }
+
+            // h = nu / t on the coset
+            let t_div = Instant::now();
+            let tinv = c.upload(t_inv).map_err(err)?;
+            let log_tn = t_inv.len().ilog2();
+            let ns = c
+                .run(|cmd| ntt::encode_mul_periodic(cmd, &nu, en, &tinv, log_tn))
+                .map_err(err)?
+                .1;
+            gpu += ns;
+            st.gpu_divide = ns;
+            st.divide = t_div.elapsed().as_nanos() as u64;
+
+            // extended_to_coeff
+            let t_inv_ntt = Instant::now();
+            let tmp2 = tmp_ref.unwrap_or(&dummy);
+            let ns = ntt::extended_to_coeff_dev(c, &nu, tmp2, ext_k, &j.divisor, &j.zeta_out)
+                .map_err(err)?;
+            gpu += ns;
+            st.gpu_inverse = ns;
+            st.inverse = t_inv_ntt.elapsed().as_nanos() as u64;
+
+            // the first `len` coefficients
+            let t_rb = Instant::now();
+            par_copy(out, &nu.as_slice::<Scalar>()[..out.len()]);
+            drop(nu);
+            drop(tinv);
+            st.readback = t_rb.elapsed().as_nanos() as u64;
+            Ok(())
+        })();
+        let t_join = Instant::now();
+        let gpu = joined(rest.map(|()| gpu))?;
+        st.readback += t_join.elapsed().as_nanos() as u64;
+        Ok(gpu)
+    })();
+    if let Some(l) = lent.take() {
+        l.give_back();
+    }
+    drop(s);
+    if r.is_ok() && numerator.is_none() {
+        *LAST_STAGES.lock().unwrap_or_else(|e| e.into_inner()) = Some(st);
+    }
+    r
 }

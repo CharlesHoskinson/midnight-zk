@@ -141,6 +141,16 @@ mod ntt;
 pub use ntt::test_support as ntt_test_support;
 #[cfg(target_os = "macos")]
 mod quotient;
+#[cfg(target_os = "macos")]
+pub use quotient::{
+    KeyHandle, QuotientStages, evict_key_copies, keep_resident, key_stale, keys_registered,
+    need_bytes, quotient_counts, register_key, set_keep_resident, threads as quotient_threads,
+};
+/// The quotient job layout and test and measurement entry points of the
+/// quotient, for this crate's integration tests (not a stable interface).
+#[cfg(target_os = "macos")]
+#[doc(hidden)]
+pub use quotient::{abi as quotient_abi, test_support as quotient_test_support};
 
 #[cfg(all(test, target_os = "macos"))]
 mod tests;
@@ -437,6 +447,8 @@ pub unsafe fn quotient(job: *const c_void, out: &mut [Scalar]) -> bool {
 pub fn begin_request() {
     #[cfg(target_os = "macos")]
     ctx::begin_request();
+    #[cfg(target_os = "macos")]
+    quotient::begin_request();
 }
 
 /// Ends a request (call it between proofs): waits for any device work in
@@ -446,7 +458,9 @@ pub fn begin_request() {
 pub fn end_request() -> bool {
     #[cfg(target_os = "macos")]
     {
-        ctx::end_request()
+        let ok = ctx::end_request();
+        quotient::end_request();
+        ok
     }
     #[cfg(not(target_os = "macos"))]
     true

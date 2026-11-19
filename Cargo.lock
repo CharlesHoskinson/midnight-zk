@@ -1234,6 +1234,7 @@ dependencies = [
  "dispatch2",
  "ff",
  "group",
+ "midnight-circuits",
  "midnight-curves",
  "midnight-proofs",
  "objc2",
