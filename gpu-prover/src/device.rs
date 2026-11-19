@@ -11,19 +11,27 @@
 // See the License for the specific language governing permissions and
 // limitations under the License.
 
-//! The device layer: the one place where this crate meets the CUDA crate
-//! `midnight-gpu` and the hook layer `midnight_proofs::gpu`.
+//! The device layer: the one place where this crate meets the device crates
+//! (the CUDA crate `midnight-gpu`, the Apple GPU crate `midnight-metal`) and
+//! the hook layer `midnight_proofs::gpu`.
 //!
-//! The service talks to a device only through the [`Device`] trait. Two
+//! The service talks to a device only through the [`Device`] trait. Three
 //! implementations exist:
 //!
 //! - [`NoDevice`]: no device. Every phase runs on the CPU. Used by a build
-//!   without the `cuda` feature, by `device = "off"`, and when the run-time
-//!   detection finds no device.
+//!   without the `cuda` and `metal` features, by `device = "off"`, and when
+//!   the run-time detection finds no device.
 //! - `CudaDevice` (module `cuda`): the hooks of `midnight_proofs::gpu` backed
 //!   by `midnight-gpu`. It is compiled only when the build has the cfg
 //!   `midnight_gpu_linked`, which the build script sets with the `cuda`
 //!   feature.
+//! - `MetalDevice` (module `metal`, file `device/metal.rs`): the same hooks
+//!   backed by `midnight-metal`. It is compiled only when the build has the
+//!   cfg `midnight_metal_linked`, which the build script sets with the `metal`
+//!   feature. A build with both features tries CUDA first: the hooks of
+//!   `midnight_proofs::gpu` are installed once per process, so when a CUDA
+//!   device is detected the Metal binding cannot install and reports no device
+//!   (in practice no machine has both).
 //!
 //! Tests and embedders can implement [`Device`] themselves, for example to
 //! give the admission ladder a fake memory reading.
@@ -360,18 +368,24 @@ pub fn build_features() -> Vec<&'static str> {
     if cfg!(feature = "cuda") {
         v.push("cuda");
     }
+    if cfg!(feature = "metal") {
+        v.push("metal");
+    }
     if cfg!(feature = "test-seed") {
         v.push("test-seed");
     }
     if cfg!(midnight_gpu_linked) {
         v.push("midnight-gpu-linked");
     }
+    if cfg!(midnight_metal_linked) {
+        v.push("midnight-metal-linked");
+    }
     v
 }
 
-/// The device of this build and configuration: a CUDA device when the build
-/// links the device crates, `select` is not `off` and one is detected;
-/// otherwise [`NoDevice`].
+/// The device of this build and configuration: a CUDA device (feature `cuda`)
+/// or a Metal device (feature `metal`) when the build links the device crates,
+/// `select` is not `off` and one is detected; otherwise [`NoDevice`].
 pub fn detect(select: crate::config::DeviceSelect) -> Box<dyn Device> {
     if select == crate::config::DeviceSelect::Off {
         return Box::new(NoDevice);
@@ -380,8 +394,18 @@ pub fn detect(select: crate::config::DeviceSelect) -> Box<dyn Device> {
     if let Some(d) = cuda::CudaDevice::detect() {
         return Box::new(d);
     }
+    // the hooks install once per process: after a CUDA device took them this
+    // finds no device
+    #[cfg(all(feature = "metal", midnight_metal_linked))]
+    if let Some(d) = metal::MetalDevice::detect() {
+        return Box::new(d);
+    }
     Box::new(NoDevice)
 }
+
+/// The binding to `midnight-metal`: see `device/metal.rs`.
+#[cfg(all(feature = "metal", midnight_metal_linked))]
+mod metal;
 
 /// The binding to `midnight-gpu` and `midnight_proofs::gpu`: every call into
 /// those crates is in this module. Compiled only with the cfg
@@ -1095,6 +1119,17 @@ mod tests {
         }
         // callable whether or not a device is present
         let _ = midnight_gpu::present();
+    }
+
+    /// The `metal` feature links the device crates: a build where the feature
+    /// is on but the binding is compiled out fails here.
+    #[cfg(feature = "metal")]
+    #[test]
+    fn metal_feature_links_the_device_crates() {
+        const { assert!(cfg!(midnight_metal_linked)) };
+        assert!(build_features().contains(&"midnight-metal-linked"));
+        // callable whether or not a device is present
+        let _ = midnight_metal::present();
     }
 
     #[test]

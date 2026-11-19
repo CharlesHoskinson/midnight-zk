@@ -29,6 +29,12 @@ pub mod device {
     use super::Metrics;
     use crate::{Key, Result};
 
+    /// The device model and its total memory in bytes.
+    pub fn info() -> Result<(String, u64)> {
+        let info = gpu::present().ok_or("CUDA device unavailable")?;
+        Ok((info.name.clone(), info.total_bytes))
+    }
+
     pub fn install(
         params: &ParamsKZG<Bls12>,
         pk: &Key,
@@ -96,6 +102,80 @@ pub mod device {
                 }
             }),
             peak_bytes,
+        })
+    }
+}
+
+/// The Metal counterpart of the CUDA `device` module above, on `midnight-metal`.
+/// With `rc1-bench-cuda` also on, the CUDA module is the one built.
+#[cfg(all(feature = "rc1-bench-metal", not(feature = "rc1-bench-cuda")))]
+pub mod device {
+    use midnight_curves::Bls12;
+    use midnight_metal as metal;
+    use midnight_proofs::{
+        gpu::{self as hooks},
+        poly::kzg::params::ParamsKZG,
+    };
+
+    use super::Metrics;
+    use crate::{Key, Result};
+
+    /// The device model and its recommended working set in bytes (unified
+    /// memory has no dedicated total).
+    pub fn info() -> Result<(String, u64)> {
+        let info = metal::present().ok_or("Metal device unavailable")?;
+        Ok((info.name.clone(), info.recommended_max_working_set))
+    }
+
+    /// What the CUDA `install` returns as registrations: `midnight-metal` has
+    /// no resident SRS or key registration, so the handle is empty.
+    pub struct Handles;
+
+    /// Installs the hooks. `params` and `pk` are not handed to the device.
+    pub fn install(_params: &ParamsKZG<Bls12>, _pk: &Key) -> Result<Handles> {
+        if !metal::device() {
+            return Err("Metal device unavailable".into());
+        }
+        if !hooks::install(hooks::GpuHooks {
+            msm_g1: Some(metal::msm_g1),
+            fft: Some(metal::fft),
+            ifft: Some(metal::ifft),
+            quotient: Some(metal::quotient),
+        }) {
+            return Err("hooks already installed".into());
+        }
+        Ok(Handles)
+    }
+
+    pub struct Baseline;
+
+    pub fn begin() -> Baseline {
+        metal::begin_request();
+        metal::reset_stats();
+        hooks::reset_hook_declines();
+        Baseline
+    }
+
+    /// The counters of one proof. Unified memory has no host-device copies, so
+    /// the transfer and staging counters are 0.
+    pub fn finish(_before: Baseline) -> Result<Metrics> {
+        let stats = metal::stats();
+        let hook_declines = hooks::hook_declines();
+        let declines = metal::declines();
+        let peak_bytes = metal::device_bytes().1;
+        if !metal::end_request() {
+            return Err("device cleanup failed".into());
+        }
+        Ok(Metrics {
+            msm: stats.msm.served,
+            ntt: stats.fft.served + stats.ifft.served,
+            quotient: stats.quotient.served,
+            device_errors: declines.iter().filter(|d| d.1 == "device-error").map(|d| d.2).sum(),
+            fallbacks: hook_declines.iter().map(|d| d.2).sum(),
+            declines,
+            hook_declines,
+            peak_bytes,
+            ..Metrics::default()
         })
     }
 }

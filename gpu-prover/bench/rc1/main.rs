@@ -3,7 +3,7 @@ mod circuit;
 mod metrics;
 
 use std::{
-    env, fs,
+    env,
     io::{self, Write},
     process::{Command, Stdio},
     thread,
@@ -11,7 +11,7 @@ use std::{
 };
 
 use circuit::Chain;
-#[cfg(not(feature = "rc1-bench-cuda"))]
+#[cfg(not(rc1_device))]
 use metrics::Metrics;
 use midnight_curves::{Bls12, Fq};
 use midnight_proofs::{
@@ -41,6 +41,24 @@ fn number(name: &str, default: u32) -> Result<u32> {
 
 // Setup and key deserialization can raise load. Sample after both, adjacent to
 // proof 0.
+/// The one-minute load average: `/proc/loadavg` on Linux, `getloadavg` elsewhere.
+#[cfg(target_os = "linux")]
+fn one_minute_load() -> Result<f64> {
+    let line = std::fs::read_to_string("/proc/loadavg")?;
+    Ok(line.split_whitespace().next().ok_or("missing load average")?.parse::<f64>()?)
+}
+
+/// The one-minute load average: `/proc/loadavg` on Linux, `getloadavg` elsewhere.
+#[cfg(not(target_os = "linux"))]
+fn one_minute_load() -> Result<f64> {
+    let mut avg = [0f64; 1];
+    // SAFETY: `avg` has room for the one sample requested.
+    if unsafe { libc::getloadavg(avg.as_mut_ptr(), 1) } != 1 {
+        return Err("the load average is unavailable".into());
+    }
+    Ok(avg[0])
+}
+
 /// Waits for a one-minute load below `RC1_MAX_LOAD` (default 2).
 fn await_quiet() -> Result<f64> {
     let max = match env::var("RC1_MAX_LOAD") {
@@ -48,8 +66,7 @@ fn await_quiet() -> Result<f64> {
         Err(_) => 2.0,
     };
     loop {
-        let line = fs::read_to_string("/proc/loadavg")?;
-        let load = line.split_whitespace().next().ok_or("missing load average")?.parse::<f64>()?;
+        let load = one_minute_load()?;
         if load < max {
             return Ok(load);
         }
@@ -83,9 +100,9 @@ fn verify(batch: &Batch, chain: &Chain) -> Result<Vec<f64>> {
 }
 
 fn stock_verify(batch: &Batch) -> Result<Vec<f64>> {
-    #[cfg(feature = "rc1-bench-cuda")]
+    #[cfg(rc1_device)]
     let verifier = env::var_os("RC1_STOCK_BIN").ok_or("set RC1_STOCK_BIN")?;
-    #[cfg(not(feature = "rc1-bench-cuda"))]
+    #[cfg(not(rc1_device))]
     let verifier = env::current_exe()?;
     let mut child = Command::new(verifier)
         .arg("verify")
@@ -120,16 +137,13 @@ fn run(chain: &Chain, smoke: bool) -> Result<()> {
         proofs: Vec::new(),
     };
     params.verifier_params().write(&mut batch.params, SerdeFormat::Processed)?;
-    #[cfg(feature = "rc1-bench-cuda")]
+    #[cfg(rc1_device)]
     let handles = metrics::device::install(&params, &pk)?;
-    #[cfg(feature = "rc1-bench-cuda")]
-    let (gpu_model, total_bytes) = {
-        let info = midnight_gpu::present().ok_or("CUDA device unavailable")?;
-        (info.name.as_str(), info.total_bytes)
-    };
-    #[cfg(not(feature = "rc1-bench-cuda"))]
-    let (gpu_model, total_bytes) = ("NA", 0);
-    let mode = if cfg!(feature = "rc1-bench-cuda") {
+    #[cfg(rc1_device)]
+    let (gpu_model, total_bytes) = metrics::device::info()?;
+    #[cfg(not(rc1_device))]
+    let (gpu_model, total_bytes) = ("NA".to_string(), 0u64);
+    let mode = if cfg!(rc1_device) {
         "gpu"
     } else {
         "cpu"
@@ -141,7 +155,7 @@ fn run(chain: &Chain, smoke: bool) -> Result<()> {
     };
     let mut rows = Vec::new();
     for _ in 0..=warm {
-        #[cfg(feature = "rc1-bench-cuda")]
+        #[cfg(rc1_device)]
         let baseline = metrics::device::begin();
         let start = Instant::now();
         let mut transcript = Blake::init();
@@ -156,15 +170,17 @@ fn run(chain: &Chain, smoke: bool) -> Result<()> {
         );
         let proof = transcript.finalize();
         let prove_s = start.elapsed().as_secs_f64();
-        #[cfg(feature = "rc1-bench-cuda")]
+        #[cfg(rc1_device)]
         let metrics = metrics::device::finish(baseline)?;
-        #[cfg(not(feature = "rc1-bench-cuda"))]
+        #[cfg(not(rc1_device))]
         let metrics = Metrics::default();
         result?;
         batch.proofs.push(hex::encode(proof));
         rows.push((prove_s, metrics));
     }
-    #[cfg(feature = "rc1-bench-cuda")]
+    // the CUDA handles release their registrations here; the Metal handle is empty
+    #[cfg(rc1_device)]
+    #[allow(clippy::drop_non_drop)]
     drop(handles);
     drop(pk);
     drop(params);
@@ -203,15 +219,15 @@ fn main() -> Result<()> {
         return Err("supported k is 5..=21".into());
     }
     match env::args().nth(1).as_deref() {
-        Some("prepare") if !cfg!(feature = "rc1-bench-cuda") => cache::prepare(&chain),
-        Some("verify") if !cfg!(feature = "rc1-bench-cuda") => {
+        Some("prepare") if !cfg!(rc1_device) => cache::prepare(&chain),
+        Some("verify") if !cfg!(rc1_device) => {
             let batch = serde_json::from_reader(io::stdin().lock())?;
             serde_json::to_writer(io::stdout().lock(), &verify(&batch, &chain)?)?;
             io::stdout().flush()?;
             Ok(())
         }
         Some("run") => run(&chain, false),
-        Some("smoke") if !cfg!(feature = "rc1-bench-cuda") && chain.k < 21 => run(&chain, true),
+        Some("smoke") if !cfg!(rc1_device) && chain.k < 21 => run(&chain, true),
         _ => Err("expected prepare, run, verify, or a small-k CPU smoke".into()),
     }
 }
