@@ -40,14 +40,66 @@ use std::{
 
 use ff::PrimeField;
 
+/// From this many bytes on, [`zero_bytes`] spreads the zeroing over the
+/// threads of the current rayon pool.
+const PAR_ZERO_BYTES: usize = 1 << 20;
+
+/// Bytes per zeroing task.
+const ZERO_TASK_BYTES: usize = 1 << 18;
+
 /// Zeroes `bytes` bytes at `ptr` with volatile writes that the compiler
 /// cannot remove.
+///
+/// The writes are 8-byte words where the address is aligned (single bytes
+/// at the unaligned ends), and a range of at least [`PAR_ZERO_BYTES`] is cut
+/// into tasks run on the threads of the current rayon pool. Every write is
+/// volatile and followed by a compiler fence on its thread, and this
+/// function returns only once every task has finished (the join of the
+/// pool orders their writes before the return), so the whole range is
+/// zero when it returns, as with one thread.
 ///
 /// # Safety
 /// `ptr` must be valid for writes of `bytes` bytes.
 pub(crate) unsafe fn zero_bytes(ptr: *mut u8, bytes: usize) {
-    for i in 0..bytes {
-        // SAFETY: the caller guarantees the range is writable.
+    if bytes >= PAR_ZERO_BYTES {
+        use rayon::iter::{IntoParallelIterator, ParallelIterator};
+        // The address crosses threads as an integer: each task writes only
+        // its own disjoint part of the range.
+        let addr = ptr as usize;
+        (0..bytes.div_ceil(ZERO_TASK_BYTES)).into_par_iter().for_each(|task| {
+            let start = task * ZERO_TASK_BYTES;
+            let len = ZERO_TASK_BYTES.min(bytes - start);
+            // SAFETY: `start + len <= bytes`, so the part lies within the
+            // range the caller guarantees writable, and no other task
+            // writes it.
+            unsafe { zero_bytes_here((addr + start) as *mut u8, len) };
+        });
+    } else {
+        // SAFETY: as guaranteed by the caller.
+        unsafe { zero_bytes_here(ptr, bytes) };
+    }
+    compiler_fence(Ordering::SeqCst);
+}
+
+/// [`zero_bytes`] on the calling thread.
+///
+/// # Safety
+/// `ptr` must be valid for writes of `bytes` bytes.
+unsafe fn zero_bytes_here(ptr: *mut u8, bytes: usize) {
+    let head = ptr.align_offset(std::mem::align_of::<u64>()).min(bytes);
+    let words = (bytes - head) / std::mem::size_of::<u64>();
+    let tail = head + words * std::mem::size_of::<u64>();
+    // SAFETY (all three loops): every address written is in
+    // `ptr..ptr + bytes`, which the caller guarantees writable; the word
+    // writes start at the aligned address `ptr + head`.
+    for i in 0..head {
+        unsafe { write_volatile(ptr.add(i), 0u8) };
+    }
+    let word_ptr = unsafe { ptr.add(head) } as *mut u64;
+    for i in 0..words {
+        unsafe { write_volatile(word_ptr.add(i), 0u64) };
+    }
+    for i in tail..bytes {
         unsafe { write_volatile(ptr.add(i), 0u8) };
     }
     compiler_fence(Ordering::SeqCst);
@@ -395,5 +447,56 @@ impl<F> Drop for ErasingVec<F> {
             // type or by the `Vec` it adopted, whose layout is the same).
             unsafe { dealloc(self.ptr.as_ptr() as *mut u8, layout) };
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::zero_bytes;
+
+    /// Every byte of the range is zeroed and no byte outside it is
+    /// touched, at every alignment, below and above the parallel size.
+    #[test]
+    fn zero_bytes_zeroes_exactly_the_range() {
+        let sizes = [
+            0usize,
+            1,
+            7,
+            8,
+            9,
+            63,
+            4096 + 3,
+            super::PAR_ZERO_BYTES - 1,
+            super::PAR_ZERO_BYTES,
+            3 * super::ZERO_TASK_BYTES + super::PAR_ZERO_BYTES + 5,
+        ];
+        for &bytes in &sizes {
+            for offset in 0..9usize {
+                let mut buf: Vec<u8> = (0..bytes + 32).map(|i| (i % 251) as u8 | 1).collect();
+                let before = buf.clone();
+                // SAFETY: `offset + bytes <= buf.len()`.
+                unsafe { zero_bytes(buf.as_mut_ptr().add(offset), bytes) };
+                for (i, (b, old)) in buf.iter().zip(&before).enumerate() {
+                    if (offset..offset + bytes).contains(&i) {
+                        assert_eq!(*b, 0, "bytes {bytes} offset {offset} at {i}");
+                    } else {
+                        assert_eq!(b, old, "bytes {bytes} offset {offset} at {i}");
+                    }
+                }
+            }
+        }
+    }
+
+    /// From inside a pool of one thread too (no other worker to run the
+    /// tasks), the zeroing completes.
+    #[test]
+    fn zero_bytes_in_a_single_thread_pool() {
+        let bytes = 2 * super::PAR_ZERO_BYTES + 3;
+        let mut buf = vec![0xffu8; bytes];
+        rayon::ThreadPoolBuilder::new().num_threads(1).build().unwrap().install(|| {
+            // SAFETY: the whole buffer.
+            unsafe { zero_bytes(buf.as_mut_ptr(), bytes) };
+        });
+        assert!(buf.iter().all(|b| *b == 0));
     }
 }

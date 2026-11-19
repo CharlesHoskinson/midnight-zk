@@ -34,6 +34,7 @@ use group::Group;
 use midnight_curves::{msm::msm_pippenger, pairing::MultiMillerLoop, serde::SerdeObject};
 use rand_core::OsRng;
 
+#[cfg_attr(feature = "prover-par", allow(unused_imports))]
 use crate::{
     poly::{
         Coeff, Error, Polynomial, PolynomialRepresentation, ProverQuery,
@@ -275,10 +276,15 @@ impl<E: KZGEngine> PolynomialCommitmentScheme<E::Fr> for KZGCommitmentScheme<E> 
         /// Fused parallel implementation: a single pass accumulates all
         /// scaled contributions directly into the output buffer, avoiding
         /// M intermediate allocations and the sequential reduce chain.
+        #[cfg_attr(feature = "prover-par", allow(unreachable_code))]
         fn poly_inner_product<F: ff::PrimeField>(
             polys: &[&Polynomial<F, Coeff>],
             scalars: impl IntoIterator<Item = F>,
         ) -> Polynomial<F, Coeff> {
+            // With the feature `prover-par`, the same sums in tasks of
+            // bounded size (see `crate::par::open`).
+            #[cfg(feature = "prover-par")]
+            return crate::par::open::poly_inner_product(polys, scalars);
             let scalars: Vec<F> = scalars.into_iter().take(polys.len()).collect();
             let max_len = polys.iter().map(|p| p.len()).max().unwrap_or(0);
             let mut values = vec![F::ZERO; max_len];
@@ -366,8 +372,15 @@ impl<E: KZGEngine> PolynomialCommitmentScheme<E::Fr> for KZGCommitmentScheme<E> 
         let x3 = truncate(x3);
 
         // Evaluate all q_polys at x3 in parallel, then write sequentially.
+        #[cfg(not(feature = "prover-par"))]
         let q_evals: Vec<E::Fr> =
             q_polys.par_iter().map(|q_poly| eval_polynomial(&q_poly.values, x3)).collect();
+        // With the feature `prover-par`, the same evaluations in tasks of
+        // bounded size (see `crate::par::open`).
+        #[cfg(feature = "prover-par")]
+        let q_evals: Vec<E::Fr> = crate::par::open::eval_many(
+            &q_polys.iter().map(|q_poly| (&q_poly.values[..], x3)).collect::<Vec<_>>(),
+        );
         for eval in &q_evals {
             transcript.write(eval).map_err(|_| Error::OpeningError)?;
         }
@@ -381,11 +394,29 @@ impl<E: KZGEngine> PolynomialCommitmentScheme<E::Fr> for KZGCommitmentScheme<E> 
 
             poly_inner_product(&polys, powers)
         };
+        #[cfg(not(feature = "prover-par"))]
         let v = eval_polynomial(&final_poly, x3);
 
+        #[cfg(not(feature = "prover-par"))]
         let pi = {
             let pi_poly = Polynomial::<_, Coeff> {
                 values: kate_division(&(&final_poly - v).values, x3),
+                _marker: PhantomData,
+            };
+            Self::commit(
+                params,
+                &pi_poly,
+                PolynomialLabel::Custom("kzg_proof".into()),
+            )
+        };
+        // With the feature `prover-par`, the same quotient by `X - x3`,
+        // divided in parallel blocks from `final_poly` itself: the quotient
+        // does not depend on the constant coefficient, so neither `v` nor
+        // the copy `final_poly - v` is needed (see `crate::par::open`).
+        #[cfg(feature = "prover-par")]
+        let pi = {
+            let pi_poly = Polynomial::<_, Coeff> {
+                values: crate::par::open::kate_division(&final_poly.values, x3),
                 _marker: PhantomData,
             };
             Self::commit(

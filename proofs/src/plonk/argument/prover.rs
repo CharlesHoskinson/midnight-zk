@@ -5,6 +5,7 @@ use rayon::iter::{
     IndexedParallelIterator, IntoParallelIterator, IntoParallelRefIterator, ParallelIterator,
 };
 
+#[cfg_attr(feature = "prover-par", allow(unused_imports))]
 use crate::{
     plonk::{
         AbsorbedVk, ConstraintSystem, Error,
@@ -209,6 +210,7 @@ impl<F: PrimeField> Committed<F, Coeff> {
         F: Hashable<T::Hash> + PrimeField,
         T: Transcript,
     {
+        #[cfg(not(feature = "prover-par"))]
         let evaluate = |poly: &Polynomial<F, Coeff>, x: F| -> Evaluation<F> {
             Evaluation {
                 point: x,
@@ -216,6 +218,7 @@ impl<F: PrimeField> Committed<F, Coeff> {
             }
         };
 
+        #[cfg(not(feature = "prover-par"))]
         let evals_map: BTreeMap<PolynomialLabel, Vec<Evaluation<F>>> = self
             .labels
             .iter()
@@ -228,6 +231,30 @@ impl<F: PrimeField> Committed<F, Coeff> {
                 )
             })
             .collect();
+        // With the feature `prover-par`, all evaluations of the group are
+        // computed at once, in tasks of bounded size, and gathered in the
+        // same map: the same values (see `crate::par::open`).
+        #[cfg(feature = "prover-par")]
+        let evals_map: BTreeMap<PolynomialLabel, Vec<Evaluation<F>>> = {
+            let points: Vec<Vec<F>> = (self.labels.iter())
+                .map(|label| argument::eval_points(cs, label, x_rotations))
+                .collect();
+            let jobs: Vec<(&[F], F)> = (self.polys.iter().zip(&points))
+                .flat_map(|(poly, points)| points.iter().map(move |x| (&poly.values[..], *x)))
+                .collect();
+            let mut evals = crate::par::open::eval_many(&jobs).into_iter();
+            (self.labels.iter().zip(points))
+                .map(|(label, points)| {
+                    let evaluations = (points.into_iter())
+                        .map(|point| Evaluation {
+                            point,
+                            eval: evals.next().expect("one evaluation per point"),
+                        })
+                        .collect();
+                    (label.clone(), evaluations)
+                })
+                .collect()
+        };
 
         for evals in evals_map.values() {
             for evaluation in evals.iter() {

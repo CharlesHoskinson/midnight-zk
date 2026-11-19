@@ -323,6 +323,10 @@ pub(crate) fn instance(seed: u64) -> [Fq; 1] {
     [Fq::from(seed.wrapping_mul(31).wrapping_add(7))]
 }
 
+/// The shape and the blinding seed are process-wide: one seeded proof at a
+/// time, so two tests that prove at once keep their own draws.
+pub(crate) static SEEDED: std::sync::Mutex<()> = std::sync::Mutex::new(());
+
 /// A proof for the circuit of shape `seed` with every random draw seeded
 /// (the quotient blinding included). Returns the proof bytes, and whether
 /// the proof verifies.
@@ -332,9 +336,6 @@ pub(crate) fn prove(
     seed: u64,
     satisfied: bool,
 ) -> (Vec<u8>, bool) {
-    // The shape and the blinding seed are process-wide: one seeded proof at a
-    // time, so two tests that prove at once keep their own draws.
-    static SEEDED: std::sync::Mutex<()> = std::sync::Mutex::new(());
     let seeded = SEEDED.lock().unwrap_or_else(|e| e.into_inner());
     #[cfg(not(feature = "gpu"))]
     set_shape(seed, satisfied);
@@ -385,6 +386,212 @@ pub(crate) fn prove(
     (proof, ok)
 }
 
+/// A chain of squarings, as the circuit of the rc1 benchmark of the prover
+/// service, with seeded proofs (tests only).
+#[cfg(test)]
+pub(crate) mod chain {
+    use ff::Field;
+    use midnight_curves::{Bls12, Fq};
+    use rand_chacha::ChaCha20Rng;
+    use rand_core::SeedableRng;
+
+    use crate::{
+        circuit::{Layouter, SimpleFloorPlanner, Value},
+        plonk::{
+            Advice, Circuit, Column, ConstraintSystem, Constraints, Error, Expression, Fixed,
+            Instance, ProvingKey, Selector, create_proof, keygen_pk, keygen_vk_with_k, prepare,
+        },
+        poly::{
+            Rotation,
+            commitment::Guard,
+            kzg::{KZGCommitmentScheme, params::ParamsKZG},
+        },
+        transcript::{CircuitTranscript, Transcript},
+        utils::SerdeFormat,
+    };
+
+    pub(crate) type Scheme = KZGCommitmentScheme<Bls12>;
+
+    fn step(x: Fq) -> Fq {
+        x.square() + Fq::from(3)
+    }
+
+    /// A chain of squarings over four advice columns, as the circuit of the
+    /// rc1 benchmark, with a second region holding a fixed column so that
+    /// the layout has more than one region.
+    #[derive(Clone)]
+    pub(crate) struct Chain {
+        pub(crate) rows: usize,
+        pub(crate) start: u64,
+    }
+
+    #[derive(Clone)]
+    pub(crate) struct ChainConfig {
+        pub(crate) advice: [Column<Advice>; 4],
+        fixed: Column<Fixed>,
+        public: Column<Instance>,
+        active: Selector,
+    }
+
+    impl Chain {
+        pub(crate) fn instance(&self) -> [Fq; 2] {
+            let start = Fq::from(self.start);
+            [start, (0..4 * self.rows).fold(start, |x, _| step(x))]
+        }
+    }
+
+    impl Circuit<Fq> for Chain {
+        type Config = ChainConfig;
+        type FloorPlanner = SimpleFloorPlanner;
+        #[cfg(feature = "circuit-params")]
+        type Params = ();
+
+        fn without_witnesses(&self) -> Self {
+            self.clone()
+        }
+
+        fn configure(meta: &mut ConstraintSystem<Fq>) -> ChainConfig {
+            let advice = std::array::from_fn(|_| meta.advice_column());
+            let fixed = meta.fixed_column();
+            let public = meta.instance_column();
+            let active = meta.selector();
+            meta.enable_equality(advice[0]);
+            meta.enable_equality(advice[1]);
+            meta.enable_equality(public);
+            meta.create_gate("four squarings", |cells| {
+                let mut chain = advice.map(|col| cells.query_advice(col, Rotation::cur())).to_vec();
+                chain.push(cells.query_advice(advice[0], Rotation::next()));
+                Constraints::with_selector(
+                    active,
+                    chain
+                        .windows(2)
+                        .map(|pair| {
+                            pair[0].clone() * pair[0].clone() + Expression::Constant(Fq::from(3))
+                                - pair[1].clone()
+                        })
+                        .collect(),
+                )
+            });
+            meta.create_gate("fixed copy", |cells| {
+                let f = cells.query_fixed(fixed, Rotation::cur());
+                let a = cells.query_advice(advice[1], Rotation::cur());
+                Constraints::without_selector(vec![f.clone() * (a - f)])
+            });
+            ChainConfig {
+                advice,
+                fixed,
+                public,
+                active,
+            }
+        }
+
+        fn synthesize(
+            &self,
+            config: ChainConfig,
+            mut layouter: impl Layouter<Fq>,
+        ) -> Result<(), Error> {
+            let (start, end) = layouter.assign_region(
+                || "chain",
+                |mut region| {
+                    let mut x = Fq::from(self.start);
+                    let mut start = None;
+                    for row in 0..self.rows {
+                        config.active.enable(&mut region, row)?;
+                        for col in config.advice {
+                            let cell =
+                                region.assign_advice(|| "x", col, row, || Value::known(x))?;
+                            if row == 0 && col == config.advice[0] {
+                                start = Some(cell.cell());
+                            }
+                            x = step(x);
+                        }
+                    }
+                    let end = region.assign_advice(
+                        || "endpoint",
+                        config.advice[0],
+                        self.rows,
+                        || Value::known(x),
+                    )?;
+                    Ok((start.unwrap(), end.cell()))
+                },
+            )?;
+            layouter.assign_region(
+                || "fixed",
+                |mut region| {
+                    for row in 0..3 {
+                        let v = Fq::from(5 + row as u64);
+                        region.assign_fixed(|| "f", config.fixed, row, || Value::known(v))?;
+                        region.assign_advice(|| "a", config.advice[1], row, || Value::known(v))?;
+                    }
+                    Ok(())
+                },
+            )?;
+            layouter.constrain_instance(start, config.public, 0)?;
+            layouter.constrain_instance(end, config.public, 1)
+        }
+    }
+
+    /// A seeded proof of `chain` with `pk`; the caller holds
+    /// `crate::test_circuit::SEEDED` and has set the blinding seed.
+    pub(crate) fn prove_seeded(
+        params: &ParamsKZG<Bls12>,
+        pk: &ProvingKey<Fq, Scheme>,
+        chain: &Chain,
+        seed: u64,
+    ) -> Vec<u8> {
+        let inst = chain.instance();
+        let mut transcript = CircuitTranscript::<blake2b_simd::State>::init();
+        create_proof::<Fq, Scheme, _, _>(
+            params,
+            pk,
+            chain,
+            #[cfg(feature = "committed-instances")]
+            0,
+            &[&inst],
+            &mut transcript,
+            ChaCha20Rng::seed_from_u64(seed),
+        )
+        .unwrap();
+        transcript.finalize()
+    }
+
+    pub(crate) fn verifies(
+        params: &ParamsKZG<Bls12>,
+        pk: &ProvingKey<Fq, Scheme>,
+        chain: &Chain,
+        proof: &[u8],
+    ) -> bool {
+        let inst = chain.instance();
+        let mut transcript = CircuitTranscript::<blake2b_simd::State>::init_from_bytes(proof);
+        prepare::<Fq, Scheme, _>(
+            pk.get_vk(),
+            #[cfg(feature = "committed-instances")]
+            &[],
+            &[&inst],
+            &mut transcript,
+        )
+        .is_ok_and(|g| g.verify(&params.verifier_params()).is_ok())
+    }
+
+    pub(crate) fn chain_setup(k: u32, chain: &Chain) -> (ParamsKZG<Bls12>, ProvingKey<Fq, Scheme>) {
+        let params = ParamsKZG::<Bls12>::unsafe_setup(k, ChaCha20Rng::seed_from_u64(k as u64));
+        let vk = keygen_vk_with_k::<Fq, Scheme, _>(&params, chain, k).unwrap();
+        let pk = keygen_pk(vk, chain).unwrap();
+        (params, pk)
+    }
+
+    pub(crate) fn read_back(pk: &ProvingKey<Fq, Scheme>) -> ProvingKey<Fq, Scheme> {
+        let bytes = pk.to_bytes(SerdeFormat::RawBytes);
+        ProvingKey::<Fq, Scheme>::from_bytes::<Chain>(
+            &bytes,
+            SerdeFormat::RawBytes,
+            #[cfg(feature = "circuit-params")]
+            (),
+        )
+        .unwrap()
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -404,4 +611,54 @@ mod tests {
     }
 
     const GOLDEN: &str = "5177fc0d3371a3ee809efe70428114afb17eddddc866a104b37e6369c5da96f2";
+
+    /// Seeded proofs at `2^14` rows, a size at which the parallel paths of
+    /// the feature `prover-par` take over (divisions in several blocks,
+    /// chunked evaluations and encodings), have the same digests in every
+    /// build: the digests below were taken from a build without the
+    /// feature. The random circuit has lookups, a trash argument and copy
+    /// constraints; the chain circuit is proved with its key from keygen
+    /// and with the same key read back from bytes (first and second proof).
+    #[test]
+    fn seeded_proof_digests_at_scale() {
+        use super::chain::{Chain, chain_setup, prove_seeded, read_back, verifies};
+
+        let digest = |proof: &[u8]| {
+            blake2b_simd::Params::new().hash_length(32).hash(proof).to_hex().to_string()
+        };
+        let k = 14;
+        let mut digests = Vec::new();
+        for seed in [7u64, 21] {
+            let (params, pk) = setup(seed, true, k);
+            let (proof, ok) = prove(&params, &pk, seed, true);
+            assert!(ok, "seed {seed}: the satisfied circuit verifies");
+            digests.push(digest(&proof));
+        }
+
+        let chain = Chain {
+            rows: (1 << k) - 24,
+            start: 7,
+        };
+        let (params, pk) = chain_setup(k, &chain);
+        let read = read_back(&pk);
+        let seeded = SEEDED.lock().unwrap_or_else(|e| e.into_inner());
+        crate::plonk::prover::test_blinding::set(Some(0xc4a1));
+        let from_keygen = prove_seeded(&params, &pk, &chain, 5);
+        let read_first = prove_seeded(&params, &read, &chain, 5);
+        let read_second = prove_seeded(&params, &read, &chain, 5);
+        crate::plonk::prover::test_blinding::set(None);
+        drop(seeded);
+        assert!(verifies(&params, &pk, &chain, &from_keygen));
+        assert_eq!(read_first, from_keygen);
+        assert_eq!(read_second, from_keygen);
+        digests.push(digest(&from_keygen));
+
+        assert_eq!(digests, GOLDEN_AT_SCALE, "proof bytes changed");
+    }
+
+    const GOLDEN_AT_SCALE: [&str; 3] = [
+        "08786ddbd7256bb817805f75492c6ccc957a7d825504f6dd084ab1f0dc3088ed",
+        "40b4a1e13ac60011fccfea6f9032b47049c84736bc525938679caa13cd5f06e7",
+        "648ff1651d7a3714197f56801c615265c020cac2a57cf669825a952e9319b510",
+    ];
 }

@@ -166,6 +166,12 @@ pub fn eval_interpolant<F: Field>(points: &[F], evals: &[F], x: F) -> (F, F) {
 /// coefficients. That is cheaper when the product is sparse, as for the
 /// `t`-th roots of a point, whose product is `X^t - x`.
 pub fn divide_by_roots<F: Field>(poly: &[F], roots: &[F]) -> Vec<F> {
+    // With the feature `prover-par`, long polynomials are divided in
+    // parallel blocks: the same quotient (see `crate::par::open`).
+    #[cfg(feature = "prover-par")]
+    if poly.len() >= crate::par::open::PAR_MIN_LEN {
+        return crate::par::open::divide_by_roots(poly, roots);
+    }
     let mut vanishing = vec![F::ONE];
     for root in roots {
         let mut next = vec![F::ZERO; vanishing.len() + 1];
@@ -196,6 +202,13 @@ pub fn divide_by_roots<F: Field>(poly: &[F], roots: &[F]) -> Vec<F> {
 /// This utility function will parallelize an operation that is to be
 /// performed over a mutable slice.
 pub fn parallelize<T: Send, F: Fn(&mut [T], usize) + Send + Sync + Clone>(v: &mut [T], f: F) {
+    // With the feature `prover-par`, a long slice is cut into a few chunks
+    // per thread rather than one, so that faster threads take over the work
+    // of slower ones; `f` sees each element once, with its offset, as here.
+    #[cfg(feature = "prover-par")]
+    if crate::par::columns::parallelize(v, &f) {
+        return;
+    }
     // Algorithm rationale:
     //
     // Using the stdlib `chunks_mut` will lead to severe load imbalance.

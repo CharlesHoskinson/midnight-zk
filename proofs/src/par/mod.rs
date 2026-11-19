@@ -21,5 +21,6 @@
 
 pub(crate) mod columns;
 pub(crate) mod invert;
+pub(crate) mod layout;
 pub(crate) mod open;
 pub(crate) mod product;
