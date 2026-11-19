@@ -24,11 +24,16 @@
 //! Where `midnight-metal` has no counterpart of a `midnight-gpu` function the
 //! binding does the neutral thing and names the missing function:
 //!
-//! - Resident SRS tables and key polynomials. `midnight-metal` has no
-//!   `register_srs`, `register_key`, `set_keep_resident`, `evict_key_copies`
-//!   or `evict_tables`. [`Device::prepare`], [`Device::set_keep`] and
-//!   [`Device::evict`] hold nothing and free 0 bytes. When those functions
-//!   exist, they go where the comments below say.
+//! - Resident SRS tables: `midnight_metal::register_srs` exists and
+//!   [`Device::prepare`] uses it, as the CUDA binding does. Unlike CUDA's, the
+//!   device table persists from the first MSM until the handle is dropped:
+//!   there is no call that frees an uploaded table and keeps the registration,
+//!   and none that reports whether a table is uploaded. [`Device::evict`] with
+//!   `tables` drops the handles (the only way to free them) and [`Device::held`]
+//!   reports their point bytes once an upload has happened (an upper bound).
+//!   Resident key polynomials have no counterpart (`register_key`,
+//!   `set_keep_resident`, `evict_key_copies`): [`Device::set_keep`] only
+//!   stores the flag and `evict` frees no key bytes.
 //! - The erasure report. `midnight_metal::end_request` returns one `bool`
 //!   (every per-request buffer zeroed and released); there is no region count,
 //!   no quarantine and no read-back check. The report carries what the crate
@@ -49,7 +54,10 @@ use std::{
 };
 
 use midnight_metal::{self as metal, G1AffineLimbs, G1JacobianLimbs, Scalar};
-use midnight_proofs::gpu::{self as hooks, GpuHooks};
+use midnight_proofs::{
+    gpu::{self as hooks, GpuHooks, adapter},
+    poly::{Coeff, LagrangeCoeff},
+};
 
 use super::*;
 
@@ -182,8 +190,50 @@ fn is_fallback(reason: &str) -> bool {
     )
 }
 
+/// A registered SRS table. `midnight-metal` exports registration on macOS
+/// only, so elsewhere the handle is empty and registration does nothing.
+#[cfg(target_os = "macos")]
+type SrsHandle = metal::SrsHandle;
+#[cfg(not(target_os = "macos"))]
+type SrsHandle = ();
+
+#[cfg(target_os = "macos")]
+fn register(points: &[G1AffineLimbs]) -> SrsHandle {
+    metal::register_srs(points)
+}
+#[cfg(not(target_os = "macos"))]
+fn register(_: &[G1AffineLimbs]) -> SrsHandle {}
+
+#[cfg(target_os = "macos")]
+fn handle_len(h: &SrsHandle) -> u64 {
+    h.len() as u64
+}
+#[cfg(not(target_os = "macos"))]
+fn handle_len(_: &SrsHandle) -> u64 {
+    0
+}
+
+/// Table uploads since process start (`msm_counts().2`).
+fn uploads() -> u64 {
+    #[cfg(target_os = "macos")]
+    return metal::msm_counts().2;
+    #[cfg(not(target_os = "macos"))]
+    0
+}
+
+/// Bytes of one affine point on the device (twelve `u64` limbs).
+const POINT_BYTES: u64 = 96;
+
 #[derive(Default)]
 struct State {
+    /// The registered SRS tables (monomial and Lagrange bases), kept for the
+    /// life of the params. Registration is host work; the first MSM on a
+    /// slice uploads its table, which stays on the device until the handle is
+    /// dropped.
+    srs: Vec<SrsHandle>,
+    /// `uploads()` when the tables were registered: a larger count now means
+    /// a table has been uploaded.
+    uploads_at_register: u64,
     admitted: Phases,
     /// The extended domain of the prepared key reaches the device size
     /// threshold (`midnight_metal::min_k`).
@@ -256,9 +306,21 @@ impl Device for MetalDevice {
     }
 
     fn held(&self) -> Held {
-        // `midnight-metal` keeps no buffer between requests: no resident key
-        // copies and no MSM tables
-        Held::default()
+        // No key copies are resident. The MSM tables stay on the device after
+        // their first MSM; midnight-metal does not say which table was
+        // uploaded, so once any upload happened since registration all
+        // registered points are counted (an upper bound, exact when both
+        // were uploaded in full). `evict(true)` frees exactly this.
+        let s = self.state();
+        let tables = if !s.srs.is_empty() && uploads() > s.uploads_at_register {
+            s.srs.iter().map(handle_len).sum::<u64>() * POINT_BYTES
+        } else {
+            0
+        };
+        Held {
+            resident: 0,
+            tables,
+        }
     }
 
     fn shape(&self, pk: &Pk) -> Option<Shape> {
@@ -279,12 +341,21 @@ impl Device for MetalDevice {
         self.state().keep = keep;
     }
 
-    fn prepare(&self, _params: &ParamsKZG<Bls12>, pk: &Pk, _check: bool) {
-        // `midnight_metal::register_srs` (the two SRS bases) and
-        // `midnight_metal::register_key` (`pk.gpu_resident_polys()`) go here
-        // once they exist. The read-back check flag has no Metal counterpart
-        // either (`end_request` takes none).
-        self.state().sized = pk.get_vk().get_domain().extended_k() >= metal::min_k();
+    fn prepare(&self, params: &ParamsKZG<Bls12>, pk: &Pk, _check: bool) {
+        // `midnight_metal::register_key` (`pk.gpu_resident_polys()`) goes here
+        // once it exists. The read-back check flag has no Metal counterpart
+        // (`end_request` takes none).
+        let mut s = self.state();
+        s.sized = pk.get_vk().get_domain().extended_k() >= metal::min_k();
+        if s.srs.is_empty() {
+            let coeff = params.bases::<Coeff>();
+            let lagrange = params.bases::<LagrangeCoeff>();
+            s.srs = vec![
+                register(adapter::affine(coeff)),
+                register(adapter::affine(lagrange)),
+            ];
+            s.uploads_at_register = uploads();
+        }
     }
 
     fn begin_request(&self, phases: Phases) -> Phases {
@@ -318,11 +389,16 @@ impl Device for MetalDevice {
         }
     }
 
-    fn evict(&self, _tables: bool) -> u64 {
-        // `midnight_metal::evict_key_copies()` and
-        // `midnight_metal::evict_tables()` go here once they exist; with
-        // nothing resident, nothing is freed
-        0
+    fn evict(&self, tables: bool) -> u64 {
+        // No key copies exist (`evict_key_copies` is missing). A table can
+        // only be freed by dropping its handle, which also drops the
+        // registration, so it is freed with `tables` only.
+        if !tables {
+            return 0;
+        }
+        let freed = self.held().tables;
+        self.state().srs.clear();
+        freed
     }
 
     fn end_request(&self, check: bool) -> Result<WipeReport, String> {

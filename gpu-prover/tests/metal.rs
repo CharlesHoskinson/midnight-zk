@@ -19,7 +19,7 @@
 //! either way, and print the served and declined counts of each class. A
 //! served call that computed a wrong value fails the proof's verification.
 
-#![cfg(all(feature = "metal", midnight_metal_linked))]
+#![cfg(all(feature = "metal", midnight_metal_linked, target_os = "macos"))]
 
 mod common;
 
@@ -50,6 +50,12 @@ fn print_classes(what: &str) {
     eprintln!(
         "{what}: served msm={} fft={} ifft={} quotient={}",
         s.msm.served, s.fft.served, s.ifft.served, s.quotient.served
+    );
+    let (cached, one_shot, uploads) = midnight_metal::msm_counts();
+    eprintln!(
+        "{what}: msm table={cached} one-shot={one_shot} uploads={uploads}, handles={}, stale={}",
+        midnight_metal::srs_handles(),
+        midnight_metal::srs_stale()
     );
     for (class, reason, count) in midnight_metal::declines() {
         eprintln!("{what}: declined {class} {reason} x{count}");
@@ -89,6 +95,7 @@ fn a_proof_with_the_device_phases_admitted_verifies_and_the_erasure_succeeds() {
         midnight_metal::device_bytes()
     );
     assert!(r.admitted.contains(Phases::ALL), "{:?}", r.admitted);
+    eprintln!("held after the request: {:?}", s.held());
     assert!(s.retired().is_none(), "the erasure was not confirmed");
     assert_eq!(r.wipe.erasure_failures, 0);
     assert!(r.verify_s > 0.0);

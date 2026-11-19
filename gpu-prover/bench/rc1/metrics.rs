@@ -113,8 +113,8 @@ pub mod device {
     use midnight_curves::Bls12;
     use midnight_metal as metal;
     use midnight_proofs::{
-        gpu::{self as hooks},
-        poly::kzg::params::ParamsKZG,
+        gpu::{self as hooks, adapter},
+        poly::{Coeff, LagrangeCoeff, kzg::params::ParamsKZG},
     };
 
     use super::Metrics;
@@ -127,15 +127,17 @@ pub mod device {
         Ok((info.name.clone(), info.recommended_max_working_set))
     }
 
-    /// What the CUDA `install` returns as registrations: `midnight-metal` has
-    /// no resident SRS or key registration, so the handle is empty.
-    pub struct Handles;
+    /// The SRS registrations, dropped when the benchmark ends (the CUDA
+    /// `install` also returns a key registration; `midnight-metal` has none).
+    pub struct Handles(#[allow(dead_code)] [metal::SrsHandle; 2]);
 
-    /// Installs the hooks. `params` and `pk` are not handed to the device.
-    pub fn install(_params: &ParamsKZG<Bls12>, _pk: &Key) -> Result<Handles> {
+    /// Registers the SRS bases and installs the hooks.
+    pub fn install(params: &ParamsKZG<Bls12>, _pk: &Key) -> Result<Handles> {
         if !metal::device() {
             return Err("Metal device unavailable".into());
         }
+        let srs = [params.bases::<Coeff>(), params.bases::<LagrangeCoeff>()]
+            .map(|p| metal::register_srs(adapter::affine(p)));
         if !hooks::install(hooks::GpuHooks {
             msm_g1: Some(metal::msm_g1),
             fft: Some(metal::fft),
@@ -144,7 +146,7 @@ pub mod device {
         }) {
             return Err("hooks already installed".into());
         }
-        Ok(Handles)
+        Ok(Handles(srs))
     }
 
     pub struct Baseline;
@@ -163,6 +165,12 @@ pub mod device {
         let hook_declines = hooks::hook_declines();
         let declines = metal::declines();
         let peak_bytes = metal::device_bytes().1;
+        let (cached, one_shot, uploads) = metal::msm_counts();
+        eprintln!(
+            "metal msm_counts (since process start): table {cached}, one-shot {one_shot}, \
+             uploads {uploads}; stale {}",
+            metal::srs_stale()
+        );
         if !metal::end_request() {
             return Err("device cleanup failed".into());
         }
