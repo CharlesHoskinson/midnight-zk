@@ -758,6 +758,315 @@ fn registered_table_prefix_splits() {
     drop(handle);
 }
 
+/// The eight indices a sampled identity check of a table would have read.
+fn sampled(n: usize) -> [usize; 8] {
+    [0, n / 7, 2 * n / 7, 3 * n / 7, 4 * n / 7, 5 * n / 7, 6 * n / 7, n - 1]
+}
+
+/// A registered table whose memory changed at ONE point that a sampled check
+/// would not read: every point is compared, so the table is dropped and the
+/// MSM takes the one-shot path with the caller's current points (whole slice,
+/// then a prefix). Runs in debug and release builds.
+#[test]
+fn registered_table_detects_one_changed_point() {
+    let _g = serial();
+    require_device();
+    assert!(midnight_metal::set_min_k(14));
+    set_cpu_share(true);
+    let n = 1usize << 16;
+    let fresh = random_points(2, 991);
+
+    let mut bases = points_cache()[..n].to_vec();
+    let h = midnight_metal::register_srs(adapter::affine(&bases));
+    let s = random_scalars(n, 61);
+    check("table", &s, &bases);
+    let i = 3 * n / 7 + 5;
+    assert!(!sampled(n).contains(&i));
+    bases[i] = fresh[0];
+    let stale = midnight_metal::srs_stale();
+    let (c0, o0, u0) = midnight_metal::msm_counts();
+    check("one point changed", &s, &bases);
+    assert_eq!(midnight_metal::srs_stale(), stale + 1);
+    assert_eq!(midnight_metal::msm_counts(), (c0, o0 + 1, u0));
+    drop(h);
+
+    let mut bases = points_cache()[..n].to_vec();
+    let h = midnight_metal::register_srs(adapter::affine(&bases));
+    let m = 1usize << 15;
+    let s = random_scalars(m, 62);
+    check("prefix", &s, &bases[..m]);
+    let j = 2 * m / 7 + 3;
+    assert!(!sampled(m).contains(&j));
+    bases[j] = fresh[1];
+    let stale = midnight_metal::srs_stale();
+    let (c0, o0, u0) = midnight_metal::msm_counts();
+    check("prefix, one point changed", &s, &bases[..m]);
+    assert_eq!(midnight_metal::srs_stale(), stale + 1);
+    assert_eq!(midnight_metal::msm_counts(), (c0, o0 + 1, u0));
+    drop(h);
+}
+
+/// The decline reason of a base outside G1 (`msm::BASES_REASON`).
+const BASES_REASON: &str = "bases-not-in-subgroup";
+
+/// A point on the curve `y^2 = x^3 + 4` outside the prime-order subgroup (no
+/// cofactor clearing), as limbs.
+fn non_subgroup_point() -> G1AffineLimbs {
+    use blst::{
+        blst_fp_add, blst_fp_from_uint64, blst_fp_sqrt, blst_p1_affine_in_g1,
+        blst_p1_affine_on_curve,
+    };
+    let fp_of = |v: u64| {
+        let mut r = blst_fp::default();
+        // SAFETY: six limbs.
+        unsafe { blst_fp_from_uint64(&mut r, [v, 0, 0, 0, 0, 0].as_ptr()) };
+        r
+    };
+    let four = fp_of(4);
+    for v in 1u64.. {
+        let x = fp_of(v);
+        let mut rhs = blst_fp::default();
+        let x3 = fmul(&fsqr(&x), &x);
+        // SAFETY: valid field elements.
+        unsafe { blst_fp_add(&mut rhs, &x3, &four) };
+        let mut y = blst_fp::default();
+        // SAFETY: as above.
+        if !unsafe { blst_fp_sqrt(&mut y, &rhs) } {
+            continue;
+        }
+        let p = blst_p1_affine { x, y };
+        // SAFETY: a valid affine point.
+        let (on, in_g1) = unsafe { (blst_p1_affine_on_curve(&p), blst_p1_affine_in_g1(&p)) };
+        assert!(on);
+        if !in_g1 {
+            let mut l = [0u64; 12];
+            l[..6].copy_from_slice(&p.x.l);
+            l[6..].copy_from_slice(&p.y.l);
+            return l;
+        }
+    }
+    unreachable!()
+}
+
+fn affine_of(l: G1AffineLimbs) -> G1Affine {
+    // SAFETY: `G1Affine` is a transparent `blst_p1_affine` (`[u64; 12]`).
+    unsafe { std::mem::transmute::<G1AffineLimbs, G1Affine>(l) }
+}
+
+/// A base on the curve but outside G1, with the scalar `r - 1` or one above
+/// `r / 2`, registered and not: the call declines (the stock MSM then runs)
+/// and the decline is counted; so does a base off the curve. A prefix of the
+/// table that stops before the bad point is served.
+#[test]
+fn bases_outside_g1_decline() {
+    let _g = serial();
+    require_device();
+    assert!(midnight_metal::set_min_k(14));
+    set_cpu_share(true);
+    let n = 1usize << 14;
+    let k = n / 3;
+    let bad = non_subgroup_point();
+    let mut off = adapter::affine(&points_cache()[..1])[0];
+    off[6] ^= 1;
+    for (what, p) in [("not in the subgroup", bad), ("off the curve", off)] {
+        let mut bases = points_cache()[..n].to_vec();
+        bases[k] = affine_of(p);
+        for (name, sc) in [("r-1", -Fq::ONE), ("> r/2", -Fq::from(12345))] {
+            let mut s = random_scalars(n, 71);
+            s[k] = sc;
+            for registered in [false, true] {
+                let h = registered.then(|| midnight_metal::register_srs(adapter::affine(&bases)));
+                midnight_metal::reset_stats();
+                let counts = midnight_metal::msm_counts();
+                let got = midnight_metal::msm_g1(adapter::scalars(&s), adapter::affine(&bases));
+                assert!(got.is_none(), "{what}, {name}, registered {registered}");
+                assert_eq!(
+                    midnight_metal::declines(),
+                    vec![("msm", BASES_REASON, 1)],
+                    "{what}, {name}, registered {registered}"
+                );
+                assert_eq!(midnight_metal::stats().msm.served, 0);
+                // no device MSM of either path ran
+                assert_eq!(midnight_metal::msm_counts(), counts);
+                drop(h);
+            }
+        }
+        if what == "not in the subgroup" {
+            // the reference the caller falls back to runs on this input
+            let mut s = random_scalars(n, 72);
+            s[k] = -Fq::ONE;
+            let _ = msm_pippenger(&s, &bases);
+        }
+        // a prefix of the registered table before the bad point is served
+        assert!(midnight_metal::set_min_k(0));
+        let h = midnight_metal::register_srs(adapter::affine(&bases));
+        let s = random_scalars(k, 73);
+        check("prefix before the bad point", &s, &bases[..k]);
+        drop(h);
+        assert!(midnight_metal::set_min_k(14));
+    }
+}
+
+/// Scalars at the boundary of the `abs` step of `msm_digits`, given raw and
+/// as `B - mask_i` (so that the masked value on the device is `B`): `(r-1)/2`,
+/// `(r+1)/2`, `r-1`, `2^254 - 1` reduced, and two scalars whose top 32-bit
+/// limb equals (or is next to) that of `r - s`.
+#[test]
+fn abs_boundary_scalars_match_cpu() {
+    let _g = serial();
+    require_device();
+    assert!(midnight_metal::set_min_k(0));
+    let two = Fq::from(2);
+    let half = two.invert().unwrap();
+    let p2 = |e: u64| two.pow_vartime([e]);
+    let top = Fq::from(0x39f6_d3a9u64);
+    let boundary = [
+        -half,                         // (r - 1) / 2
+        half,                          // (r + 1) / 2
+        -Fq::ONE,                      // r - 1
+        p2(254) - Fq::ONE,             // 2^254 - 1 reduced
+        (top + Fq::ONE) * p2(224) - Fq::ONE, // top limb of s and r - s equal
+        top * p2(224),                 // top limbs next to each other
+    ];
+    assert_eq!(-half - half, -Fq::ONE);
+    let n = 1usize << 14;
+    let bases = &points_cache()[..n];
+    let mask = mask_fq(n);
+    for split in [false, true] {
+        set_cpu_share(split);
+        for masked in [false, true] {
+            let mut s = random_scalars(n, 81);
+            for i in (0..n).step_by(3) {
+                let b = boundary[(i / 3) % boundary.len()];
+                s[i] = if masked { b - mask[i] } else { b };
+            }
+            check(&format!("abs boundary, masked {masked}, split {split}"), &s, bases);
+            // the boundary values alone
+            let s: Vec<Fq> = (0..n)
+                .map(|i| {
+                    let b = boundary[i % boundary.len()];
+                    if masked { b - mask[i] } else { b }
+                })
+                .collect();
+            check(&format!("abs boundary only, masked {masked}, split {split}"), &s, bases);
+        }
+    }
+    set_cpu_share(true);
+    assert!(midnight_metal::set_min_k(14));
+}
+
+/// Points at infinity among the bases, every scalar non-zero, on the table
+/// and the one-shot paths; and unequal lengths decline `shape`.
+#[test]
+fn infinity_bases_and_unequal_lengths() {
+    let _g = serial();
+    require_device();
+    assert!(midnight_metal::set_min_k(14));
+    set_cpu_share(true);
+    let n = 1usize << 15;
+    let mut bases = points_cache()[..n].to_vec();
+    for i in (0..n).step_by(5) {
+        bases[i] = G1Affine::identity();
+    }
+    let s: Vec<Fq> = random_scalars(n, 91)
+        .into_iter()
+        .map(|x| if x == Fq::ZERO { Fq::ONE } else { x })
+        .collect();
+    let (_, o0, _) = midnight_metal::msm_counts();
+    check("infinity bases, one-shot", &s, &bases);
+    assert_eq!(midnight_metal::msm_counts().1, o0 + 1);
+    let h = midnight_metal::register_srs(adapter::affine(&bases));
+    let (c0, _, _) = midnight_metal::msm_counts();
+    check("infinity bases, table", &s, &bases);
+    check("infinity bases, table again", &s, &bases);
+    assert_eq!(midnight_metal::msm_counts().0, c0 + 2);
+
+    for (sl, bl) in [(n - 1, n), (n, n - 1)] {
+        midnight_metal::reset_stats();
+        assert!(
+            midnight_metal::msm_g1(adapter::scalars(&s[..sl]), adapter::affine(&bases[..bl]))
+                .is_none()
+        );
+        assert_eq!(midnight_metal::declines(), vec![("msm", "shape", 1)]);
+    }
+    drop(h);
+}
+
+/// The window widths 15 (`2^20`) and 16 (`2^21`, `2^22`: two chunks) on a
+/// registered table with the CPU share: once, in a release build only.
+#[test]
+fn wide_windows_on_a_table_match_cpu() {
+    let _g = serial();
+    if cfg!(debug_assertions) {
+        eprintln!("skipped in a debug build");
+        return;
+    }
+    require_device();
+    assert!(midnight_metal::set_min_k(14));
+    set_cpu_share(true);
+    let n = 1usize << 22;
+    let bases = random_points(n, 2222);
+    let scal = random_scalars(n, 2223);
+    let h = midnight_metal::register_srs(adapter::affine(&bases));
+    for (k, wbits) in [(20u32, 15u32), (21, 16), (22, 16)] {
+        let m = 1usize << k;
+        let (s, b) = (&scal[..m], &bases[..m]);
+        let (r, st) =
+            midnight_metal::msm_g1_stages(adapter::scalars(s), adapter::affine(b)).unwrap();
+        assert!(adapter::from_jacobian(r) == msm_pippenger(s, b), "2^{k}");
+        assert!(st.table && st.wbits == wbits && st.device_points < m as u64, "2^{k}: {st:?}");
+        check(&format!("table 2^{k}"), s, b);
+    }
+    drop(h);
+}
+
+// ---------------------------------------------------------------------------
+// Adversarial scalars.
+
+/// The mask vector of the device MSM as scalars (`mask_is_the_cuda_vector`
+/// checks it against the kernel).
+fn mask_fq(n: usize) -> Vec<Fq> {
+    cuda_mask_vector(n).into_iter().map(adapter::from_scalar).collect()
+}
+
+/// `s_i = c - mask_i`: every masked scalar is `c`, so every point of a window
+/// falls into one bucket, summed by one GPU thread. The result is exact, or
+/// the call declines cleanly (the stock CPU code then runs).
+#[test]
+fn hot_bucket_is_exact_or_declined() {
+    let _g = serial();
+    require_device();
+    assert!(midnight_metal::set_min_k(14));
+    set_cpu_share(true);
+    let n = if cfg!(debug_assertions) { 1usize << 16 } else { 1usize << 20 };
+    let bases = &points_cache()[..n];
+    let c = Fq::random(ChaCha8Rng::seed_from_u64(4242));
+    let s: Vec<Fq> = mask_fq(n).iter().map(|m| c - m).collect();
+    let want = msm_pippenger(&s, bases);
+    for registered in [false, true] {
+        let h = registered.then(|| midnight_metal::register_srs(adapter::affine(bases)));
+        midnight_metal::reset_stats();
+        let t = Instant::now();
+        let got = midnight_metal::msm_g1(adapter::scalars(&s), adapter::affine(bases));
+        let el = t.elapsed();
+        match got {
+            Some(r) => assert!(adapter::from_jacobian(r) == want, "registered {registered}"),
+            None => assert_eq!(
+                midnight_metal::declines(),
+                vec![("msm", "device-error", 1)],
+                "registered {registered}"
+            ),
+        }
+        eprintln!(
+            "hot bucket 2^{}, registered {registered}: {} in {el:.1?}",
+            n.trailing_zeros(),
+            if got.is_some() { "served" } else { "declined" }
+        );
+        drop(h);
+    }
+    assert!(midnight_metal::set_min_k(14));
+}
+
 // ---------------------------------------------------------------------------
 // The hook.
 

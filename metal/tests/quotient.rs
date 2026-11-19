@@ -804,14 +804,11 @@ fn declines_leave_out_unchanged() {
         let sentinel = [0x5eedu64; 4];
         let try_job = |j: &pa::QuotientJobAbi, reason: &str| {
             let before = count(reason);
-            let mut out = vec![sentinel; j.len];
+            let mut out = pattern(j.len);
             // SAFETY: the prover's tables, within its call.
             let ok = unsafe { metal::quotient(j as *const _ as *const c_void, &mut out) };
             assert!(!ok, "{reason}: declined");
-            assert!(
-                out.iter().all(|x| *x == sentinel),
-                "{reason}: out unchanged"
-            );
+            assert!(out == pattern(j.len), "{reason}: out unchanged");
             assert_eq!(count(reason) - before, 1, "{reason}: counted");
         };
         let mut bad = *j;
@@ -931,6 +928,696 @@ fn registered_key_is_resident() {
     RandomCircuit::new(8, false, 8).prove();
     set_probe(None);
     assert_eq!(DONE.load(Relaxed), 1);
+}
+
+// ---------------------------------------------------------------------------
+// Owned jobs: a deep copy of a hook's job, usable after the proof
+
+/// A program and its arrays.
+struct OwnedProgram {
+    ops: Vec<hooks::DeviceOp>,
+    reads: Vec<hooks::DeviceRead>,
+    uniforms: Vec<Scalar>,
+    outputs: Vec<u32>,
+}
+
+impl OwnedProgram {
+    /// # Safety
+    /// `p` is a valid program.
+    unsafe fn of(p: &ProgramAbi) -> Self {
+        // SAFETY: the caller's contract.
+        unsafe {
+            OwnedProgram {
+                ops: sl(p.ops, p.nops).to_vec(),
+                reads: sl(p.reads, p.nreads).to_vec(),
+                uniforms: sl(p.uniforms, p.nuniforms).to_vec(),
+                outputs: sl(p.outputs, p.noutputs).to_vec(),
+            }
+        }
+    }
+
+    fn abi(&self, nslots: u32) -> ProgramAbi {
+        ProgramAbi {
+            ops: self.ops.as_ptr(),
+            nops: self.ops.len(),
+            reads: self.reads.as_ptr(),
+            nreads: self.reads.len(),
+            uniforms: self.uniforms.as_ptr(),
+            nuniforms: self.uniforms.len(),
+            outputs: self.outputs.as_ptr(),
+            noutputs: self.outputs.len(),
+            nslots,
+            pad: 0,
+        }
+    }
+}
+
+/// A deep copy of a quotient job: every polynomial and table owned, the
+/// aliasing of the original (one polynomial behind several pointers) kept.
+/// `abi` points into the owned storage, whose heap buffers never move (the
+/// vectors are only written in place).
+struct OwnedJob {
+    abi: pa::QuotientJobAbi,
+    /// The proof's polynomials (`2^k` each).
+    proof: Vec<Vec<Scalar>>,
+    /// The proving-key polynomials (`2^ext_k` each), in first-use order.
+    keys: Vec<Vec<Scalar>>,
+    _ptrs: Vec<Vec<*const Scalar>>,
+    _progs: Vec<OwnedProgram>,
+    _lookups: Vec<pa::LookupAbi>,
+    _lookup_progs: Vec<Vec<ProgramAbi>>,
+    _trash: Vec<pa::TrashAbi>,
+    _kinds: Vec<u32>,
+    _index: Vec<u32>,
+    _t_inv: Vec<Scalar>,
+}
+
+// SAFETY: the raw pointers point into the job's own storage.
+unsafe impl Send for OwnedJob {}
+
+impl OwnedJob {
+    /// # Safety
+    /// `j` is a valid job (within the hook call).
+    unsafe fn of(j: &pa::QuotientJobAbi) -> Self {
+        use std::collections::HashMap;
+        let (n, en) = (1usize << j.k, 1usize << j.ext_k);
+        let mut proof: Vec<Vec<Scalar>> = Vec::new();
+        let mut keys: Vec<Vec<Scalar>> = Vec::new();
+        let mut pix: HashMap<usize, usize> = HashMap::new();
+        let mut kix: HashMap<usize, usize> = HashMap::new();
+        // the owned index of each original pointer (null stays null)
+        let mut proof_i = |p: *const Scalar| -> Option<usize> {
+            (!p.is_null()).then(|| {
+                *pix.entry(p as usize).or_insert_with(|| {
+                    // SAFETY: the job's contract.
+                    proof.push(unsafe { sl(p, n) }.to_vec());
+                    proof.len() - 1
+                })
+            })
+        };
+        let mut key_i = |p: *const Scalar| -> Option<usize> {
+            (!p.is_null()).then(|| {
+                *kix.entry(p as usize).or_insert_with(|| {
+                    // SAFETY: the job's contract.
+                    keys.push(unsafe { sl(p, en) }.to_vec());
+                    keys.len() - 1
+                })
+            })
+        };
+        // SAFETY (all `sl`): the job's contract.
+        let advice: Vec<_> = unsafe { sl(j.advice, j.nadvice) }.iter().map(|p| proof_i(*p)).collect();
+        let instance: Vec<_> =
+            unsafe { sl(j.instance, j.ninstance) }.iter().map(|p| proof_i(*p)).collect();
+        let fixed: Vec<_> = unsafe { sl(j.fixed, j.nfixed) }.iter().map(|p| key_i(*p)).collect();
+        let lag: Vec<_> = [j.l0, j.l_last, j.l_active].iter().map(|p| key_i(*p)).collect();
+        let sigma: Vec<_> =
+            unsafe { sl(j.perm_sigma, j.perm_ncolumns) }.iter().map(|p| key_i(*p)).collect();
+        let products: Vec<_> =
+            unsafe { sl(j.perm_products, j.perm_nsets) }.iter().map(|p| proof_i(*p)).collect();
+        let lookups_in = unsafe { sl(j.lookups, j.nlookups) };
+        // (aggregator, multiplicities, helpers, programs)
+        type L = (Option<usize>, Option<usize>, Vec<Option<usize>>, Vec<OwnedProgram>);
+        let lks: Vec<L> = lookups_in
+            .iter()
+            .map(|l| unsafe {
+                (
+                    proof_i(l.aggregator),
+                    proof_i(l.multiplicities),
+                    sl(l.helpers, l.nchunks).iter().map(|h| proof_i(*h)).collect(),
+                    sl(l.programs, l.nchunks).iter().map(|p| OwnedProgram::of(p)).collect(),
+                )
+            })
+            .collect();
+        let trash_in = unsafe { sl(j.trash, j.ntrash) };
+        let trs: Vec<(Option<usize>, OwnedProgram)> = trash_in
+            .iter()
+            .map(|t| (proof_i(t.trash), unsafe { OwnedProgram::of(&t.program) }))
+            .collect();
+        let gates = unsafe { OwnedProgram::of(&j.gates) };
+        let t_inv = unsafe { sl(j.t_inv, j.nt_inv) }.to_vec();
+        let kinds = unsafe { sl(j.perm_column_kind, j.perm_ncolumns) }.to_vec();
+        let index = unsafe { sl(j.perm_column_index, j.perm_ncolumns) }.to_vec();
+
+        let pp = |i: Option<usize>| i.map_or(std::ptr::null(), |i| proof[i].as_ptr());
+        let kp = |i: Option<usize>| i.map_or(std::ptr::null(), |i| keys[i].as_ptr());
+        let ptrs: Vec<Vec<*const Scalar>> = vec![
+            advice.iter().map(|i| pp(*i)).collect(),
+            instance.iter().map(|i| pp(*i)).collect(),
+            fixed.iter().map(|i| kp(*i)).collect(),
+            sigma.iter().map(|i| kp(*i)).collect(),
+            products.iter().map(|i| pp(*i)).collect(),
+        ];
+        let mut helper_ptrs: Vec<Vec<*const Scalar>> =
+            lks.iter().map(|l| l.2.iter().map(|h| pp(*h)).collect()).collect();
+        let lookup_progs: Vec<Vec<ProgramAbi>> = lks
+            .iter()
+            .zip(lookups_in)
+            .map(|(l, o)| {
+                l.3.iter()
+                    .zip(unsafe { sl(o.programs, o.nchunks) })
+                    .map(|(p, op)| p.abi(op.nslots))
+                    .collect()
+            })
+            .collect();
+        let lookups: Vec<pa::LookupAbi> = lks
+            .iter()
+            .zip(&helper_ptrs)
+            .zip(&lookup_progs)
+            .map(|((l, h), p)| pa::LookupAbi {
+                aggregator: pp(l.0),
+                multiplicities: pp(l.1),
+                helpers: h.as_ptr(),
+                programs: p.as_ptr(),
+                nchunks: h.len(),
+            })
+            .collect();
+        let trash: Vec<pa::TrashAbi> = trs
+            .iter()
+            .zip(trash_in)
+            .map(|((t, p), o)| pa::TrashAbi {
+                trash: pp(*t),
+                program: p.abi(o.program.nslots),
+                selector_column: o.selector_column,
+                pad: 0,
+            })
+            .collect();
+        let mut abi = *j;
+        abi.advice = ptrs[0].as_ptr();
+        abi.instance = ptrs[1].as_ptr();
+        abi.fixed = ptrs[2].as_ptr();
+        abi.perm_sigma = ptrs[3].as_ptr();
+        abi.perm_products = ptrs[4].as_ptr();
+        abi.perm_column_kind = kinds.as_ptr();
+        abi.perm_column_index = index.as_ptr();
+        abi.l0 = kp(lag[0]);
+        abi.l_last = kp(lag[1]);
+        abi.l_active = kp(lag[2]);
+        abi.gates = gates.abi(j.gates.nslots);
+        abi.lookups = lookups.as_ptr();
+        abi.trash = trash.as_ptr();
+        abi.t_inv = t_inv.as_ptr();
+        let mut ptrs = ptrs;
+        ptrs.append(&mut helper_ptrs);
+        let mut progs = vec![gates];
+        for (_, _, _, ps) in lks {
+            progs.extend(ps);
+        }
+        progs.extend(trs.into_iter().map(|t| t.1));
+        OwnedJob {
+            abi,
+            proof,
+            keys,
+            _ptrs: ptrs,
+            _progs: progs,
+            _lookups: lookups,
+            _lookup_progs: lookup_progs,
+            _trash: trash,
+            _kinds: kinds,
+            _index: index,
+            _t_inv: t_inv,
+        }
+    }
+
+    fn ptr(&self) -> *const c_void {
+        &self.abi as *const _ as *const c_void
+    }
+
+    fn key_slices(&self) -> Vec<&[Scalar]> {
+        self.keys.iter().map(|k| k.as_slice()).collect()
+    }
+
+    /// The device quotient (asserted served) and the stages of the call.
+    fn serve(&self) -> (Vec<Scalar>, metal::QuotientStages) {
+        let mut out = vec![[0u64; 4]; self.abi.len];
+        // SAFETY: the job's storage lives in `self`.
+        assert!(
+            unsafe { metal::quotient(self.ptr(), &mut out) },
+            "served: {:?}",
+            reasons()
+        );
+        (out, qt::last_stages().unwrap())
+    }
+
+    /// The reference quotient of the job's current contents.
+    fn reference(&self) -> Vec<Scalar> {
+        reference_quotient(&self.abi).into_iter().map(scalar).collect()
+    }
+
+    /// Adds one to coefficient `at` of key polynomial `key` (stays reduced).
+    fn bump_key(&mut self, key: usize, at: usize, by: u64) {
+        let v = &mut self.keys[key][at];
+        *v = scalar(from_scalar(*v) + Fq::from(by));
+    }
+}
+
+/// Deep copies of the quotient jobs of the proofs `prove` makes.
+fn capture(prove: impl FnOnce()) -> Vec<OwnedJob> {
+    static JOBS: Mutex<Vec<OwnedJob>> = Mutex::new(Vec::new());
+    JOBS.lock().unwrap_or_else(|e| e.into_inner()).clear();
+    set_probe(Some(Box::new(|job| {
+        // SAFETY: within the hook call.
+        let owned = unsafe { OwnedJob::of(abi(job)) };
+        JOBS.lock().unwrap_or_else(|e| e.into_inner()).push(owned);
+    })));
+    prove();
+    set_probe(None);
+    std::mem::take(&mut *JOBS.lock().unwrap_or_else(|e| e.into_inner()))
+}
+
+/// One owned job of a random circuit.
+fn job_of_circuit(seed: u64, k: u32) -> OwnedJob {
+    let mut jobs = capture(|| {
+        RandomCircuit::new(seed, false, k).prove();
+    });
+    assert_eq!(jobs.len(), 1);
+    let j = jobs.pop().unwrap();
+    // the owned copy gives the prover's quotient
+    assert_eq!(j.serve().0, j.reference());
+    j
+}
+
+/// A pattern for `out` that no quotient writes by chance.
+fn pattern(len: usize) -> Vec<Scalar> {
+    (0..len as u64)
+        .map(|i| [0x5eed_0000 + i, !i, i.rotate_left(17) ^ 0xa5a5, 7])
+        .collect()
+}
+
+/// `j` declines with `reason` (counted once) and leaves `out`, filled with a
+/// pattern, byte-identical.
+fn expect_decline(j: &pa::QuotientJobAbi, reason: &str) {
+    let before = count(reason);
+    let declines = metal::quotient_counts().1;
+    let want = pattern(j.len);
+    let mut out = want.clone();
+    // SAFETY: the job's pointers live for the call.
+    let ok = unsafe { metal::quotient(j as *const _ as *const c_void, &mut out) };
+    assert!(!ok, "{reason}: declined");
+    assert!(out == want, "{reason}: out byte-identical");
+    assert_eq!(count(reason) - before, 1, "{reason}: counted, {:?}", reasons());
+    assert_eq!(metal::quotient_counts().1 - declines, 1);
+}
+
+/// The modulus `r` plus `d`: unreduced (and equal to `d` mod `r`).
+fn r_plus(d: u64) -> Scalar {
+    [0xffff_ffff_0000_0001 + d, 0x53bd_a402_fffe_5bfe, 0x3339_d808_09a1_d805, 0x73ed_a753_299d_7d48]
+}
+
+// ---------------------------------------------------------------------------
+// Declines on malformed tables and unreduced scalars
+
+/// Every element of the job's tables the program checks reject: an operand
+/// index, a slot index and a uniform index out of range, a null helper
+/// pointer, a null fixed column a program reads; and the scalars passed by
+/// value to the transforms (the shift, its inverse, the divisor, an element
+/// of `t_inv`) unreduced; and polynomials with an unreduced coefficient
+/// (found while copying, after device work began). Each declines with its
+/// reason and leaves `out` byte-identical.
+#[test]
+fn malformed_jobs_decline_and_leave_out_unchanged() {
+    let _g = lock();
+    let j = job_of_circuit(3, 7);
+    let a = j.abi;
+    let gates = unsafe { OwnedProgram::of(&a.gates) };
+    assert!(!gates.ops.is_empty() && !gates.reads.is_empty());
+
+    // operands, slots, uniforms out of range
+    let with_op = |f: &dyn Fn(&mut hooks::DeviceOp)| {
+        let mut p = unsafe { OwnedProgram::of(&a.gates) };
+        f(&mut p.ops[0]);
+        let mut bad = a;
+        bad.gates = p.abi(a.gates.nslots);
+        expect_decline(&bad, "shape");
+    };
+    let nreads = gates.reads.len() as u32;
+    let nunis = gates.uniforms.len() as u32;
+    with_op(&|op| op.a = (hooks::TAG_READ << 30) | nreads);
+    with_op(&|op| op.b = (hooks::TAG_UNIFORM << 30) | nunis);
+    with_op(&|op| op.a = (hooks::TAG_SLOT << 30) | a.nslots);
+    with_op(&|op| op.dst = a.nslots);
+    with_op(&|op| op.a = 3 << 30);
+    // an output operand out of range
+    {
+        let mut p = unsafe { OwnedProgram::of(&a.gates) };
+        p.outputs[0] = (hooks::TAG_READ << 30) | nreads;
+        let mut bad = a;
+        bad.gates = p.abi(a.gates.nslots);
+        expect_decline(&bad, "shape");
+    }
+
+    // a null helper pointer
+    assert!(a.nlookups > 0, "the job has a lookup");
+    {
+        let mut lookups: Vec<pa::LookupAbi> = unsafe { sl(a.lookups, a.nlookups) }.to_vec();
+        let mut helpers: Vec<*const Scalar> =
+            unsafe { sl(lookups[0].helpers, lookups[0].nchunks) }.to_vec();
+        helpers[0] = std::ptr::null();
+        lookups[0].helpers = helpers.as_ptr();
+        let mut bad = a;
+        bad.lookups = lookups.as_ptr();
+        expect_decline(&bad, "shape");
+    }
+
+    // a null fixed column that a program reads
+    let fixed_read = gates.reads.iter().find(|r| r.kind == hooks::COLUMN_FIXED);
+    let fixed_read = fixed_read.expect("the gates read a fixed column");
+    {
+        let mut fixed: Vec<*const Scalar> = unsafe { sl(a.fixed, a.nfixed) }.to_vec();
+        fixed[fixed_read.column as usize] = std::ptr::null();
+        let mut bad = a;
+        bad.fixed = fixed.as_ptr();
+        expect_decline(&bad, "shape");
+    }
+
+    // unreduced scalars passed by value: the shift and its inverse (checked
+    // before the shift check: `shape`), the divisor and `t_inv` (`unreduced`)
+    for v in [r_plus(0), r_plus(1), [u64::MAX; 4]] {
+        let mut bad = a;
+        bad.zeta[0] = v;
+        expect_decline(&bad, "shape");
+        let mut bad = a;
+        bad.zeta[1] = v;
+        expect_decline(&bad, "shape");
+        let mut bad = a;
+        bad.zeta_out[1] = v;
+        expect_decline(&bad, "shape");
+        let mut bad = a;
+        bad.divisor = v;
+        expect_decline(&bad, "unreduced");
+        for at in [0, a.nt_inv - 1] {
+            let mut t_inv: Vec<Scalar> = unsafe { sl(a.t_inv, a.nt_inv) }.to_vec();
+            t_inv[at] = v;
+            let mut bad = a;
+            bad.t_inv = t_inv.as_ptr();
+            expect_decline(&bad, "unreduced");
+        }
+    }
+    // the same shift, unreduced: `zeta + r` (equal mod r)
+    {
+        let mut bad = a;
+        let z = from_scalar(a.zeta[0]);
+        let mut limbs = scalar(z);
+        let (l0, c) = limbs[0].overflowing_add(r_plus(0)[0]);
+        limbs[0] = l0;
+        let mut carry = c as u64;
+        for i in 1..4 {
+            let (s1, c1) = limbs[i].overflowing_add(r_plus(0)[i]);
+            let (s2, c2) = s1.overflowing_add(carry);
+            limbs[i] = s2;
+            carry = (c1 | c2) as u64;
+        }
+        if carry == 0 {
+            bad.zeta[0] = limbs;
+            expect_decline(&bad, "shape");
+        }
+    }
+
+    // an unreduced coefficient of a proof polynomial (found while copying,
+    // with the device at work) and of a key polynomial
+    {
+        let mut adv: Vec<Scalar> = j.proof[0].clone();
+        let last = adv.len() - 1;
+        adv[last] = r_plus(2);
+        let mut ptrs: Vec<*const Scalar> = unsafe { sl(a.advice, a.nadvice) }.to_vec();
+        let target = ptrs[0];
+        for p in ptrs.iter_mut().filter(|p| **p == target) {
+            *p = adv.as_ptr();
+        }
+        assert_eq!(target, j.proof[0].as_ptr());
+        let mut bad = a;
+        bad.advice = ptrs.as_ptr();
+        expect_decline(&bad, "unreduced");
+    }
+    {
+        let mut la: Vec<Scalar> = unsafe { sl(a.l_active, 1 << a.ext_k) }.to_vec();
+        la[5] = r_plus(3);
+        let mut bad = a;
+        bad.l_active = la.as_ptr();
+        expect_decline(&bad, "unreduced");
+    }
+    // a memory decline after planning, with a registered key lent and given
+    // back: the next call still serves the right quotient
+    {
+        let handle = metal::register_key(&j.key_slices());
+        // SAFETY: the job's storage lives in `j`.
+        let need = unsafe { qt::need_bytes_job(j.ptr()) }.expect("checks pass") as u64;
+        qt::set_memory_limit(Some(need - 1));
+        expect_decline(&a, "memory");
+        // at the limit exactly the job is admitted
+        qt::set_memory_limit(Some(need));
+        assert_eq!(j.serve().0, j.reference());
+        qt::set_memory_limit(None);
+        drop(handle);
+    }
+    // the job itself still serves
+    assert_eq!(j.serve().0, j.reference());
+    assert!(metal::end_request());
+}
+
+// ---------------------------------------------------------------------------
+// Resident copies: lengths, staleness, ABA
+
+/// One handle holding the key polynomials of two circuits of different
+/// extended lengths (in both registration orders), keep-resident on: the
+/// jobs A, B, A each equal their reference, across requests and within one
+/// request, and the third serves A from its copy without copying again.
+#[test]
+fn mixed_length_registration_serves_each_length() {
+    let _g = lock();
+    let a = job_of_circuit(3, 6);
+    let b = job_of_circuit(4, 8);
+    assert_ne!(a.abi.ext_k, b.abi.ext_k, "two extended lengths");
+    let (ra, rb) = (a.reference(), b.reference());
+    let (na, nb) = (a.keys.len() as u32, b.keys.len() as u32);
+    metal::set_keep_resident(true);
+    for a_first in [true, false] {
+        for one_request in [false, true] {
+            let polys: Vec<&[Scalar]> = if a_first {
+                a.key_slices().into_iter().chain(b.key_slices()).collect()
+            } else {
+                b.key_slices().into_iter().chain(a.key_slices()).collect()
+            };
+            let handle = metal::register_key(&polys);
+            let what = format!("A first {a_first}, one request {one_request}");
+            if one_request {
+                metal::begin_request();
+            }
+            let step = |j: &OwnedJob, want: &[Scalar], nkeys: u32, copies: u32, i: usize| {
+                if !one_request {
+                    metal::begin_request();
+                }
+                let (out, st) = j.serve();
+                assert!(out == want, "{what}: quotient {i}");
+                assert_eq!(
+                    (st.resident_polys, st.uploaded_polys, st.key_copies_made),
+                    (nkeys, 0, copies),
+                    "{what}: placement {i}"
+                );
+                if !one_request {
+                    assert!(metal::end_request());
+                }
+            };
+            step(&a, &ra, na, na, 0);
+            step(&b, &rb, nb, nb, 1);
+            step(&a, &ra, na, 0, 2);
+            step(&b, &rb, nb, 0, 3);
+            // outside any request too (every serve checks)
+            if one_request {
+                assert!(metal::end_request());
+            }
+            let (out, st) = a.serve();
+            assert!(out == ra, "{what}: outside a request");
+            assert_eq!((st.resident_polys, st.key_copies_made), (na, 0));
+            assert_eq!(
+                handle.resident_bytes(),
+                ((na as u64) << a.abi.ext_k) * 32 + ((nb as u64) << b.abi.ext_k) * 32,
+                "{what}: one copy per length"
+            );
+            drop(handle);
+            assert_eq!(metal::keys_registered(), 0);
+        }
+    }
+    metal::set_keep_resident(false);
+    assert!(metal::end_request());
+}
+
+/// Without `begin_request` (hooks installed with no request calls), every
+/// serve checks its digests: a key polynomial changed in place after its copy
+/// was made is detected at the next serve, uploaded, and the quotient is the
+/// one of the new contents (debug and release builds alike).
+#[test]
+fn outside_a_request_every_serve_checks() {
+    let _g = lock();
+    assert!(metal::end_request());
+    let mut j = job_of_circuit(8, 7);
+    for keep in [false, true] {
+        metal::set_keep_resident(keep);
+        let polys = j.key_slices();
+        let nkeys = polys.len() as u32;
+        let handle = metal::register_key(&polys);
+        let (out, st) = j.serve();
+        assert!(out == j.reference());
+        assert_eq!((st.resident_polys, st.key_copies_made), (nkeys, nkeys));
+        // served again from the copy (checked, not copied)
+        let (out, st) = j.serve();
+        assert!(out == j.reference());
+        assert_eq!((st.resident_polys, st.key_copies_made), (nkeys, 0));
+        let stale = metal::key_stale();
+        let old = j.reference();
+        j.bump_key(nkeys as usize - 1, 3, 1);
+        let new = j.reference();
+        assert!(old != new, "the change moves the quotient");
+        let (out, st) = j.serve();
+        assert!(out == new, "keep {keep}: the new contents");
+        assert_eq!(metal::key_stale() - stale, 1);
+        assert_eq!((st.resident_polys, st.uploaded_polys), (nkeys - 1, 1));
+        drop(handle);
+    }
+    metal::set_keep_resident(false);
+    assert!(metal::end_request());
+}
+
+/// Inside a request each registered polynomial is checked at its first
+/// serve of the request only (the CUDA crate's semantics): a polynomial
+/// changed in place after that is still served from the copy until the
+/// next request, which detects it.
+#[test]
+fn inside_a_request_checks_once() {
+    let _g = lock();
+    let mut j = job_of_circuit(8, 7);
+    metal::set_keep_resident(true);
+    metal::begin_request();
+    let polys = j.key_slices();
+    let nkeys = polys.len() as u32;
+    let handle = metal::register_key(&polys);
+    let old = j.reference();
+    let (out, st) = j.serve();
+    assert!(out == old);
+    assert_eq!(st.key_copies_made, nkeys);
+    let stale = metal::key_stale();
+    j.bump_key(0, 9, 5);
+    let new = j.reference();
+    assert!(old != new);
+    // not checked again in this request: the copy, the old contents
+    let (out, st) = j.serve();
+    assert!(out == old, "once per request: the copy");
+    assert_eq!((st.resident_polys, st.key_copies_made), (nkeys, 0));
+    assert_eq!(metal::key_stale(), stale);
+    assert!(metal::end_request());
+    // the next request checks
+    metal::begin_request();
+    let (out, st) = j.serve();
+    assert!(out == new, "the next request: the new contents");
+    assert_eq!(metal::key_stale() - stale, 1);
+    assert_eq!((st.resident_polys, st.uploaded_polys), (nkeys - 1, 1));
+    assert!(metal::end_request());
+    drop(handle);
+    metal::set_keep_resident(false);
+}
+
+/// A slot is marked present only with content verified in the call that
+/// filled it: a polynomial registered with contents C1 and changed to C2
+/// before its first serve (in the request of the registration) is detected
+/// when its slot is filled, not marked present, and the quotient is the one
+/// of C2; changed back to C1 in a later request, the quotient is the one of
+/// C1 (the slot never served C2 under the C1 digest).
+#[test]
+fn slot_filled_with_changed_contents_is_not_present() {
+    let _g = lock();
+    let mut j = job_of_circuit(8, 7);
+    metal::set_keep_resident(true);
+    for inside in [true, false] {
+        if inside {
+            metal::begin_request();
+        }
+        let polys = j.key_slices();
+        let nkeys = polys.len() as u32;
+        let handle = metal::register_key(&polys);
+        let c1 = j.reference();
+        let stale = metal::key_stale();
+        let victim = nkeys as usize / 2;
+        j.bump_key(victim, 11, 1);
+        let c2 = j.reference();
+        assert!(c1 != c2);
+        let (out, st) = j.serve();
+        assert!(out == c2, "inside {inside}: C2");
+        assert_eq!(metal::key_stale() - stale, 1);
+        assert_eq!(
+            (st.resident_polys, st.uploaded_polys, st.key_copies_made),
+            (nkeys - 1, 1, nkeys - 1),
+            "inside {inside}: the C2 slot is not present"
+        );
+        assert_eq!(metal::keys_registered(), nkeys as usize - 1);
+        assert!(metal::end_request());
+        // back to C1, a later request
+        let v = &mut j.keys[victim][11];
+        *v = scalar(from_scalar(*v) - Fq::ONE);
+        assert!(j.reference() == c1);
+        metal::begin_request();
+        let (out, st) = j.serve();
+        assert!(out == c1, "inside {inside}: C1 again");
+        assert_eq!(metal::key_stale() - stale, 1);
+        assert_eq!(
+            (st.resident_polys, st.uploaded_polys, st.key_copies_made),
+            (nkeys - 1, 1, 0)
+        );
+        assert!(metal::end_request());
+        drop(handle);
+    }
+    metal::set_keep_resident(false);
+}
+
+// ---------------------------------------------------------------------------
+// Memory need
+
+/// `need_bytes_job` (the admission's own sum) and `need_bytes` (the shape
+/// bound) are at least the device bytes a call adds, measured with an empty
+/// pool (every buffer new) from the start of a request: no key registered,
+/// a key registered (the copy made by the call), the copy resident, and a
+/// stale key uploaded again after the check.
+#[test]
+fn need_bytes_bounds_the_measured_peak() {
+    let _g = lock();
+    let mut jobs = vec![job_of_circuit(3, 6), job_of_circuit(4, 8), job_of_circuit(10, 9)];
+    let (params, pk, c) = range::setup(1, 9);
+    jobs.extend(capture(|| {
+        range::prove(&params, &pk, &c);
+    }));
+    metal::set_keep_resident(true);
+    let measure = |j: &OwnedJob, what: &str| {
+        assert!(metal::end_request());
+        metal::release_pool();
+        metal::begin_request();
+        // SAFETY: the job's storage lives in `j`.
+        let need = unsafe { qt::need_bytes_job(j.ptr()) }.expect("checks pass");
+        let (now0, _) = metal::device_bytes();
+        let want = j.reference();
+        let (out, _) = j.serve();
+        assert!(out == want, "{what}: quotient");
+        let (_, peak) = metal::device_bytes();
+        let used = peak.saturating_sub(now0);
+        let proof_polys = j.proof.len();
+        let shape = metal::need_bytes(j.abi.ext_k, proof_polys, j.keys.len(), j.abi.nslots);
+        println!("{what}: ext_k {} measured {used} need_bytes_job {need} need_bytes {shape}", j.abi.ext_k);
+        assert!(used > 0, "{what}: measured");
+        assert!(need as u64 >= used, "{what}: need_bytes_job {need} < measured {used}");
+        assert!(shape as u64 >= used, "{what}: need_bytes {shape} < measured {used}");
+    };
+    for (i, j) in jobs.iter_mut().enumerate() {
+        measure(j, &format!("job {i} unregistered"));
+        let handle = metal::register_key(&j.key_slices());
+        measure(j, &format!("job {i} copy made"));
+        measure(j, &format!("job {i} resident"));
+        drop(handle);
+        // a stale key: the second upload; the copy is new (outside the
+        // registration's request) and the polynomial changed after it
+        let handle = metal::register_key(&j.key_slices());
+        j.bump_key(0, 1, 1);
+        measure(j, &format!("job {i} stale"));
+        drop(handle);
+    }
+    metal::set_keep_resident(false);
+    assert!(metal::end_request());
 }
 
 // ---------------------------------------------------------------------------

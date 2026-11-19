@@ -301,6 +301,52 @@ fn elementwise_blocks() {
     }
 }
 
+/// The device building blocks refuse an unreduced scalar argument (a scale,
+/// a divisor, a `zeta`) before any device work, and keep serving reduced
+/// ones afterwards.
+#[test]
+fn building_blocks_refuse_unreduced_scalars() {
+    use midnight_metal::field::FR_MODULUS;
+    setup();
+    let bad = FR_MODULUS;
+    let worse = [u64::MAX; 4];
+    for log_n in [4u32, 12] {
+        let values = random(1 << log_n, 600 + u64::from(log_n));
+        for inverse in [false, true] {
+            for s in [bad, worse] {
+                let e = dev::ntt(scalars(&values), log_n, inverse, Some(s)).unwrap_err();
+                assert!(e.contains("unreduced"), "ntt scale: {e}");
+            }
+        }
+        let one = scalar(Fq::ONE);
+        let z = scalar(Fq::ZETA);
+        // the coset zetas of coeff_to_extended
+        for zeta in [[bad, z], [z, bad], [worse, worse]] {
+            let e = dev::coeff_to_extended(scalars(&values), log_n, log_n + 1, zeta).unwrap_err();
+            assert!(e.contains("unreduced"), "coeff_to_extended zeta: {e}");
+        }
+        // the divisor and the zetas of extended_to_coeff
+        let e = dev::extended_to_coeff(scalars(&values), log_n, bad, [z, z]).unwrap_err();
+        assert!(e.contains("unreduced"), "extended_to_coeff divisor: {e}");
+        let e = dev::extended_to_coeff(scalars(&values), log_n, one, [z, bad]).unwrap_err();
+        assert!(e.contains("unreduced"), "extended_to_coeff zeta: {e}");
+    }
+    // the elementwise blocks: zeta, then the scale factor
+    let values = random(30, 610);
+    let table = random(2, 611);
+    let z = scalar(Fq::ZETA);
+    let e = dev::elementwise(scalars(&values), [z, bad], scalar(Fq::ONE), scalars(&table))
+        .unwrap_err();
+    assert!(e.contains("unreduced"), "distribute_zeta: {e}");
+    let e = dev::elementwise(scalars(&values), [z, z], bad, scalars(&table)).unwrap_err();
+    assert!(e.contains("unreduced"), "scale: {e}");
+    // reduced arguments are served again
+    let got = dev::ntt(scalars(&values[..16]), 4, false, Some(scalar(Fq::ONE))).unwrap();
+    let mut want = values[..16].to_vec();
+    stock_fft(&mut want, root(4), 4);
+    assert_eq!(&got[..], scalars(&want));
+}
+
 fn declines_of(class: &str, reason: &str) -> u64 {
     midnight_metal::declines()
         .into_iter()

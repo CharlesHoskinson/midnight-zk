@@ -64,6 +64,11 @@ pub(crate) enum Reason {
     Memory,
     /// A pipeline, encoder or command buffer failed.
     DeviceError,
+    /// The backend panicked; the hook entry caught it (`crate::guarded`).
+    Panic,
+    /// An MSM base that is not a point of G1 (off the curve or outside the
+    /// prime-order subgroup).
+    BasesNotInSubgroup,
 }
 
 impl Reason {
@@ -75,6 +80,8 @@ impl Reason {
             Reason::Unreduced => "unreduced",
             Reason::Memory => "memory",
             Reason::DeviceError => "device-error",
+            Reason::Panic => "panic",
+            Reason::BasesNotInSubgroup => "bases-not-in-subgroup",
         }
     }
 
@@ -86,6 +93,7 @@ impl Reason {
             crate::ctx::Error::NoDevice(_) => Reason::NoDevice,
             crate::ctx::Error::Memory(_) => Reason::Memory,
             crate::ctx::Error::Device(_) => Reason::DeviceError,
+            crate::ctx::Error::Unreduced(_) => Reason::Unreduced,
         }
     }
 }

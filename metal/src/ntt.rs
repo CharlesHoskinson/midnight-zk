@@ -67,7 +67,16 @@
 //! [`extended_to_coeff_dev`], [`encode_distribute_zeta`], [`encode_scale`]
 //! and [`encode_mul_periodic`] work on [`Buffer`]s already on the device and
 //! read nothing back. The caller holds the device ([`ctx::lock`]) for the
-//! whole sequence. They mirror `mgpu_ntt_dev`, `mgpu_coeff_to_extended_dev`,
+//! whole sequence.
+//!
+//! Their contract: every element of the device data and every scalar
+//! argument (a divisor, a scale, a `zeta` pair) is reduced (below `r`), the
+//! field arithmetic of the kernels being exact only on reduced inputs. A
+//! scalar argument that is not reduced is an [`Error::Unreduced`] before any
+//! device work; the element data is not checked (it is on the device), so
+//! the caller checks it before upload. After any `Err` the contents of the
+//! data buffer (and of the scratch) are UNDEFINED: a job of several command
+//! buffers may have transformed it in part. They mirror `mgpu_ntt_dev`, `mgpu_coeff_to_extended_dev`,
 //! `mgpu_distribute_zeta_dev`, `mgpu_scale_dev` and `mgpu_mul_periodic_dev`
 //! of the CUDA crate.
 
@@ -82,6 +91,7 @@ use crate::{
     MAX_LOG_N, Scalar,
     account::{self, Class, Reason},
     ctx::{self, Arg, Buffer, Command, Ctx, Error, Pod},
+    field,
 };
 
 /// Bytes of one scalar.
@@ -106,6 +116,11 @@ const _: () = assert!(MAX_LOG_N <= UNIVERSAL_LOG);
 /// Log2 of the length of the high twiddle table (`w_{2^HI_BITS}^j`); the
 /// low table (`w_{2^28}^j`) has `2^(28 - HI_BITS)` elements.
 const HI_BITS: u32 = 16;
+
+/// Bytes of the scaled low twiddle table (`2^(UNIVERSAL_LOG - HI_BITS)`
+/// elements) that a transform with a divisor allocates for its call. The
+/// quotient's memory need counts it from here.
+pub(crate) const SCALE_TABLE_BYTES: usize = SCALAR_BYTES << (UNIVERSAL_LOG - HI_BITS);
 
 /// The largest radix (log2) of a pass: `2^MAX_PASS_LOG` elements fill a
 /// threadgroup's 32 KiB.
@@ -285,6 +300,30 @@ fn plan(log_n: u32) -> Vec<u32> {
     (0..passes).map(|i| base + u32::from(i < extra)).collect()
 }
 
+/// Log2 of the columns of one threadgroup of a pass of radix `2^r` in a
+/// `2^log_n` transform.
+fn group_columns_log(log_n: u32, r: u32) -> u32 {
+    GROUP_LOG.saturating_sub(r).min(log_n - r)
+}
+
+/// The threads of one threadgroup of a pass holding `2^e_log` elements: one
+/// thread per four elements (two butterflies of each stage), the best of 32
+/// to 256 threads per 1024 elements measured on an M4 Max.
+fn group_threads(e_log: u32) -> usize {
+    1usize << e_log.saturating_sub(2)
+}
+
+/// The threadgroup size of each `ntt_pass` dispatch of a `2^log_n`
+/// transform (the tests hold the pipeline's `maxTotalThreadsPerThreadgroup`
+/// to it: a smaller maximum would decline every such transform).
+#[cfg_attr(not(test), allow(dead_code))]
+pub(crate) fn pass_group_threads(log_n: u32) -> Vec<usize> {
+    plan(log_n)
+        .into_iter()
+        .map(|r| group_threads(r + group_columns_log(log_n, r)))
+        .collect()
+}
+
 /// The scratch a [`ntt_dev`] or [`coeff_to_extended_dev`] of `2^log_n`
 /// elements needs, in bytes: none for a one-pass size (`log_n <= 10`), else
 /// a buffer of the transform's length.
@@ -334,7 +373,26 @@ fn check_len(b: &Buffer, elems: usize, what: &str) -> Result<(), Error> {
 
 /// Runs the passes of `job`, in as many command buffers as [`RUN_BUDGET`]
 /// asks. Returns the GPU time.
+///
+/// Every by-value scalar of the job (the scale, the coset's `z1`, `z2`, the
+/// final `zeta`) must be reduced: one that is not is an
+/// [`Error::Unreduced`] before any device work (the kernels' arithmetic
+/// silently mis-computes on such inputs). After an `Err` from a later step
+/// the contents of `dst` (and `tmp`) are undefined: the command buffers that
+/// completed before the failure have transformed it in part.
 fn run_job(ctx: &Ctx, job: &Job<'_>) -> Result<u64, Error> {
+    let by_value = job
+        .scale
+        .iter()
+        .chain(job.coset.iter().flat_map(|(_, z)| z.iter()))
+        .chain(job.post_zeta.iter().flatten());
+    for v in by_value {
+        if !field::is_reduced(v) {
+            return Err(Error::Unreduced(format!(
+                "ntt: a scalar argument {v:x?} is not below the modulus"
+            )));
+        }
+    }
     let log_n = job.log_n;
     if log_n == 0 || log_n > MAX_LOG_N {
         return Err(Error::Device(format!("ntt: size 2^{log_n}")));
@@ -382,7 +440,12 @@ fn run_job(ctx: &Ctx, job: &Job<'_>) -> Result<u64, Error> {
     // the divisor, folded into the low table of the last pass (a scaled copy
     // made in the first command buffer)
     let scaled = match job.scale {
-        Some(_) => Some(ctx.alloc_pooled(SCALAR_BYTES << (UNIVERSAL_LOG - tables.hi_bits))?),
+        Some(_) => {
+            // the tables are made with `HI_BITS`: the size the quotient's
+            // need counts
+            debug_assert_eq!(tables.hi_bits, HI_BITS);
+            Some(ctx.alloc_pooled(SCALE_TABLE_BYTES)?)
+        }
         None => None,
     };
 
@@ -425,7 +488,7 @@ fn run_job(ctx: &Ctx, job: &Job<'_>) -> Result<u64, Error> {
             log_n,
             log_r: r,
             log_p,
-            log_g: GROUP_LOG.saturating_sub(r).min(log_n - r),
+            log_g: group_columns_log(log_n, r),
             flags,
             hi_bits: tables.hi_bits,
             ..Default::default()
@@ -485,10 +548,7 @@ fn run_job(ctx: &Ctx, job: &Job<'_>) -> Result<u64, Error> {
                         Arg::value(p),
                     ];
                     let e_log = p.log_r + p.log_g;
-                    // one thread per four elements (two butterflies of each
-                    // stage): the best of 32 to 256 threads per 1024
-                    // elements measured on an M4 Max
-                    let tpg = 1usize << e_log.saturating_sub(2);
+                    let tpg = group_threads(e_log);
                     cmd.dispatch_groups(
                         "ntt_pass",
                         n >> e_log,
@@ -521,7 +581,12 @@ fn run_job(ctx: &Ctx, job: &Job<'_>) -> Result<u64, Error> {
 ///
 /// Runs one or more command buffers and returns the GPU time in
 /// nanoseconds. The CUDA counterpart is `mgpu_ntt_dev` (plus
-/// `mgpu_scale_dev`).
+/// `mgpu_scale_dev`).///
+/// Contract: the elements of the data must already be reduced, and every
+/// scalar argument too (an unreduced one is [`Error::Unreduced`], with no
+/// device work). After an `Err` the contents of the data buffer (and of
+/// `tmp`) are UNDEFINED: a transform of several command buffers may have
+/// transformed it in part.
 pub(crate) fn ntt_dev(
     ctx: &Ctx,
     a: &Buffer,
@@ -555,7 +620,11 @@ pub(crate) fn ntt_dev(
 /// [`scratch_bytes`]`(ext_k)` bytes. `1 <= k <= ext_k <= 28`. `zeta` is
 /// `[g_coset, g_coset_inv]` of the domain (`coset_zetas`).
 ///
-/// Returns the GPU time. The CUDA counterpart is `mgpu_coeff_to_extended_dev`.
+/// Returns the GPU time. The CUDA counterpart is `mgpu_coeff_to_extended_dev`.///
+/// Contract: the elements of the data must already be reduced, and every
+/// scalar argument too (an unreduced one is [`Error::Unreduced`], with no
+/// device work). After an `Err` the contents of `dst` (and of `tmp`) are UNDEFINED: a transform of several command buffers may have
+/// transformed it in part.
 pub(crate) fn coeff_to_extended_dev(
     ctx: &Ctx,
     src: &Buffer,
@@ -570,7 +639,8 @@ pub(crate) fn coeff_to_extended_dev(
 
 /// [`coeff_to_extended_dev`] into `dst` from the byte offset `dst_off` (a
 /// multiple of 32): the result is `2^ext_k` elements there, so that a coset
-/// is written straight into its place in a larger buffer.
+/// is written straight into its place in a larger buffer. Contract as
+/// [`coeff_to_extended_dev`].
 #[allow(clippy::too_many_arguments)]
 pub(crate) fn coeff_to_extended_dev_at(
     ctx: &Ctx,
@@ -614,7 +684,12 @@ pub(crate) fn coeff_to_extended_dev_at(
 /// domain's `extended_ifft_divisor`, folded into the last pass), then
 /// [`encode_distribute_zeta`] with `zeta_out` (`[g_coset_inv, g_coset]`, in
 /// the last command buffer of the transform). `tmp` as for [`ntt_dev`].
-/// Returns the GPU time.
+/// Returns the GPU time.///
+/// Contract: the elements of the data must already be reduced, and every
+/// scalar argument too (an unreduced one is [`Error::Unreduced`], with no
+/// device work). After an `Err` the contents of the data buffer (and of
+/// `tmp`) are UNDEFINED: a transform of several command buffers may have
+/// transformed it in part.
 pub(crate) fn extended_to_coeff_dev(
     ctx: &Ctx,
     a: &Buffer,
@@ -643,7 +718,12 @@ pub(crate) fn extended_to_coeff_dev(
 /// [`encode_mul_periodic`] of `a` by `t` (`2^log_tn` elements: the division
 /// by the vanishing polynomial), then [`extended_to_coeff_dev`], with the
 /// multiplication in the transform's first command buffer. Returns the GPU
-/// time.
+/// time. The elements of `t` must be reduced too.///
+/// Contract: the elements of the data must already be reduced, and every
+/// scalar argument too (an unreduced one is [`Error::Unreduced`], with no
+/// device work). After an `Err` the contents of the data buffer (and of
+/// `tmp`) are UNDEFINED: a transform of several command buffers may have
+/// transformed it in part.
 #[allow(clippy::too_many_arguments)]
 pub(crate) fn divide_extended_to_coeff_dev(
     ctx: &Ctx,
@@ -692,7 +772,8 @@ static MASKS: [u32; 32] = {
 };
 
 /// Encodes `a[i] *= [1, zeta[0], zeta[1]][i mod 3]` for `i < n` into `cmd`
-/// (`distribute_powers_zeta`). The CUDA counterpart is
+/// (`distribute_powers_zeta`). `zeta` must be reduced
+/// ([`Error::Unreduced`] otherwise, nothing encoded). The CUDA counterpart is
 /// `mgpu_distribute_zeta_dev`.
 pub(crate) fn encode_distribute_zeta<'a>(
     cmd: &mut Command<'a>,
@@ -701,6 +782,9 @@ pub(crate) fn encode_distribute_zeta<'a>(
     zeta: &'a [Scalar; 2],
 ) -> Result<(), Error> {
     elementwise_len(a, n)?;
+    if !zeta.iter().all(field::is_reduced) {
+        return Err(Error::Unreduced("distribute_zeta: zeta".into()));
+    }
     cmd.dispatch(
         "ntt_distribute_zeta",
         n,
@@ -708,8 +792,9 @@ pub(crate) fn encode_distribute_zeta<'a>(
     )
 }
 
-/// Encodes `a[i] *= c` for `i < n` into `cmd`. The CUDA counterpart is
-/// `mgpu_scale_dev`.
+/// Encodes `a[i] *= c` for `i < n` into `cmd`. `c` must be reduced
+/// ([`Error::Unreduced`] otherwise, nothing encoded). The CUDA counterpart
+/// is `mgpu_scale_dev`.
 pub(crate) fn encode_scale<'a>(
     cmd: &mut Command<'a>,
     a: &'a Buffer,
@@ -717,6 +802,9 @@ pub(crate) fn encode_scale<'a>(
     c: &'a Scalar,
 ) -> Result<(), Error> {
     elementwise_len(a, n)?;
+    if !field::is_reduced(c) {
+        return Err(Error::Unreduced("scale: the factor".into()));
+    }
     cmd.dispatch("ntt_scale", n, &[Arg::Buffer(a), Arg::value(c)])
 }
 
@@ -751,23 +839,6 @@ pub(crate) fn encode_mul_periodic<'a>(
 // ---------------------------------------------------------------------------
 // Host copies
 
-/// Copies `src` into `dst` (equal lengths), on several threads when long:
-/// a single thread does not reach the memory bandwidth of the machine.
-fn par_copy(dst: &mut [Scalar], src: &[Scalar]) {
-    const PART: usize = 1 << 15;
-    if src.len() <= 2 * PART {
-        dst.copy_from_slice(src);
-        return;
-    }
-    let threads = std::thread::available_parallelism().map_or(4, |t| t.get()).min(8);
-    let per = src.len().div_ceil(threads).max(PART);
-    std::thread::scope(|s| {
-        for (d, c) in dst.chunks_mut(per).zip(src.chunks(per)) {
-            s.spawn(move || d.copy_from_slice(c));
-        }
-    });
-}
-
 /// `[copy in (with the buffers), device part (wall, with the wait for the
 /// device), GPU, copy out]` nanoseconds of the last host transform.
 static LAST_HOST: Mutex<[u64; 4]> = Mutex::new([0; 4]);
@@ -779,6 +850,7 @@ static LAST_HOST: Mutex<[u64; 4]> = Mutex::new([0; 4]);
 /// device work of the others. `a` is written only after every command
 /// buffer has completed.
 fn transform_host(
+    class: Class,
     a: &mut [Scalar],
     log_n: u32,
     dir: Dir,
@@ -788,13 +860,15 @@ fn transform_host(
     let ctx = ctx::context()?;
     let bytes = std::mem::size_of_val(a);
     let mut data = ctx::take_request_buffer("ntt-data", bytes)?;
-    par_copy(&mut data.buf_mut().as_mut_slice::<Scalar>()[..a.len()], a);
+    ctx::par_copy(&mut data.buf_mut().as_mut_slice::<Scalar>()[..a.len()], a);
     let tmp = if scratch_bytes(log_n) > 0 {
         Some(ctx::take_request_buffer("ntt-scratch", bytes)?)
     } else {
         None
     };
     let t1 = Instant::now();
+    // a test panic with the request buffers taken and filled; `a` unchanged
+    crate::test_switch::hook_panic(class);
     let ns = {
         let _device = ctx::lock()?;
         let d = data.buf();
@@ -808,7 +882,7 @@ fn transform_host(
         )?
     };
     let t2 = Instant::now();
-    par_copy(a, &data.buf().as_slice::<Scalar>()[..a.len()]);
+    ctx::par_copy(a, &data.buf().as_slice::<Scalar>()[..a.len()]);
     let t3 = Instant::now();
     data.give_back();
     if let Some(t) = tmp {
@@ -836,7 +910,7 @@ pub(crate) fn fft(a: &mut [Scalar], omega: Scalar, log_n: u32) -> bool {
     let Some(dir) = direction(&omega, log_n) else {
         return account::decline(Class::Fft, Reason::Shape);
     };
-    finish(Class::Fft, transform_host(a, log_n, dir, None))
+    finish(Class::Fft, transform_host(Class::Fft, a, log_n, dir, None))
 }
 
 /// The FFT of `a` at `omega_inv`, then each element times `divisor`, in
@@ -845,7 +919,7 @@ pub(crate) fn ifft(a: &mut [Scalar], omega_inv: Scalar, log_n: u32, divisor: Sca
     let Some(dir) = direction(&omega_inv, log_n) else {
         return account::decline(Class::Ifft, Reason::Shape);
     };
-    finish(Class::Ifft, transform_host(a, log_n, dir, Some(&divisor)))
+    finish(Class::Ifft, transform_host(Class::Ifft, a, log_n, dir, Some(&divisor)))
 }
 
 // ---------------------------------------------------------------------------

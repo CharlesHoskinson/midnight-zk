@@ -29,10 +29,13 @@
 //!    order and with the reasons of the CUDA crate.
 //! 2. The proving-key polynomials: served from the resident copy of a
 //!    registered handle ([`keys`]) or uploaded for the call. They are placed
-//!    before their digests are checked ([`keys::plan`]); CPU threads hash
-//!    the ones not yet checked in the request, copy the uploads and refill
-//!    the empty slots of the resident copy while the device runs step 3, and
-//!    [`keys::settle`] drops a stale one (uploaded instead) before step 4,
+//!    before their digests are checked ([`keys::plan`]); CPU threads copy
+//!    the uploads, refill the empty slots of the resident copy and hash the
+//!    registered polynomials to check (every one outside a request, the ones
+//!    not yet checked in the request inside one, and the bytes copied into
+//!    every slot refilled) while the device runs step 3, and
+//!    [`keys::settle`] marks a refilled slot present only when its digest
+//!    matched and drops a stale polynomial (uploaded instead) before step 4,
 //!    the first kernel that reads a slot.
 //! 3. The proof's polynomials (advice, instance, permutation accumulators,
 //!    lookup aggregators, multiplicities and helpers, trash) to the extended
@@ -50,8 +53,9 @@
 //!    (`ntt::divide_extended_to_coeff_dev`). Meanwhile CPU threads zero the
 //!    cosets, the uploads and the scratch slots and put them back into the
 //!    pool (`ctx::release_later`; `end_request` waits for them).
-//! 6. The first `len` coefficients are copied into `out`. No extended-domain
-//!    vector goes back.
+//! 6. The first `len` coefficients are copied into `out`, after every step
+//!    that can fail or panic (`out` is written last, by a copy that cannot
+//!    fail). No extended-domain vector goes back.
 //!
 //! Every buffer that holds a witness-dependent value is zeroed before it is
 //! used again or reported erased: the transform scratch is per-request
@@ -81,9 +85,13 @@
 //! - The proving-key polynomials are checked reduced when they are copied (the
 //!   CUDA crate checks only the proof's polynomials); an unreduced one
 //!   declines `unreduced`.
-//! - A resident copy is one buffer per [`KeyHandle`]; a job whose key
-//!   polynomials are registered under several handles reads the handle with
-//!   the most of them from its copy and uploads the others for the call.
+//! - A resident copy is one buffer per [`KeyHandle`] and polynomial length;
+//!   a job whose key polynomials are registered under several handles reads
+//!   the handle with the most of them from its copy for the job's extended
+//!   length and uploads the others for the call.
+//! - Outside a request (no [`crate::begin_request`] open) every serve checks
+//!   the digests of the registered polynomials it reads; the CUDA crate
+//!   checks once per request only.
 //! - The memory limit is the device's free working set
 //!   (`recommendedMaxWorkingSetSize - currentAllocatedSize`) and
 //!   `maxBufferLength` for each buffer, or a test limit.
@@ -201,25 +209,119 @@ fn stride(ext_k: u32) -> usize {
     (threads() as usize).min(1usize << ext_k)
 }
 
-/// The device bytes one quotient job needs at its peak (the numerator): the
-/// extended cosets of the proof's polynomials and of the proving-key
-/// polynomials (resident or uploaded), the numerator, the transform scratch,
-/// and the programs' scratch slots (`nslots * stride * 32`, stride the
-/// dispatch threads, [`threads`] capped at `2^ext_k`):
+/// Every device allocation one quotient call can make, in bytes ([`run`]
+/// allocates exactly these buffers, each at most once; Metal makes a buffer
+/// of at least 16 bytes). Their sum is an upper bound of the device bytes
+/// the call adds, whatever the pool of zeroed buffers gives back meanwhile.
+/// Used by [`run`]'s admission and by [`need_bytes`], so the two cannot
+/// drift.
+#[derive(Clone, Copy, Debug)]
+struct Need {
+    /// One extended coset: `2^ext_k * 32`.
+    ebytes: usize,
+    /// One coefficient buffer of the coset phase: `2^k * 32` (two of them).
+    coeff_bytes: usize,
+    /// The proof's polynomials (one flat buffer of cosets).
+    nproof: usize,
+    /// Key polynomials uploaded for the call at the plan.
+    ntemp: usize,
+    /// The resident copy, when the call allocates it (0: it exists).
+    lent_new: usize,
+    /// Polynomials of the second upload after a stale key at [`keys::settle`]
+    /// (0: no polynomial placed in a slot is checked, so none can move).
+    restale: usize,
+    /// The programs' scratch slots.
+    slots_bytes: usize,
+    /// The transform scratch, when the call allocates it.
+    tmp_new: usize,
+    /// The programs' words and uniforms.
+    words_bytes: usize,
+    uniforms_bytes: usize,
+    /// `t_inv` (the inverse phase only).
+    t_inv_bytes: usize,
+    /// Whether the call divides and transforms back (not the numerator test
+    /// path).
+    inverse: bool,
+}
+
+impl Need {
+    fn buffers(&self) -> [usize; 14] {
+        let a = |b: usize| b.max(16);
+        let e = self.ebytes;
+        let opt = |b: usize| if b > 0 { a(b) } else { 0 };
+        [
+            opt(self.tmp_new),
+            a(self.nproof.max(1) * e),
+            a(self.coeff_bytes),
+            a(self.coeff_bytes),
+            a(self.ntemp * e),
+            opt(self.lent_new),
+            // the dummy argument
+            16,
+            opt(self.restale * e),
+            // the numerator
+            a(e),
+            a(self.slots_bytes),
+            a(self.words_bytes),
+            a(self.uniforms_bytes),
+            if self.inverse { a(self.t_inv_bytes) } else { 0 },
+            // the scaled twiddle table of the inverse transform
+            if self.inverse { ntt::SCALE_TABLE_BYTES } else { 0 },
+        ]
+    }
+
+    /// The sum of the call's allocations.
+    fn total(&self) -> usize {
+        self.buffers().iter().sum()
+    }
+
+    /// The largest single buffer (against `maxBufferLength`).
+    fn biggest(&self) -> usize {
+        self.buffers().into_iter().max().unwrap_or(0)
+    }
+}
+
+/// An upper bound of the device bytes one quotient job allocates: the
+/// [`Need`] of [`run`] at its worst over what the shape does not fix (the
+/// base size `k <= ext_k`, which key polynomials sit in a resident copy that
+/// the call makes, a stale key uploaded again after the check). It holds
+/// every buffer of the call: the proof's cosets, the coefficient buffers of
+/// the coset phase, the key uploads, the resident copy, the second upload
+/// after a stale key, the numerator, the transform scratch, the programs'
+/// scratch slots (`nslots * stride * 32`, stride [`threads`] capped at
+/// `2^ext_k`), `t_inv` and the scaled twiddle table of the inverse.
 ///
-/// `(proof_polys + key_polys + 1) * 2^ext_k * 32 + ntt_scratch(ext_k)
-///  + max(nslots * stride * 32, 2^ext_k * 32)`
+/// Two terms are outside the shape and assumed: the resident copy holds the
+/// job's key polynomials only (a handle registered with the job's
+/// `gpu_resident_polys`, as the prover binding does; a handle holding more
+/// polynomials of this length lends all of them), and the programs' words
+/// and uniforms (a few KiB) are not counted beyond their 16-byte minimum.
+/// `test_support::need_bytes_job` gives the exact bound of a job.
 ///
-/// `ntt_scratch` is `2^ext_k * 32` above `2^10`, else 0. The last term covers
-/// the two coefficient buffers of the coset phase (`2 * 2^k * 32`, at most
-/// `2^ext_k * 32` when `k < ext_k`, as for every job with a quotient of
-/// degree 2 or more). The job's tables (programs, uniforms, `t_inv`) come on
-/// top: a few KiB to a few MiB. The arguments are the fields of
-/// `midnight_proofs::gpu::QuotientShape`.
+/// The arguments are the fields of `midnight_proofs::gpu::QuotientShape`.
 pub fn need_bytes(ext_k: u32, proof_polys: usize, key_polys: usize, nslots: u32) -> usize {
     let e = SCALAR_BYTES << ext_k;
-    let slots = nslots as usize * stride(ext_k) * SCALAR_BYTES;
-    (proof_polys + key_polys + 1) * e + ntt::scratch_bytes(ext_k) + slots.max(e)
+    let mut worst = 0;
+    for k in 1..=ext_k.max(1) {
+        for resident in 0..=key_polys {
+            let n = Need {
+                ebytes: e,
+                coeff_bytes: SCALAR_BYTES << k,
+                nproof: proof_polys,
+                ntemp: key_polys - resident,
+                lent_new: resident * e,
+                restale: if resident > 0 { key_polys } else { 0 },
+                slots_bytes: (nslots as usize).max(1) * stride(ext_k) * SCALAR_BYTES,
+                tmp_new: ntt::scratch_bytes(ext_k),
+                words_bytes: 0,
+                uniforms_bytes: 0,
+                t_inv_bytes: SCALAR_BYTES << ext_k.saturating_sub(k),
+                inverse: true,
+            };
+            worst = worst.max(n.total());
+        }
+    }
+    worst
 }
 
 // ---------------------------------------------------------------------------
@@ -268,9 +370,40 @@ pub struct QuotientStages {
 
 static LAST_STAGES: Mutex<Option<QuotientStages>> = Mutex::new(None);
 
-/// Test and measurement support (not a stable interface).
+/// Test and measurement support (not a stable interface; only with the
+/// `test-support` feature: [`test_support::numerator`] returns
+/// witness-dependent values).
+#[cfg(any(test, feature = "test-support"))]
 pub mod test_support {
     use super::*;
+
+    /// The exact [`Need`] total of `job` now (the registry and the
+    /// per-request scratch as they are): an upper bound of the device bytes
+    /// the hook call would add. `Err`: the decline reason of the checks
+    /// before the admission.
+    ///
+    /// # Safety
+    /// As [`crate::quotient`].
+    pub unsafe fn need_bytes_job(job: *const c_void) -> Result<usize, &'static str> {
+        if job.is_null() || !crate::device() {
+            return Err("no-device");
+        }
+        // SAFETY: the caller's contract.
+        let j = unsafe { &*(job as *const QuotientJobAbi) };
+        checked(j, None).map_err(|r| r.name())?;
+        // SAFETY: as above.
+        let tab = unsafe { Tables::new(j) }.map_err(|r| r.name())?;
+        // SAFETY: as above.
+        let t_inv = unsafe { abi::slice(j.t_inv, j.nt_inv) };
+        let s = ctx::lock().map_err(|e| err(e).name())?;
+        let mut plan = keys::plan(&tab.keys, 1usize << j.ext_k);
+        let need = need_of(j, &tab, t_inv, &plan, &s, true);
+        drop(s);
+        if let Some(l) = plan.lent.take() {
+            l.give_back();
+        }
+        Ok(need.total())
+    }
 
     /// The stages of the last quotient served.
     pub fn last_stages() -> Option<QuotientStages> {
@@ -427,22 +560,6 @@ fn copy_checked(dst: &mut [Scalar], src: &[Scalar]) -> bool {
     })
 }
 
-/// Copies `src` into `dst` (equal lengths) on several threads.
-fn par_copy(dst: &mut [Scalar], src: &[Scalar]) {
-    const PART: usize = 1 << 16;
-    if src.len() <= 2 * PART {
-        dst.copy_from_slice(src);
-        return;
-    }
-    let threads = std::thread::available_parallelism().map_or(4, |t| t.get()).min(8);
-    let per = src.len().div_ceil(threads).max(PART);
-    std::thread::scope(|s| {
-        for (d, c) in dst.chunks_mut(per).zip(src.chunks(per)) {
-            s.spawn(move || d.copy_from_slice(c));
-        }
-    });
-}
-
 // ---------------------------------------------------------------------------
 // The device run
 
@@ -496,6 +613,49 @@ fn err(e: Error) -> Reason {
     Reason::of(&e)
 }
 
+/// The [`Need`] of a planned call: the proof's cosets, the uploads of the
+/// plan, the resident copy when the call makes it, the second upload when a
+/// polynomial placed in a slot is checked (it may be stale), the transform
+/// scratch unless the request has one long enough, the job's tables.
+fn need_of(
+    j: &QuotientJobAbi,
+    tab: &Tables<'_>,
+    t_inv: &[Scalar],
+    plan: &keys::Plan,
+    s: &ctx::Session,
+    inverse: bool,
+) -> Need {
+    let ebytes = SCALAR_BYTES << j.ext_k;
+    let ntemp = plan.places.iter().filter(|p| **p == Place::Temp).count();
+    let lent_new = plan.lent.as_ref().map_or(0, |l| if l.buf.is_none() { l.bytes() } else { 0 });
+    let resident_checked = plan.resident_checked();
+    let tmp_need = ntt::scratch_bytes(j.ext_k);
+    let tmp_have = s.get_scratch("quotient-tmp").map_or(0, |b| b.len_bytes());
+    Need {
+        ebytes,
+        coeff_bytes: SCALAR_BYTES << j.k,
+        nproof: tab.proof.len(),
+        ntemp,
+        lent_new,
+        restale: if resident_checked > 0 {
+            ntemp + resident_checked
+        } else {
+            0
+        },
+        slots_bytes: (j.nslots as usize).max(1) * stride(j.ext_k) * SCALAR_BYTES,
+        // a shorter one is replaced by a new one
+        tmp_new: if tmp_need > 0 && tmp_have < tmp_need {
+            tmp_need
+        } else {
+            0
+        },
+        words_bytes: tab.words.len() * 4,
+        uniforms_bytes: tab.uniforms.len() * SCALAR_BYTES,
+        t_inv_bytes: t_inv.len() * SCALAR_BYTES,
+        inverse,
+    }
+}
+
 /// The bank and index of each proving-key polynomial, and the number of
 /// uploaded ones.
 fn banks(places: &[Place]) -> (Vec<(u32, usize)>, usize) {
@@ -533,6 +693,23 @@ unsafe fn run(
     if !field::all_reduced(t_inv) {
         return Err(Reason::Unreduced);
     }
+    // the scalars passed by value to the transform helpers, whose shader
+    // arithmetic needs reduced inputs: `checked` has checked them already
+    // (the shift and its inverse, `zeta_out`, the divisor, the roots by
+    // equality with the standard roots); checked again here, next to their
+    // use, so that a change to `checked` cannot let one through
+    let by_value = [
+        j.zeta[0],
+        j.zeta[1],
+        j.zeta_out[0],
+        j.zeta_out[1],
+        j.divisor,
+        j.extended_omega,
+        j.omega_inv,
+    ];
+    if !field::all_reduced(&by_value) {
+        return Err(Reason::Unreduced);
+    }
     let (k, ext_k) = (j.k, j.ext_k);
     let (n, en) = (1usize << k, 1usize << ext_k);
     let ebytes = SCALAR_BYTES << ext_k;
@@ -547,39 +724,16 @@ unsafe fn run(
     // the proving-key polynomials: resident or uploaded, placed before their
     // digests are checked (they are checked while the device works on the
     // proof's polynomials, and settled before the numerator reads a slot)
-    let mut plan = keys::plan(&tab.keys);
+    let mut plan = keys::plan(&tab.keys, en);
     let ntemp = plan.places.iter().filter(|p| **p == Place::Temp).count();
-    let res_new = plan.lent.as_ref().map_or(0, |l| {
-        if l.buf.is_none() {
-            l.npolys * ebytes
-        } else {
-            0
-        }
-    });
 
-    // memory: what this call allocates at its peak (the numerator)
-    let tmp_have = s.get_scratch("quotient-tmp").map_or(0, |b| b.len_bytes());
+    // memory: every buffer this call can allocate (the same sum as
+    // `need_bytes`)
+    let need = need_of(j, &tab, t_inv, &plan, &s, numerator.is_none());
     let tmp_need = ntt::scratch_bytes(ext_k);
-    let slots_bytes = nslots.max(1) * threads * SCALAR_BYTES;
-    let tables_bytes =
-        tab.words.len() * 4 + tab.uniforms.len() * SCALAR_BYTES + t_inv.len() * SCALAR_BYTES;
-    let peak_of = |ntemp: usize| {
-        (nproof + ntemp + 1) * ebytes
-            + res_new
-            + tmp_need.saturating_sub(tmp_have)
-            + slots_bytes.max(2 * n * SCALAR_BYTES)
-            + tables_bytes
-    };
-    let biggest = |ntemp: usize| {
-        [nproof * ebytes, ntemp * ebytes, res_new, slots_bytes]
-            .into_iter()
-            .max()
-            .unwrap_or(0)
-    };
-    let fits = |ntemp: usize| {
-        peak_of(ntemp) as u64 <= memory_limit() && biggest(ntemp) as u64 <= info.max_buffer_length
-    };
-    if !fits(ntemp) {
+    let fits = need.total() as u64 <= memory_limit()
+        && need.biggest() as u64 <= info.max_buffer_length;
+    if !fits {
         if let Some(l) = plan.lent.take() {
             l.give_back();
         }
@@ -625,37 +779,45 @@ unsafe fn run(
         let keys_list = &tab.keys;
         let places_ref = &plan.places;
         let check_ref = &plan.check;
+        // the polynomials whose slot this call fills: their digests are
+        // computed over the bytes copied into the slot, so that a slot is
+        // only ever marked present (at `keys::settle`) with verified content
+        let fills: Vec<bool> = (0..tab.keys.len()).map(|i| plan.fills(i)).collect();
+        let fills_ref = &fills;
         let lent_ref = &mut plan.lent;
         let key_tmp_ref = &mut key_tmp;
         let proof_list = &tab.proof;
         let zeta = j.zeta;
-        // (digests, copies good, slots filled, wall)
+        // (digests in the order of `check`, copies good, slots filled, wall)
         type KeyWork = (Vec<[u8; 32]>, bool, Vec<usize>, u64);
         let (key_work, cos): (KeyWork, Result<u64, Reason>) = std::thread::scope(|sc| {
             let kh = sc.spawn(move || -> KeyWork {
                 let t = Instant::now();
-                let to_hash: Vec<&[Scalar]> = check_ref.iter().map(|&i| keys_list[i]).collect();
-                let (digests, (ok, filled)) = std::thread::scope(|sc2| {
-                    let dh = sc2.spawn(|| keys::digest_many(&to_hash));
+                // the registered polynomials read from host memory
+                let host_hash: Vec<&[Scalar]> = check_ref
+                    .iter()
+                    .filter(|&&i| !fills_ref[i])
+                    .map(|&i| keys_list[i])
+                    .collect();
+                let (host_digests, (ok, filled)) = std::thread::scope(|sc2| {
+                    let dh = sc2.spawn(|| keys::digest_many(&host_hash));
                     let tmp_slice = key_tmp_ref.as_mut_slice::<Scalar>();
                     let mut ti = 0;
                     let mut ok = true;
                     let mut filled = Vec::new();
-                    for (p, pl) in keys_list.iter().zip(places_ref) {
+                    for (i, (p, pl)) in keys_list.iter().zip(places_ref).enumerate() {
                         match pl {
                             Place::Temp => {
                                 ok &= copy_checked(&mut tmp_slice[ti * en..(ti + 1) * en], p);
                                 ti += 1;
                             }
                             Place::Resident(slot) => {
-                                let l = lent_ref.as_mut().expect("a lent copy");
-                                if !l.present[*slot] {
+                                if fills_ref[i] {
+                                    let l = lent_ref.as_mut().expect("a lent copy");
                                     let b =
                                         l.buf.as_mut().expect("allocated").as_mut_slice::<Scalar>();
-                                    let good = copy_checked(&mut b[slot * en..(slot + 1) * en], p);
-                                    l.present[*slot] = good;
+                                    ok &= copy_checked(&mut b[slot * en..(slot + 1) * en], p);
                                     filled.push(*slot);
-                                    ok &= good;
                                 }
                             }
                         }
@@ -665,7 +827,26 @@ unsafe fn run(
                     }
                     (dh.join().unwrap_or_default(), (ok, filled))
                 });
-                (digests, ok, filled, t.elapsed().as_nanos() as u64)
+                if !ok {
+                    return (Vec::new(), false, filled, t.elapsed().as_nanos() as u64);
+                }
+                // the bytes now in the filled slots
+                let slot_digests = match lent_ref.as_ref().and_then(|l| l.buf.as_ref()) {
+                    Some(b) => {
+                        let b = b.as_slice::<Scalar>();
+                        let in_slots: Vec<&[Scalar]> =
+                            filled.iter().map(|s| &b[s * en..(s + 1) * en]).collect();
+                        keys::digest_many(&in_slots)
+                    }
+                    None => Vec::new(),
+                };
+                // in the order of `check` (both lists follow it)
+                let (mut h, mut f) = (host_digests.into_iter(), slot_digests.into_iter());
+                let digests: Option<Vec<[u8; 32]>> = check_ref
+                    .iter()
+                    .map(|&i| if fills_ref[i] { f.next() } else { h.next() })
+                    .collect();
+                (digests.unwrap_or_default(), ok, filled, t.elapsed().as_nanos() as u64)
             });
             let cos = (|| -> Result<u64, Reason> {
                 let mut ns = 0;
@@ -870,11 +1051,20 @@ unsafe fn run(
         st.gpu_inverse = ns;
         st.inverse = t_inv_ntt.elapsed().as_nanos() as u64;
 
-        // the first `len` coefficients
+        // the first `len` coefficients. Everything that can fail or panic is
+        // done before the first byte of `out` is written (a panic becomes a
+        // decline, which must leave `out` unchanged): `tinv` is released, the
+        // source is sliced (`checked` has held `out.len()` to `j.len <= en`)
+        // and the resident copy was given back after the numerator. What
+        // follows the copy cannot fail: `ctx::par_copy` and
+        // `ctx::release_later` never panic, and the rest of `run` and of
+        // `quotient` stores counters and takes poison-tolerant locks.
         let t_rb = Instant::now();
-        par_copy(out, &nu.as_slice::<Scalar>()[..out.len()]);
-        ctx::release_later(vec![nu]);
         drop(tinv);
+        debug_assert!(plan.lent.is_none());
+        let src = &nu.as_slice::<Scalar>()[..out.len()];
+        ctx::par_copy(out, src);
+        ctx::release_later(vec![nu]);
         st.readback = t_rb.elapsed().as_nanos() as u64;
         Ok(gpu)
     })();

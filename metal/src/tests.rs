@@ -651,6 +651,21 @@ unsafe fn checked_quotient(job: *const std::ffi::c_void, out: &mut [Scalar]) -> 
     unsafe { crate::quotient(job, out) }
 }
 
+/// Installs [`checked_quotient`] as the prover's quotient hook (once per
+/// process; the other hooks stay the stock CPU code).
+fn install_checked_quotient() {
+    use midnight_proofs::gpu::{self as hooks, GpuHooks};
+    static INSTALL: std::sync::Once = std::sync::Once::new();
+    INSTALL.call_once(|| {
+        assert!(hooks::install(GpuHooks {
+            msm_g1: None,
+            fft: None,
+            ifft: None,
+            quotient: Some(checked_quotient),
+        }));
+    });
+}
+
 /// Each entry point serves a small valid call with the stock CPU value, and
 /// declines a call of a wrong shape or with an unreduced input, leaving the
 /// caller's buffer unchanged.
@@ -659,7 +674,7 @@ fn entry_points_serve_small_calls() {
     use group::Curve;
     use midnight_curves::Fq;
     use midnight_proofs::gpu::{
-        self as hooks, GpuHooks,
+        self as hooks,
         adapter::{affine, from_jacobian, scalar, scalars, scalars_mut},
         test_switches::{QUOTIENT_CHECK, RandomCircuit},
     };
@@ -698,15 +713,7 @@ fn entry_points_serve_small_calls() {
 
     // quotient: a real job of a proof, with the hook layer's check mode
     // comparing the device quotient with the stock CPU one
-    static INSTALL: std::sync::Once = std::sync::Once::new();
-    INSTALL.call_once(|| {
-        assert!(hooks::install(GpuHooks {
-            msm_g1: None,
-            fft: None,
-            ifft: None,
-            quotient: Some(checked_quotient),
-        }));
-    });
+    install_checked_quotient();
     let (checks, diffs) = (hooks::quotient_checks(), hooks::quotient_check_diffs());
     let q = crate::stats().quotient.served;
     QUOTIENT_CHECK.store(true, Relaxed);
@@ -856,22 +863,154 @@ fn erase_report_reads_back_every_region() {
     };
     fill(4096 + 3);
     let w = crate::end_request_report(true).expect("every region reads back zero");
-    assert_eq!((w.regions, w.checked_regions), (2, 2));
-    assert_eq!(w.bytes, 3 * (4096 + 3) as u64);
+    // the per-request regions, then (check mode) the idle buffers of the
+    // pool, read back before them
+    assert_eq!(
+        (w.regions - w.pool_regions, w.checked_regions - w.pool_regions),
+        (2, 2)
+    );
+    assert_eq!(w.checked_regions, w.regions);
+    assert_eq!(w.bytes - w.pool_bytes, 3 * (4096 + 3) as u64);
     assert!(w.checked && w.nonzero_regions == 0 && w.check_failures == 0);
-    // without the check nothing is read back
+    assert_eq!(w.erasure_failures, 0);
+    // without the check nothing is read back, the pool is not counted
     fill(64);
     let w = crate::end_request_report(false).unwrap();
     assert_eq!((w.regions, w.checked, w.checked_regions), (2, false, 0));
-    // a planted non-zero byte
+    assert_eq!((w.pool_regions, w.pool_bytes), (0, 0));
+    // a non-zero byte planted after the zeroing through the raw pointer
+    // (the buffer's dirty flag is not set: its drop would not zero it)
     fill(64);
     ctx::set_plant_nonzero(true);
     let r = crate::end_request_report(true);
     ctx::set_plant_nonzero(false);
     let w = r.expect_err("a non-zero region fails the report");
-    assert_eq!((w.regions, w.nonzero_regions, w.check_failures), (2, 1, 0));
-    // the region was released all the same
+    assert_eq!(
+        (w.regions - w.pool_regions, w.nonzero_regions, w.check_failures),
+        (2, 1, 0)
+    );
+    // the region was released all the same: not kept as scratch, not in the
+    // pool, and every idle buffer of the pool reads zero
     assert_eq!(ctx::lock().unwrap().scratch_bytes(), 0);
+    let planted = ctx::last_planted();
+    assert_ne!(planted, 0);
+    assert!(
+        !ctx::idle_pool_addresses().contains(&planted),
+        "the failed region is not in the pool"
+    );
+    assert!(ctx::idle_pool_reads_zero());
+    assert!(ctx::request_buffers().is_empty());
+    let w = crate::end_request_report(true).expect("clean afterwards");
+    assert_eq!(w.nonzero_regions, 0);
+}
+
+/// The check mode reads back every idle buffer of the pool (the scoped
+/// buffers that held witness values go back there): a non-zero idle buffer
+/// fails the report, is zeroed again and leaves the pool.
+#[test]
+fn erase_report_reads_back_the_idle_pool() {
+    let _g = serial();
+    require_device();
+    assert!(crate::end_request());
+    let c = ctx::context().unwrap();
+    // a scoped pooled buffer that held data, back in the pool zeroed
+    let mut b = c.alloc_pooled(1 << 20).unwrap();
+    b.as_mut_slice::<u8>().fill(0x42);
+    drop(b);
+    let idle = ctx::idle_pool_addresses().len() as u64;
+    assert!(idle >= 1);
+    let w = crate::end_request_report(true).expect("the idle pool reads zero");
+    assert_eq!((w.regions, w.pool_regions, w.checked_regions), (idle, idle, idle));
+    assert_eq!(w.bytes, w.pool_bytes);
+    assert!(w.pool_bytes >= 1 << 20);
+    // a stray non-zero byte in an idle buffer
+    let planted = ctx::plant_in_idle_pool().expect("an idle buffer");
+    let pooled = crate::pool_bytes();
+    let w = crate::end_request_report(true).expect_err("a non-zero idle buffer");
+    assert_eq!((w.nonzero_regions, w.check_failures), (1, 0));
+    assert_eq!(w.pool_regions, idle);
+    assert!(!ctx::idle_pool_addresses().contains(&planted));
+    assert!(crate::pool_bytes() < pooled, "the buffer left the pool");
+    assert!(ctx::idle_pool_reads_zero());
+    assert!(crate::end_request_report(true).is_ok());
+}
+
+/// An upload shorter than the 16-byte minimum allocation copies exactly its
+/// bytes (no read past the caller's data) and the rest reads zero.
+#[test]
+fn short_uploads_copy_exactly_their_bytes() {
+    require_device();
+    let c = ctx::context().unwrap();
+    for len in [1usize, 4, 15] {
+        let data: Vec<u8> = (1..=len as u8).collect();
+        let b = c.upload(&data).unwrap();
+        assert_eq!(b.len_bytes(), len);
+        assert!(b.alloc_bytes() >= 16);
+        let mut back = vec![0u8; len];
+        b.read(&mut back);
+        assert_eq!(back, data, "{len} bytes");
+        // SAFETY: the allocation is `alloc_bytes` long; nothing writes it
+        let whole = unsafe { std::slice::from_raw_parts(b.as_slice::<u8>().as_ptr(), b.alloc_bytes()) };
+        assert!(whole[len..].iter().all(|x| *x == 0), "the tail of {len} bytes");
+    }
+}
+
+/// `settle_releases` returns, for every caller at the same time, only once
+/// every release made before it has completed.
+#[test]
+fn settle_releases_waits_for_every_caller() {
+    let _g = serial();
+    require_device();
+    assert!(crate::end_request());
+    let c = ctx::context().unwrap();
+    for _ in 0..2 {
+        let bufs: Vec<_> = (0..2)
+            .map(|_| {
+                let mut b = c.alloc_pooled(32 << 20).unwrap();
+                b.as_mut_slice::<u8>().fill(0x11);
+                b
+            })
+            .collect();
+        ctx::release_later(bufs);
+    }
+    let start = std::sync::Barrier::new(2);
+    std::thread::scope(|s| {
+        let hs: Vec<_> = (0..2)
+            .map(|_| {
+                s.spawn(|| {
+                    start.wait();
+                    ctx::settle_releases();
+                    !ctx::releases_pending()
+                })
+            })
+            .collect();
+        for h in hs {
+            assert!(h.join().unwrap(), "a caller returned before the zeroing ended");
+        }
+    });
+    assert!(ctx::idle_pool_reads_zero());
+    assert!(crate::end_request());
+}
+
+/// A zeroing that panics is completed on the calling thread; the buffer is
+/// released, not pooled, and the next report fails with the fault counted.
+#[test]
+fn a_panicking_zeroing_is_completed_and_reported() {
+    let _g = serial();
+    require_device();
+    assert!(crate::end_request());
+    let c = ctx::context().unwrap();
+    let mut b = c.alloc_pooled(1 << 20).unwrap();
+    b.as_mut_slice::<u8>().fill(0x66);
+    let at = b.as_slice::<u8>().as_ptr() as usize;
+    ctx::set_zeroing_panic(at);
+    ctx::release_later(vec![b]);
+    ctx::settle_releases();
+    ctx::set_zeroing_panic(0);
+    assert!(!ctx::idle_pool_addresses().contains(&at), "not pooled");
+    assert!(ctx::idle_pool_reads_zero());
+    let w = crate::end_request_report(false).expect_err("the fault is reported");
+    assert_eq!(w.erasure_failures, 1);
     assert!(crate::end_request());
 }
 
@@ -1014,6 +1153,160 @@ fn command_buffer_duration() {
                 ns as f64 / 1e9
             ),
             Err(e) => println!("target {target:5.1} s: {e} (wall {wall:.3} s)"),
+        }
+    }
+}
+
+// --- hook calls outside a request, panics at the hook boundary ---------------
+
+/// The per-request buffers that exist now, for messages.
+fn request_buffer_keys() -> Vec<&'static str> {
+    ctx::request_buffers().into_iter().map(|r| r.0).collect()
+}
+
+/// Nothing a hook call left behind: no per-request buffer exists, and every
+/// idle buffer of the pool reads zero.
+fn assert_wiped(after: &str) {
+    let left = ctx::request_buffers();
+    assert!(left.is_empty(), "after {after}: {left:?}");
+    assert!(ctx::idle_pool_reads_zero(), "after {after}: an idle buffer is not zero");
+}
+
+/// Without `begin_request` every hook call zeroes its per-request buffers
+/// before it returns; with a request open they are kept between calls and
+/// zeroed at `end_request`.
+#[test]
+fn hooks_outside_a_request_wipe_before_they_return() {
+    use midnight_proofs::gpu::{
+        adapter::{affine, scalar, scalars, scalars_mut},
+        test_switches::RandomCircuit,
+    };
+    let _g = serial();
+    require_device();
+    assert!(crate::end_request());
+    assert!(!ctx::request_open());
+    assert!(crate::set_min_k(1));
+    // two passes: data and scratch buffers
+    let log_n = 12;
+    let input = stock::scalars(1 << log_n, 21);
+    let w = scalar(stock::root(log_n));
+
+    let mut a = input.clone();
+    assert!(crate::fft(scalars_mut(&mut a), w, log_n));
+    assert_wiped("fft");
+    let points = stock::points(1 << 10, 22);
+    let r = crate::msm_g1(scalars(&input[..1 << 10]), affine(&points));
+    assert!(r.is_some(), "{:?}", crate::declines());
+    assert_wiped("msm_g1");
+    install_checked_quotient();
+    let q = crate::stats().quotient.served;
+    let (_, verified) = RandomCircuit::new(8, true, 9).prove();
+    assert!(verified);
+    assert_eq!(crate::stats().quotient.served - q, 1, "{:?}", crate::declines());
+    assert_wiped("quotient");
+
+    // inside a request the scratch stays for the next call
+    crate::begin_request();
+    assert!(ctx::request_open());
+    let mut a = input.clone();
+    assert!(crate::fft(scalars_mut(&mut a), w, log_n));
+    let first = ctx::request_buffers();
+    assert!(
+        first.iter().any(|r| r.0 == "ntt-data"),
+        "{:?}",
+        request_buffer_keys()
+    );
+    let mut a = input.clone();
+    assert!(crate::fft(scalars_mut(&mut a), w, log_n));
+    let second = ctx::request_buffers();
+    let addr = |rows: &[(&str, usize, bool, usize)]| {
+        rows.iter().find(|r| r.0 == "ntt-data").map(|r| r.3)
+    };
+    assert_eq!(addr(&first), addr(&second), "the same buffer, reused");
+    assert!(crate::msm_g1(scalars(&input[..1 << 10]), affine(&points)).is_some());
+    assert!(ctx::request_buffers().len() > second.len(), "the msm's scratch");
+    assert!(crate::end_request());
+    assert!(!ctx::request_open());
+    assert_wiped("end_request");
+    crate::reset_min_k();
+}
+
+/// A panic inside a backend is a counted decline `panic`; the caller's
+/// buffer is unchanged and the call still wipes its scratch (no request).
+#[test]
+fn a_backend_panic_is_a_counted_decline() {
+    use midnight_proofs::gpu::adapter::{affine, scalar, scalars, scalars_mut};
+    let _g = serial();
+    require_device();
+    assert!(crate::end_request());
+    assert!(crate::set_min_k(1));
+    let log_n = 12;
+    let n = 1usize << log_n;
+    let input = stock::scalars(n, 31);
+    let w = stock::root(log_n);
+    let wi = ff::Field::invert(&w).unwrap();
+    let div = ff::Field::invert(&midnight_curves::Fq::from(n as u64)).unwrap();
+
+    let panics = crate::hook_panics();
+    // fft and ifft: the panic comes with the request buffers filled
+    for class in ["fft", "ifft"] {
+        let before = decline_count(class, "panic");
+        crate::set_hook_panic(class, true);
+        let mut a = input.clone();
+        let ok = if class == "fft" {
+            crate::fft(scalars_mut(&mut a), scalar(w), log_n)
+        } else {
+            crate::ifft(scalars_mut(&mut a), scalar(wi), log_n, scalar(div))
+        };
+        crate::set_hook_panic(class, false);
+        assert!(!ok);
+        assert_eq!(a, input, "{class}: the caller's buffer is unchanged");
+        assert_eq!(decline_count(class, "panic") - before, 1);
+        assert_wiped(class);
+    }
+    // msm: the panic comes after the device MSM used its scratch
+    let points = stock::points(1 << 10, 32);
+    let before = decline_count("msm", "panic");
+    crate::set_hook_panic("msm", true);
+    let r = crate::msm_g1(scalars(&input[..1 << 10]), affine(&points));
+    crate::set_hook_panic("msm", false);
+    assert!(r.is_none());
+    assert_eq!(decline_count("msm", "panic") - before, 1);
+    assert_wiped("msm_g1");
+    // quotient: the panic comes before the job is read (so a placeholder
+    // job is never dereferenced)
+    let before = decline_count("quotient", "panic");
+    let placeholder = 0u64;
+    let mut out = vec![[7u64; 4]; 4];
+    crate::set_hook_panic("quotient", true);
+    // SAFETY: the test switch panics before the job is read.
+    let ok = unsafe {
+        crate::quotient(&placeholder as *const u64 as *const std::ffi::c_void, &mut out)
+    };
+    crate::set_hook_panic("quotient", false);
+    assert!(!ok);
+    assert_eq!(out, vec![[7u64; 4]; 4]);
+    assert_eq!(decline_count("quotient", "panic") - before, 1);
+    assert_wiped("quotient");
+    assert_eq!(crate::hook_panics() - panics, 4);
+    // the hooks serve again afterwards
+    let mut a = input.clone();
+    assert!(crate::fft(scalars_mut(&mut a), scalar(w), log_n));
+    crate::reset_min_k();
+    assert!(crate::end_request());
+}
+
+/// The `ntt_pass` pipeline takes every threadgroup size the plan uses, so
+/// no transform size is declined for good by `dispatch_groups`.
+#[test]
+fn ntt_pass_takes_the_planned_threadgroups() {
+    use objc2_metal::MTLComputePipelineState;
+    require_device();
+    let p = ctx::context().unwrap().pipeline("ntt_pass").unwrap();
+    let max = p.maxTotalThreadsPerThreadgroup();
+    for log_n in 1..=crate::MAX_LOG_N {
+        for t in crate::ntt::pass_group_threads(log_n) {
+            assert!(t >= 1 && t <= max, "2^{log_n}: {t} threads, pipeline max {max}");
         }
     }
 }

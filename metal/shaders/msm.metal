@@ -76,11 +76,16 @@ MONT_INLINE uint booth_encode(uint wval, uint wmask, uint wbits) {
 
 } // namespace msm
 
+// `hot` (one uint, see `msm_bucket_guard`) is reset here, at the start of
+// each chunk's command buffer. In the mask mode `scalars` is not read (the
+// host binds the scalars buffer, never the output).
 kernel void msm_digits(device const Fr *scalars [[buffer(0)]],
                        device uint *digits [[buffer(1)]],
                        constant msm::DigitsParams &p [[buffer(2)]],
+                       device uint *hot [[buffer(3)]],
                        uint i [[thread_position_in_grid]]) {
     using namespace msm;
+    if (i == 0) *hot = 0;
     if (i >= p.len) return;
 
     Fr s;
@@ -178,12 +183,14 @@ MONT_INLINE void slice_of(uint len, uint groups, uint g, thread uint &base, thre
 }
 
 // Exclusive prefix sum over the threadgroup of one value per thread; the
-// threadgroup is whole SIMD-groups of 32. `total` is the sum of all values.
-// (sppark builds this from `shfl.sync.up`; here the SIMD-group prefix sum.)
+// threadgroup is whole SIMD-groups of `width` (at least 32, so that the
+// `nsg <= 32` group totals fit one SIMD-group; the host checks that the
+// width is 32). `total` is the sum of all values. (sppark builds this from
+// `shfl.sync.up`; here the SIMD-group prefix sum.)
 MONT_INLINE uint group_exclusive_sum(uint x, threadgroup uint *sg_tot, uint lane, uint sg, uint nsg,
-                                     thread uint &total) {
+                                     uint width, thread uint &total) {
     uint incl = simd_prefix_inclusive_sum(x);
-    if (lane == 31) sg_tot[sg] = incl;
+    if (lane == width - 1) sg_tot[sg] = incl;
     threadgroup_barrier(mem_flags::mem_threadgroup);
     if (sg == 0) {
         uint v = lane < nsg ? sg_tot[lane] : 0;
@@ -247,7 +254,8 @@ kernel void msm_sort_scan(device uint *counts [[buffer(0)]],
                           uint tpg [[threads_per_threadgroup]],
                           uint lane [[thread_index_in_simdgroup]],
                           uint sg [[simdgroup_index_in_threadgroup]],
-                          uint nsg [[simdgroups_per_threadgroup]]) {
+                          uint nsg [[simdgroups_per_threadgroup]],
+                          uint width [[threads_per_simdgroup]]) {
     using namespace msm;
     threadgroup uint sg_tot[33];
 
@@ -260,7 +268,7 @@ kernel void msm_sort_scan(device uint *counts [[buffer(0)]],
     uint sum = 0;
     for (uint j = lo; j < hi; j++) sum += c[j];
     uint total;
-    uint run = group_exclusive_sum(sum, sg_tot, lane, sg, nsg, total);
+    uint run = group_exclusive_sum(sum, sg_tot, lane, sg, nsg, width, total);
     for (uint j = lo; j < hi; j++) {
         uint v = c[j];
         c[j] = run;
@@ -322,7 +330,8 @@ kernel void msm_sort_lower(device uint *digits [[buffer(0)]],
                            uint tpg [[threads_per_threadgroup]],
                            uint lane [[thread_index_in_simdgroup]],
                            uint sg [[simdgroup_index_in_threadgroup]],
-                           uint nsg [[simdgroups_per_threadgroup]]) {
+                           uint nsg [[simdgroups_per_threadgroup]],
+                           uint width [[threads_per_simdgroup]]) {
     using namespace msm;
     threadgroup atomic_uint counters[MAX_LOW];
     threadgroup uint sg_tot[33];
@@ -348,7 +357,7 @@ kernel void msm_sort_lower(device uint *digits [[buffer(0)]],
     uint sum = 0;
     for (uint j = lo; j < hi; j++) sum += atomic_load_explicit(&counters[j], memory_order_relaxed);
     uint total;
-    uint run = group_exclusive_sum(sum, sg_tot, lane, sg, nsg, total) + base;
+    uint run = group_exclusive_sum(sum, sg_tot, lane, sg, nsg, width, total) + base;
     for (uint j = lo; j < hi; j++) {
         run += atomic_load_explicit(&counters[j], memory_order_relaxed);
         atomic_store_explicit(&counters[j], run, memory_order_relaxed);
@@ -368,8 +377,11 @@ kernel void msm_sort_lower(device uint *digits [[buffer(0)]],
 // sppark `batch_addition` (the digits-only form): the bucket of digit 1 in
 // window 0 (the first `hist[0]` sorted entries of row 0), summed by every
 // thread of the grid, then reduced within each SIMD-group (sppark's
-// `shfl_down` reduction with `simd_shuffle_down`). One partial sum per
-// SIMD-group; the host adds them.
+// `shfl_down` reduction with `simd_shuffle_down`). One partial sum per 32
+// threads of the grid, written by the thread whose grid index is a multiple
+// of 32: with SIMD-groups of 32 (the host checks the width) or any multiple
+// of 32, each run of 32 lanes reduces into its first lane, so every one of
+// the `threads / 32` records the host reads is written at every run.
 
 namespace msm {
 
@@ -399,6 +411,7 @@ kernel void msm_ones(device g1::Xyzz *ones [[buffer(0)]],
                      uint nthreads [[threads_per_grid]],
                      uint lane [[thread_index_in_simdgroup]]) {
     using namespace msm;
+    // the reduction below combines lanes in runs of 32
     const uint ndigits = hist[0];
 
     g1::Xyzz acc = g1::inf();
@@ -413,7 +426,7 @@ kernel void msm_ones(device g1::Xyzz *ones [[buffer(0)]],
         if ((lane & (off - 1)) == 0) g1::add(acc, down);
     }
 
-    if (lane == 0) ones[tid / 32] = acc;
+    if ((tid & 31) == 0) ones[tid / 32] = acc;
 }
 
 // ---------------------------------------------------------------------------
@@ -426,8 +439,9 @@ kernel void msm_ones(device g1::Xyzz *ones [[buffer(0)]],
 namespace msm {
 struct AccParams {
     uint nwins;
-    uint bits;    // wbits - 1
-    uint stride;  // digits row length
+    uint bits;       // wbits - 1
+    uint stride;     // digits row length
+    uint hot_limit;  // the most points of one bucket (src/msm.rs HOT_BUCKET_LIMIT)
 };
 // Threads of an `msm_accumulate` group (src/msm.rs `ACC_GROUP`).
 constant uint ACC_GROUP = 256;
@@ -445,17 +459,39 @@ MONT_INLINE uint bucket_len(device const uint *hist, constant msm::AccParams &p,
     return (x == 0 && y == 0) ? 0 : h[x] - idx;
 }
 
+// The hot-bucket bound (src/msm.rs `HOT_BUCKET_LIMIT`): one thread per
+// bucket; `hot` is set when a bucket (the bucket of `msm_ones` excepted)
+// holds more than `hot_limit` points. Then `msm_accumulate` writes infinity
+// to every bucket without reading any point, and the host declines the call
+// (it reads `hot` after the command buffer).
+kernel void msm_bucket_guard(device const uint *hist [[buffer(0)]],
+                             device metal::atomic_uint *hot [[buffer(1)]],
+                             constant msm::AccParams &p [[buffer(2)]],
+                             uint t [[thread_position_in_grid]]) {
+    if (t >= (p.nwins << p.bits)) return;
+    uint idx;
+    if (bucket_len(hist, p, t, idx) > p.hot_limit)
+        metal::atomic_store_explicit(hot, 1u, metal::memory_order_relaxed);
+}
+
 kernel void msm_accumulate(device g1::Xyzz *buckets [[buffer(0)]],
                            device const g1::Affine *points [[buffer(1)]],
                            device const uint *digits [[buffer(2)]],
                            device const uint *hist [[buffer(3)]],
                            constant msm::AccParams &p [[buffer(4)]],
+                           device const uint *hot [[buffer(5)]],
                            uint g [[thread_position_in_grid]],
                            uint tid [[thread_index_in_threadgroup]],
                            uint tpg [[threads_per_threadgroup]]) {
     threadgroup uint lens[ACC_GROUP];
     threadgroup uint slot[ACC_GROUP];
     const uint total = p.nwins << p.bits;
+    // the same value for every thread: the whole grid returns here, before
+    // any barrier
+    if (*hot != 0) {
+        if (g < total) buckets[g] = g1::inf();
+        return;
+    }
     uint idx;
     const uint mine = g < total ? bucket_len(hist, p, g, idx) : 0;
     // the group's buckets by load, longest first: each SIMD-group takes 32

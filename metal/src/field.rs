@@ -72,8 +72,25 @@ pub fn all_reduced(a: &[Scalar]) -> bool {
     }
     let threads = std::thread::available_parallelism().map_or(4, |t| t.get()).min(16);
     let per = a.len().div_ceil(threads).max(PART);
+    // a part whose thread cannot be made (or failed) is checked on this
+    // thread: no panic on thread exhaustion
     std::thread::scope(|s| {
-        let hs: Vec<_> = a.chunks(per).map(|c| s.spawn(move || c.iter().all(is_reduced))).collect();
-        hs.into_iter().all(|h| h.join().unwrap_or(false))
+        let hs: Vec<_> = a
+            .chunks(per)
+            .map(|c| {
+                let h = std::thread::Builder::new()
+                    .spawn_scoped(s, move || c.iter().all(is_reduced))
+                    .ok();
+                (c, h)
+            })
+            .collect();
+        let mut all = true;
+        for (c, h) in hs {
+            all &= match h {
+                Some(h) => h.join().unwrap_or_else(|_| c.iter().all(is_reduced)),
+                None => c.iter().all(is_reduced),
+            };
+        }
+        all
     })
 }

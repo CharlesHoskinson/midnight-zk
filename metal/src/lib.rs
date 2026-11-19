@@ -24,7 +24,17 @@
 //!     ifft: Some(midnight_metal::ifft),
 //!     quotient: Some(midnight_metal::quotient),
 //! });
+//! // per proof (recommended): the device scratch, which holds witness
+//! // values, is reused across the calls of the proof and zeroed at its end
+//! midnight_metal::begin_request();
+//! let proof = prove(/* ... */);
+//! assert!(midnight_metal::end_request()); // or end_request_report(true)
 //! ```
+//!
+//! With [`begin_request`] / [`end_request`] the per-request device scratch
+//! is reused across the hook calls of one request and wiped at its end.
+//! Without them (only `install`), every hook call wipes it before it
+//! returns, which is slower: each call takes and zeroes its scratch again.
 //!
 //! This crate does not depend on midnight-proofs. On macOS it depends on
 //! midnight-curves for the CPU share of a G1 MSM, which runs the stock
@@ -42,7 +52,10 @@
 //!    is a fixed public function of the input shape.
 //! 4. The device is never a correctness dependency: every failure (no device,
 //!    an allocation, a pipeline, a command buffer in the error state) is a
-//!    counted decline, never a panic.
+//!    counted decline, never a panic. A panic inside a kernel module is
+//!    caught at the entry point and becomes the counted decline `panic`
+//!    (with the caller's buffer unchanged, per 2), so it never unwinds into
+//!    the prover (unless the process is built with `panic = "abort"`).
 //!
 //! ## Data layout
 //!
@@ -188,14 +201,26 @@
 //! ## Requests
 //!
 //! Call [`begin_request`] and [`end_request`] (or [`end_request_report`])
-//! around each proof: it zeroes the per-request buffers (which can hold
-//! witness values), with [`end_request_report`]`(true)` reading each one back
-//! from the host mapping and counting the regions that are not zero. Scoped
-//! buffers (owned by one call) are zeroed when dropped, at the end of that
-//! call or on a background thread that [`end_request`] waits for; they are
-//! not in the report. A region that fails the check is zeroed again and
-//! reported: there is no quarantine and no retry, unlike the wipe layer of
-//! the CUDA crate.
+//! around each proof. Between them the per-request buffers (device scratch
+//! that can hold witness values: the MSM's scalars, digits, histograms,
+//! temporaries and buckets, the transforms' data and scratch, the
+//! quotient's transform scratch) are kept and reused by the next call;
+//! [`end_request`] zeroes them, and [`end_request_report`]`(true)` also
+//! reads each one back from the host mapping, reads back every idle buffer
+//! of the pool, and counts the regions that are not zero. Without a request
+//! (an integrator that only installs the hooks), every hook call zeroes the
+//! per-request buffers before it returns, on success, decline, error or a
+//! caught panic, with no read-back: nothing stays in device-visible memory
+//! between calls, at the cost of making and zeroing the scratch at every
+//! call.
+//!
+//! Scoped buffers (owned by one call) are zeroed when dropped, at the end
+//! of that call or on a background thread that [`end_request`] waits for;
+//! they go back to the pool, whose idle buffers the check reads back. A
+//! region that fails the check is zeroed again, read back again and
+//! released (never pooled, never kept as scratch), and the report is `Err`:
+//! there is no quarantine and no retry, unlike the wipe layer of the CUDA
+//! crate.
 //!
 //! The large buffers, per-request and scoped, come from a pool of zeroed
 //! buffers and go back to it after their zeroing, instead of being released:
@@ -214,7 +239,7 @@ use std::{
     ffi::c_void,
     sync::{
         OnceLock,
-        atomic::{AtomicU32, Ordering::Relaxed},
+        atomic::{AtomicU32, AtomicU64, Ordering::Relaxed},
     },
 };
 
@@ -226,9 +251,12 @@ pub mod ctx;
 #[cfg(target_os = "macos")]
 mod msm;
 #[cfg(target_os = "macos")]
-pub use msm::{
-    MsmStages, SrsHandle, msm_counts, msm_g1_stages, register_srs, srs_handles, srs_stale,
-};
+pub use msm::{SrsHandle, msm_counts, register_srs, srs_handles, srs_stale};
+/// The MSM's measurement entry (feature `test-support`; not a stable
+/// interface, not for secret scalars).
+#[cfg(all(target_os = "macos", any(test, feature = "test-support")))]
+#[doc(hidden)]
+pub use msm::{MsmStages, msm_g1_stages};
 #[cfg(target_os = "macos")]
 mod ntt;
 /// Host-to-host wrappers of the NTT device building blocks, for this crate's
@@ -247,7 +275,12 @@ pub use quotient::{
 /// quotient, for this crate's integration tests (not a stable interface).
 #[cfg(target_os = "macos")]
 #[doc(hidden)]
-pub use quotient::{abi as quotient_abi, test_support as quotient_test_support};
+pub use quotient::abi as quotient_abi;
+/// The quotient's test and measurement entry points (feature
+/// `test-support`).
+#[cfg(all(target_os = "macos", any(test, feature = "test-support")))]
+#[doc(hidden)]
+pub use quotient::test_support as quotient_test_support;
 
 #[cfg(all(test, target_os = "macos"))]
 mod tests;
@@ -510,7 +543,9 @@ pub fn stats() -> Stats {
 /// layout or version the device does not take), `unreduced` (a scalar not
 /// below the modulus), `memory` (a buffer above `maxBufferLength`, a failed
 /// allocation or a budget), `device-error` (a pipeline, encoder or command
-/// buffer failed).
+/// buffer failed), `panic` (the kernel module panicked; the entry point
+/// caught it), `bases-not-in-subgroup` (`msm` only: a base that is not a
+/// point of G1, off the curve or outside the prime-order subgroup).
 pub fn declines() -> Vec<(&'static str, &'static str, u64)> {
     account::declines()
 }
@@ -536,6 +571,28 @@ pub fn msm_admission(scalars: usize, bases: usize, max_log: u32) -> Result<(), &
     Ok(())
 }
 
+/// Whether [`msm_g1`] takes an MSM of `len` scalars over `bases` by its
+/// length: `len` passes [`msm_admission`] (with [`MAX_MSM_LOG`]) and, when
+/// no registered table serves `bases`, reaches the class `msm_one_shot` of
+/// [`thresholds`]. It reads no scalar: the checks that do (the effective
+/// size of a sparse MSM, the reduction) come after it in [`msm_g1`], which
+/// may still decline. A figure that does not depend on the scalar values,
+/// for a caller that must not report one that does.
+pub fn msm_sized(len: usize, bases: &[G1AffineLimbs]) -> bool {
+    if msm_admission(len, bases.len(), MAX_MSM_LOG).is_err() {
+        return false;
+    }
+    if lg2_nearest(len) >= thresholds().msm_one_shot {
+        return true;
+    }
+    #[cfg(target_os = "macos")]
+    {
+        msm::has_table(bases)
+    }
+    #[cfg(not(target_os = "macos"))]
+    false
+}
+
 /// G1 MSM `sum scalars[i] * bases[i]` (equal lengths): the hook
 /// `GpuHooks::msm_g1`. `None`: declined.
 ///
@@ -548,6 +605,10 @@ pub fn msm_admission(scalars: usize, bases: usize, max_log: u32) -> Result<(), &
 /// (one-shot), and with an explicit threshold to `2^min_k`, with the same
 /// decline.
 pub fn msm_g1(scalars: &[Scalar], bases: &[G1AffineLimbs]) -> Option<G1JacobianLimbs> {
+    guarded(Class::Msm, None, || msm_g1_body(scalars, bases))
+}
+
+fn msm_g1_body(scalars: &[Scalar], bases: &[G1AffineLimbs]) -> Option<G1JacobianLimbs> {
     if let Err(why) = msm_admission(scalars.len(), bases.len(), MAX_MSM_LOG) {
         let r = if why == Reason::Shape.name() {
             Reason::Shape
@@ -595,7 +656,10 @@ pub fn msm_g1(scalars: &[Scalar], bases: &[G1AffineLimbs]) -> Option<G1JacobianL
     }
     #[cfg(target_os = "macos")]
     {
-        msm::msm_g1(scalars, bases, one_shot_min)
+        let r = msm::msm_g1(scalars, bases, one_shot_min);
+        // a test panic after the backend used its scratch
+        test_switch::hook_panic(Class::Msm);
+        r
     }
     #[cfg(not(target_os = "macos"))]
     None
@@ -632,6 +696,10 @@ fn transform_admission(
 /// The FFT of `a` (length `2^log_n`) at `omega`, natural order, in place:
 /// the hook `GpuHooks::fft`. `false`: declined, `a` unchanged.
 pub fn fft(a: &mut [Scalar], omega: Scalar, log_n: u32) -> bool {
+    guarded(Class::Fft, false, || fft_body(a, omega, log_n))
+}
+
+fn fft_body(a: &mut [Scalar], omega: Scalar, log_n: u32) -> bool {
     if !transform_admission(Class::Fft, a, &omega, log_n, None) {
         return false;
     }
@@ -646,6 +714,10 @@ pub fn fft(a: &mut [Scalar], omega: Scalar, log_n: u32) -> bool {
 /// The FFT of `a` at `omega_inv`, then each element times `divisor`, in
 /// place: the hook `GpuHooks::ifft`. `false`: declined, `a` unchanged.
 pub fn ifft(a: &mut [Scalar], omega_inv: Scalar, log_n: u32, divisor: Scalar) -> bool {
+    guarded(Class::Ifft, false, || ifft_body(a, omega_inv, log_n, divisor))
+}
+
+fn ifft_body(a: &mut [Scalar], omega_inv: Scalar, log_n: u32, divisor: Scalar) -> bool {
     if !transform_admission(Class::Ifft, a, &omega_inv, log_n, Some(&divisor)) {
         return false;
     }
@@ -665,6 +737,13 @@ pub fn ifft(a: &mut [Scalar], omega_inv: Scalar, log_n: u32, divisor: Scalar) ->
 /// `job` is null or points to a valid `QuotientJobAbi` whose pointers live
 /// for the call (the prover passes such a job).
 pub unsafe fn quotient(job: *const c_void, out: &mut [Scalar]) -> bool {
+    // SAFETY: the caller's contract, passed on.
+    guarded(Class::Quotient, false, || unsafe { quotient_body(job, out) })
+}
+
+/// # Safety
+/// As [`quotient`].
+unsafe fn quotient_body(job: *const c_void, out: &mut [Scalar]) -> bool {
     if job.is_null() {
         return account::decline(Class::Quotient, Reason::Shape);
     }
@@ -673,6 +752,8 @@ pub unsafe fn quotient(job: *const c_void, out: &mut [Scalar]) -> bool {
     }
     #[cfg(target_os = "macos")]
     {
+        // a test panic before the backend: `out` is not written yet
+        test_switch::hook_panic(Class::Quotient);
         // SAFETY: the caller's contract.
         unsafe { quotient::quotient(job, out) }
     }
@@ -683,7 +764,125 @@ pub unsafe fn quotient(job: *const c_void, out: &mut [Scalar]) -> bool {
     }
 }
 
-/// Starts a request: resets the peak of [`device_bytes`].
+/// Hook calls whose backend panicked ([`Reason::Panic`]), since process
+/// start. For tests: a panic is otherwise only the decline `panic`.
+static HOOK_PANICS: AtomicU64 = AtomicU64::new(0);
+
+/// Hook calls whose backend panicked since process start (each one also a
+/// decline `panic` of its class). Not a stable interface.
+#[doc(hidden)]
+pub fn hook_panics() -> u64 {
+    HOOK_PANICS.load(Relaxed)
+}
+
+/// The scope of one hook call: when no request is open
+/// ([`begin_request`]) at its start or at its end, its drop zeroes every
+/// per-request buffer (the device scratch and the idle lendable buffers,
+/// which can hold witness values) before the hook returns, on success,
+/// decline, error or a caught panic. The wipe takes the device, so it never
+/// zeroes a buffer another call is using (see `ctx::wipe_unbracketed`).
+/// Inside a request it does nothing: the scratch is reused by the next call
+/// and zeroed by [`end_request`].
+struct HookScope {
+    #[cfg(target_os = "macos")]
+    open: bool,
+}
+
+impl HookScope {
+    fn enter() -> Self {
+        HookScope {
+            #[cfg(target_os = "macos")]
+            open: ctx::request_open(),
+        }
+    }
+}
+
+impl Drop for HookScope {
+    fn drop(&mut self) {
+        #[cfg(target_os = "macos")]
+        if !self.open || !ctx::request_open() {
+            ctx::wipe_unbracketed();
+        }
+    }
+}
+
+/// Runs the body of a hook: a panic inside it becomes a counted decline
+/// `panic` of `class` with the value `declined` (the caller's buffer is
+/// unchanged: no body writes it before its result is complete), and the
+/// call's scope ([`HookScope`]) wipes the per-request buffers outside a
+/// request, on every path.
+fn guarded<R>(class: Class, declined: R, body: impl FnOnce() -> R) -> R {
+    let _scope = HookScope::enter();
+    match std::panic::catch_unwind(std::panic::AssertUnwindSafe(body)) {
+        Ok(r) => r,
+        Err(_) => {
+            HOOK_PANICS.fetch_add(1, Relaxed);
+            account::decline(class, Reason::Panic);
+            declined
+        }
+    }
+}
+
+/// Test switches of the hook entries (feature `test-support`); no-ops
+/// otherwise.
+pub(crate) mod test_switch {
+    use crate::account::Class;
+    #[cfg(any(test, feature = "test-support"))]
+    use std::sync::atomic::{AtomicU32, Ordering::Relaxed};
+
+    #[cfg(any(test, feature = "test-support"))]
+    static HOOK_PANIC: AtomicU32 = AtomicU32::new(0);
+
+    #[cfg(any(test, feature = "test-support"))]
+    fn bit(class: Class) -> u32 {
+        match class {
+            Class::Msm => 1,
+            Class::Fft => 2,
+            Class::Ifft => 4,
+            Class::Quotient => 8,
+        }
+    }
+
+    /// Makes every later call of the hook `class` (`msm`, `fft`, `ifft`,
+    /// `quotient`) panic inside its backend (`true`), or stops it.
+    #[cfg(any(test, feature = "test-support"))]
+    pub fn set_hook_panic(class: &str, on: bool) {
+        let b = [Class::Msm, Class::Fft, Class::Ifft, Class::Quotient]
+            .into_iter()
+            .find(|c| c.name() == class)
+            .map_or(0, bit);
+        if on {
+            HOOK_PANIC.fetch_or(b, Relaxed);
+        } else {
+            HOOK_PANIC.fetch_and(!b, Relaxed);
+        }
+    }
+
+    /// Panics when [`set_hook_panic`] is on for `class`.
+    #[inline]
+    #[allow(unused_variables)]
+    pub(crate) fn hook_panic(class: Class) {
+        #[cfg(any(test, feature = "test-support"))]
+        if HOOK_PANIC.load(Relaxed) & bit(class) != 0 {
+            panic!("midnight-metal test switch: a panic in the {} backend", class.name());
+        }
+    }
+}
+
+/// Makes every later call of the hook `class` (`msm`, `fft`, `ifft`,
+/// `quotient`) panic inside its backend (`true`), or stops it: a test
+/// switch of the `panic` decline (feature `test-support`).
+#[cfg(any(test, feature = "test-support"))]
+#[doc(hidden)]
+pub fn set_hook_panic(class: &str, on: bool) {
+    test_switch::set_hook_panic(class, on);
+}
+
+/// Starts a request: the per-request buffers (device scratch that can hold
+/// witness values) are then kept for reuse across the hook calls of the
+/// request until [`end_request`] / [`end_request_report`] zeroes them; also
+/// resets the peaks of [`device_bytes`] and [`request_peak_bytes`]. Without a request every hook call
+/// zeroes them before it returns (see "Requests" in the crate text).
 pub fn begin_request() {
     #[cfg(target_os = "macos")]
     ctx::begin_request();
@@ -692,10 +891,13 @@ pub fn begin_request() {
 }
 
 /// What [`end_request_report`] erased: the per-request buffers (regions) of
-/// the request, zeroed before their release, and with `check` read back.
+/// the request, zeroed before their release, and with `check` read back,
+/// with (check mode) the idle buffers of the pool read back.
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
 pub struct WipeStats {
-    /// Per-request regions zeroed and released.
+    /// Regions zeroed (then pooled, or released when one failed its check):
+    /// the per-request buffers, and in check mode the idle buffers of the
+    /// pool read back (`pool_regions`).
     pub regions: u64,
     /// Their bytes.
     pub bytes: u64,
@@ -708,16 +910,31 @@ pub struct WipeStats {
     /// Regions that could not be read back from the host (not in shared
     /// storage), so no result came back (check mode).
     pub check_failures: u64,
+    /// Of `regions` (and `bytes`): the idle buffers of the pool of zeroed
+    /// buffers read back (check mode). Scoped buffers that held witness
+    /// values go back there after their zeroing.
+    pub pool_regions: u64,
+    /// Their bytes.
+    pub pool_bytes: u64,
+    /// Zeroings that panicked since the last report (on a background
+    /// release thread or in a buffer's drop). Each one was completed on the
+    /// calling thread and its buffer released, not pooled; the report is
+    /// `Err` all the same.
+    pub erasure_failures: u64,
 }
 
 /// Ends a request (call it between proofs): waits for any device work in
-/// progress and for the zeroing still running in the background, then
+/// progress and for the zeroing still running in the background; with
+/// `check` reads back every idle buffer of the pool of zeroed buffers; then
 /// zeroes every per-request buffer, with `check` reads each one back from
-/// the host and compares it with zero, and puts it back into the pool of
-/// zeroed buffers; then frees the proving-key copies unless
-/// [`keep_resident`]. `Err`: a region read back non-zero or could not be
-/// read (the region is zeroed again: there is no quarantine). On other
-/// targets, or before the context exists, there is no region.
+/// the host and compares it with zero, and puts it back into the pool;
+/// then frees the proving-key copies unless [`keep_resident`]. `Err`: a
+/// region read back non-zero or could not be read, or a zeroing panicked
+/// (`erasure_failures`). A region (a per-request buffer, or an idle buffer
+/// of the pool) that read back non-zero or could not be read back is zeroed
+/// again, read back again and released: it never goes back into the pool
+/// and is never kept as scratch (there is no quarantine). On other targets, or
+/// before the context exists, there is no region.
 pub fn end_request_report(check: bool) -> Result<WipeStats, WipeStats> {
     #[cfg(target_os = "macos")]
     {
@@ -733,7 +950,8 @@ pub fn end_request_report(check: bool) -> Result<WipeStats, WipeStats> {
 }
 
 /// [`end_request_report`] without the read-back: `true` when every
-/// per-request buffer was zeroed and put back into the pool.
+/// per-request buffer was zeroed (and pooled, or released above the pool's
+/// limit) and no zeroing panicked.
 pub fn end_request() -> bool {
     end_request_report(false).is_ok()
 }
@@ -773,14 +991,31 @@ pub fn device_bytes() -> (u64, u64) {
     (0, 0)
 }
 
+/// The peak, since the last [`begin_request`], of the bytes in use: buffers
+/// handed out (new or taken from the pool of zeroed buffers), the resident
+/// SRS tables and the resident proving-key copies, without the idle buffers
+/// of the pool. A buffer taken from the pool counts while it is in use.
+/// [`begin_request`] resets it to the bytes in use then, so it includes what
+/// earlier requests left resident, as the peak of the CUDA crate's
+/// `device_bytes` does. Lock-free.
+pub fn request_peak_bytes() -> u64 {
+    #[cfg(target_os = "macos")]
+    {
+        ctx::request_peak_bytes()
+    }
+    #[cfg(not(target_os = "macos"))]
+    0
+}
+
 /// `(free, total)` bytes for the device, when a device is usable.
 ///
 /// `total` is `MTLDevice.recommendedMaxWorkingSetSize`: Metal's estimate of
 /// the memory the GPU can use without hurting performance. `free` is `total`
 /// minus `MTLDevice.currentAllocatedSize` (everything this process has
 /// allocated on the device: buffers, the library, pipelines, driver
-/// structures), plus the idle buffers of the pool ([`pool_bytes`], reused
-/// before any new allocation), saturating at zero and at most `total`.
+/// structures), plus the idle buffers of the pool ([`pool_bytes`]: a new
+/// allocation that would not fit releases idle buffers first, so they are
+/// free for any allocation), saturating at zero and at most `total`.
 ///
 /// On unified memory these are neither physical figures nor reservations:
 /// the GPU allocates from the same system memory as the CPU, other processes

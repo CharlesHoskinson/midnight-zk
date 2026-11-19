@@ -85,7 +85,10 @@
 //! only, see `shaders/include/msm.h`). `MSM(r)` is cached per registered
 //! table and length; the one-shot path computes it at every call. The result
 //! is the same group element. No statistic of the scalars is computed,
-//! logged or branched on (except by [`msm_g1_stages`], a measurement entry).
+//! logged or branched on, except by [`msm_g1_stages`] (a measurement entry)
+//! and by the hot-bucket bound ([`HOT_BUCKET_LIMIT`]: one bit, whether a
+//! bucket of the masked digits holds more than the limit, observable only as
+//! a `device-error` decline).
 //!
 //! # The CPU share
 //!
@@ -113,11 +116,40 @@
 //! start address, not longer), copies the points into a shared Metal buffer
 //! (the host copy is then released: on unified memory the buffer is the
 //! host-visible copy) that later MSMs use without a transfer. Before each
-//! use the caller's slice is compared with the table: every point in a
-//! debug build, eight sampled points in a release build. A slice that fails
-//! the check drops its table and takes the one-shot path. The table holds
-//! public points only; it lives until the handle is dropped
-//! ([`SrsHandle::device_bytes`] says how many bytes it holds on the device).
+//! use every point of the caller's slice is compared with the table, in
+//! every build, on several threads (as the CUDA crate compares its host
+//! copy), before any device work. A slice that fails the check drops its
+//! table, with its cached `MSM(r)`, and takes the one-shot path with the
+//! caller's current points. The table holds public points only; it lives
+//! until the handle is dropped ([`SrsHandle::device_bytes`] says how many
+//! bytes it holds on the device).
+//!
+//! The registry lock is held only to look a table up and pin it (an
+//! `Arc`); the comparison, the upload and the MSM run on the pinned table.
+//! A table dropped or replaced while an MSM runs on it stays alive until
+//! that MSM ends: its points never change after registration, and the
+//! comparison has shown that they are the caller's, so the value is exact.
+//! Lock order: the registry, then the device state (`ctx::lock`), then a
+//! table's points or its mask cache; the registry is never taken while a
+//! table's lock is held.
+//!
+//! # Bases outside G1
+//!
+//! The `abs` step of `msm_digits` (a digit set of `r - s` with the signs
+//! flipped) and the skew mask (`MSM(s + r) - MSM(r)`, with `s + r` reduced
+//! modulo the group order) give `sum s_i P_i` only when `q P_i = O` for
+//! every base (`q` the group order). The stock CPU MSM makes no such
+//! assumption. So every base the device would use is checked to be a point
+//! of G1: on the curve (blst `blst_p1_affine_on_curve`) and in the
+//! prime-order subgroup (`G1Affine::is_torsion_free` of midnight-curves,
+//! blst `blst_p1_affine_in_g1`); the point at infinity (all zero, the
+//! crate's encoding) is in G1. [`register_srs`] checks every point once and
+//! keeps the first index that fails: an MSM on a prefix that reaches it
+//! declines (the stock CPU code then runs, exact for any input, a point off
+//! the curve included); shorter prefixes are served. The one-shot path
+//! checks every base at every call before any device work and declines at
+//! the first failure. Both checks run on several threads; the decline
+//! reason is [`BASES_REASON`].
 //!
 //! A table serves the registered slice and its prefixes, by address: the
 //! caller has to register the very slice the prover passes. The KZG prover of
@@ -164,20 +196,42 @@
 //!   bound).
 //! - The mask is added on the device in `msm_digits` (each element computed
 //!   from its index); the CUDA crate builds `r` and `s + r` on the host.
-//! - Every chunk's buffers are per-request scratch (zeroed and released by
-//!   [`crate::end_request`]); the copies of the bucket sums on the host are
-//!   zeroed after use.
+//! - Every chunk's buffers are per-request scratch (zeroed by
+//!   [`crate::end_request`] and put back into the pool of zeroed buffers, or
+//!   released when one fails the erasure check; outside a request they are
+//!   zeroed at the end of the hook call, before it returns). Every host buffer holding values derived from
+//!   the scalars (the copies of the bucket sums, the window sums, the
+//!   partial and the CPU share's sums) is a guard ([`Secret`],
+//!   [`SecretVec`]) that zeroes it with volatile writes when it is dropped,
+//!   on every exit, unwinding included; and every thread that ran the host
+//!   collection's `blst` arithmetic, the caller's included, zeroes 64 KiB of
+//!   its stack below its frame afterwards ([`scrub_stack`], the counterpart
+//!   of the CUDA patch's `scrub_stack` in sppark `collect`).
+//! - The host's thread starts (`std::thread::Builder::spawn_scoped`) fall
+//!   back to the calling thread when a thread cannot be made; a panic of a
+//!   host thread, or of anything else under [`msm_g1`], is a decline.
+//! - The SIMD-group width of every MSM pipeline is checked to be 32 before
+//!   any device work (the reductions of `msm_ones` and the prefix sums of
+//!   the sort assume it); another width declines.
+//! - A chunk whose sort gives a bucket of more than [`HOT_BUCKET_LIMIT`]
+//!   points declines before its accumulation (see `msm_bucket_guard`).
 
 use std::{
     collections::HashMap,
+    mem::{size_of, size_of_val},
+    ops::{Deref, DerefMut},
+    panic::AssertUnwindSafe,
     sync::{
-        Mutex, MutexGuard,
-        atomic::{AtomicU64, Ordering::Relaxed},
+        Arc, Mutex, MutexGuard, RwLock, RwLockReadGuard, RwLockWriteGuard,
+        atomic::{AtomicBool, AtomicU64, AtomicUsize, Ordering::Relaxed},
     },
     time::Instant,
 };
 
-use blst::{blst_fp, blst_fp_mul, blst_p1, blst_p1_add_or_double, blst_p1_cneg, blst_p1_double};
+use blst::{
+    blst_fp, blst_fp_mul, blst_p1, blst_p1_add_or_double, blst_p1_affine, blst_p1_affine_on_curve,
+    blst_p1_cneg, blst_p1_double,
+};
 use objc2_metal::MTLComputePipelineState;
 
 use crate::{
@@ -212,6 +266,47 @@ const SORT_TEMP_BYTES: usize = 64 << 20;
 const MAX_LOW_BITS: u32 = 12;
 /// The largest top-digit width of the upper sort (`MAX_TOP`).
 const MAX_TOP_BITS: u32 = 9;
+
+/// The SIMD-group width the kernels assume (`msm_ones`, the prefix sums of
+/// the sort).
+const SIMD_WIDTH: usize = 32;
+/// The kernels whose pipelines must have [`SIMD_WIDTH`].
+const KERNELS: [&str; 9] = [
+    "msm_digits",
+    "msm_sort_count",
+    "msm_sort_scan",
+    "msm_sort_scatter",
+    "msm_sort_lower",
+    "msm_bucket_guard",
+    "msm_ones",
+    "msm_accumulate",
+    "msm_integrate",
+];
+
+/// The most points one bucket of a chunk may hold (the bucket of digit 1 in
+/// window 0, summed by the whole grid in `msm_ones`, excepted). A bucket is
+/// summed serially by one GPU thread, so its length bounds the time of the
+/// chunk's command buffer; `CHUNK_ADDS` assumes balanced buckets.
+///
+/// With the skew mask the masked scalars `s_i + r_i` of any input that does
+/// not depend on the public mask spread evenly over the buckets of each
+/// window; the largest legitimate loads are in the top window, whose
+/// digits have few values: with `wbits` 11 (lengths below `2^15.5`) a
+/// bucket holds fewer points than the chunk (`< 2^15.5 < 2^16`); with
+/// `wbits` 13 (below `2^19.5`) the top window has about 116 digit values,
+/// about `n / 116 < 6400` points each; wider windows have far fewer per
+/// bucket. Scalars chosen as `s_i = c - r_i` send every point of a window to
+/// one bucket (a chunk of `2^20` points then takes seconds of GPU time, near
+/// the GPU watchdog). Above this limit the chunk declines before its
+/// accumulation (`device-error`, the reason a watchdog timeout gives).
+///
+/// What the decline reveals: that in some chunk and some window, more than
+/// `HOT_BUCKET_LIMIT` of the masked scalars `s_i + r_i` (`r` public and
+/// fixed) have the same window digit: one bit about the scalars, which
+/// honest (mask-independent) scalars set with negligible probability. It
+/// is not counted, logged or reported anywhere but as one generic
+/// `device-error` decline.
+const HOT_BUCKET_LIMIT: u32 = 1 << 16;
 
 /// An XYZZ record of the device (`g1::Xyzz`): `X, Y, ZZZ, ZZ`, six limbs each.
 type Xyzz = [u64; 24];
@@ -365,66 +460,77 @@ fn plan(n: usize) -> Plan {
 // ---------------------------------------------------------------------------
 // Registered tables.
 
-/// A registered table: the host copy of the points until the first MSM, then
-/// the device buffer; the mask MSMs by length.
+/// Where a table's points are: the host copy until the first MSM, then the
+/// device buffer.
+enum Store {
+    Host(Vec<G1AffineLimbs>),
+    Device(Buffer),
+}
+
+/// A registered table. Its points never change after registration.
 struct Table {
     id: u64,
-    host: Vec<G1AffineLimbs>,
-    dev: Option<Buffer>,
-    masks: HashMap<usize, G1JacobianLimbs>,
+    len: usize,
+    /// The first index whose point is not in G1 (off the curve, or on it
+    /// outside the prime-order subgroup); `len` when every point is. An MSM
+    /// on a prefix longer than this declines ([`BASES_REASON`]).
+    first_bad: usize,
+    store: RwLock<Store>,
+    /// `MSM(r)` by length (public: the mask and the points are public).
+    masks: Mutex<HashMap<usize, G1JacobianLimbs>>,
+}
+
+fn read<T>(l: &RwLock<T>) -> RwLockReadGuard<'_, T> {
+    l.read().unwrap_or_else(|e| e.into_inner())
+}
+
+fn write<T>(l: &RwLock<T>) -> RwLockWriteGuard<'_, T> {
+    l.write().unwrap_or_else(|e| e.into_inner())
+}
+
+fn lock<T>(l: &Mutex<T>) -> MutexGuard<'_, T> {
+    l.lock().unwrap_or_else(|e| e.into_inner())
+}
+
+impl Store {
+    fn points(&self, len: usize) -> &[G1AffineLimbs] {
+        let all = match self {
+            Store::Host(h) => h.as_slice(),
+            Store::Device(b) => b.as_slice::<G1AffineLimbs>(),
+        };
+        &all[..len.min(all.len())]
+    }
 }
 
 impl Table {
-    fn points(&self) -> &[G1AffineLimbs] {
-        match &self.dev {
-            Some(b) => &b.as_slice::<G1AffineLimbs>()[..self.len()],
-            None => &self.host,
-        }
-    }
-
-    fn len(&self) -> usize {
-        match &self.dev {
-            Some(b) => b.len_bytes() / size_of::<G1AffineLimbs>(),
-            None => self.host.len(),
-        }
-    }
-
-    /// Whether the table still has the caller's points (a prefix of it):
-    /// every point in a debug build, eight sampled points in a release build.
+    /// Whether the table still has the caller's points (it is the slice or
+    /// a longer one): every point compared, on several threads.
     fn serves(&self, bases: &[G1AffineLimbs]) -> bool {
-        let t = self.points();
-        let n = bases.len();
-        if n > t.len() {
+        if bases.len() > self.len {
             return false;
         }
-        if cfg!(debug_assertions) || n <= 8 {
-            return t[..n] == *bases;
-        }
-        [
-            0,
-            n / 7,
-            2 * n / 7,
-            3 * n / 7,
-            4 * n / 7,
-            5 * n / 7,
-            6 * n / 7,
-            n - 1,
-        ]
-        .iter()
-        .all(|&i| t[i] == bases[i])
+        let st = read(&self.store);
+        let t = st.points(self.len);
+        t.len() >= bases.len() && points_equal(&t[..bases.len()], bases)
     }
 }
 
 /// Tables keyed by (address, length) of the registered slice.
-static TABLES: Mutex<Option<HashMap<(usize, usize), Table>>> = Mutex::new(None);
+static TABLES: Mutex<Option<HashMap<(usize, usize), Arc<Table>>>> = Mutex::new(None);
 static NEXT_ID: AtomicU64 = AtomicU64::new(1);
 static STALE: AtomicU64 = AtomicU64::new(0);
 static UPLOADS: AtomicU64 = AtomicU64::new(0);
 static CACHED: AtomicU64 = AtomicU64::new(0);
 static ONE_SHOT: AtomicU64 = AtomicU64::new(0);
 
-fn tables() -> MutexGuard<'static, Option<HashMap<(usize, usize), Table>>> {
-    TABLES.lock().unwrap_or_else(|e| e.into_inner())
+fn tables() -> MutexGuard<'static, Option<HashMap<(usize, usize), Arc<Table>>>> {
+    lock(&TABLES)
+}
+
+/// The live table registered under `key` with `id`, pinned (the registry
+/// lock is released on return).
+fn pinned(key: (usize, usize), id: u64) -> Option<Arc<Table>> {
+    tables().as_ref().and_then(|t| t.get(&key)).filter(|e| e.id == id).cloned()
 }
 
 /// The registration of an SRS base slice. While it lives, the registrant
@@ -452,23 +558,17 @@ impl SrsHandle {
     /// dropped as stale. The host copy of a registration that was not
     /// uploaded yet is not counted.
     pub fn device_bytes(&self) -> u64 {
-        tables()
-            .as_ref()
-            .and_then(|t| t.get(&self.key))
-            .filter(|e| e.id == self.id)
-            .and_then(|e| e.dev.as_ref())
-            .map_or(0, |b| b.len_bytes() as u64)
+        pinned(self.key, self.id).map_or(0, |t| match &*read(&t.store) {
+            Store::Device(b) => b.len_bytes() as u64,
+            Store::Host(_) => 0,
+        })
     }
 
     /// Whether `bases` is the registered slice with the registered content
     /// (every point compared).
     pub fn verify(&self, bases: &[G1AffineLimbs]) -> bool {
         (bases.as_ptr() as usize, bases.len()) == self.key
-            && tables()
-                .as_ref()
-                .and_then(|t| t.get(&self.key))
-                .filter(|e| e.id == self.id)
-                .is_some_and(|e| e.points() == bases)
+            && pinned(self.key, self.id).is_some_and(|t| t.serves(bases))
     }
 }
 
@@ -481,6 +581,8 @@ impl Drop for SrsHandle {
                 _ => None,
             }
         };
+        // outside the registry lock (an MSM may still hold the table: it is
+        // freed when that MSM ends)
         drop(removed);
     }
 }
@@ -488,15 +590,20 @@ impl Drop for SrsHandle {
 /// Registers a host copy of an SRS base slice (no device work: the first MSM
 /// on the slice uploads it). Registering the same slice again replaces the
 /// table.
+///
+/// Every point is checked to be in G1 (on several threads; see "Bases
+/// outside G1" in the module text): a table with a point that is not is
+/// still registered, and MSMs on a prefix that includes that point decline.
 pub fn register_srs(bases: &[G1AffineLimbs]) -> SrsHandle {
     let key = (bases.as_ptr() as usize, bases.len());
     let id = NEXT_ID.fetch_add(1, Relaxed);
-    let t = Table {
+    let t = Arc::new(Table {
         id,
-        host: bases.to_vec(),
-        dev: None,
-        masks: HashMap::new(),
-    };
+        len: bases.len(),
+        first_bad: first_not_in_g1(bases),
+        store: RwLock::new(Store::Host(bases.to_vec())),
+        masks: Mutex::new(HashMap::new()),
+    });
     let old = tables().get_or_insert_with(HashMap::new).insert(key, t);
     drop(old);
     SrsHandle { id, key }
@@ -525,7 +632,7 @@ pub fn msm_counts() -> (u64, u64, u64) {
 /// The table that serves an MSM of `m` scalars on the slice `key`: the exact
 /// entry, else the shortest entry at the same address that is longer.
 fn table_for(
-    t: &HashMap<(usize, usize), Table>,
+    t: &HashMap<(usize, usize), Arc<Table>>,
     key: (usize, usize),
     m: usize,
 ) -> Option<(usize, usize)> {
@@ -536,6 +643,303 @@ fn table_for(
         return Some(key);
     }
     t.keys().filter(|k| k.0 == key.0 && k.1 > key.1).min_by_key(|k| k.1).copied()
+}
+
+/// The table that serves an MSM of `n` scalars on `bases`, pinned, after
+/// every point of `bases` was compared with it. A table that does not match
+/// is dropped from the registry (with its cached mask MSMs), unless it was
+/// replaced or dropped meanwhile, and the next candidate is tried. The
+/// registry lock is held only for the lookups and the removal.
+fn serving_table(bases: &[G1AffineLimbs], n: usize) -> Option<Arc<Table>> {
+    let key = (bases.as_ptr() as usize, bases.len());
+    loop {
+        let (tk, t) = {
+            let g = tables();
+            let t = g.as_ref()?;
+            let tk = table_for(t, key, n)?;
+            (tk, t.get(&tk)?.clone())
+        };
+        if t.serves(bases) {
+            return Some(t);
+        }
+        let removed = {
+            let mut g = tables();
+            match g.as_mut() {
+                Some(m) if m.get(&tk).is_some_and(|e| Arc::ptr_eq(e, &t)) => m.remove(&tk),
+                _ => None,
+            }
+        };
+        if removed.is_some() {
+            STALE.fetch_add(1, Relaxed);
+        }
+        drop(removed);
+        drop(t);
+    }
+}
+
+// ---------------------------------------------------------------------------
+// Host passes over the points: the identity comparison and the G1 check.
+
+/// The threads of a host pass.
+fn host_threads() -> usize {
+    std::thread::available_parallelism().map_or(4, |t| t.get()).min(16)
+}
+
+/// `f` with a panic caught: `None` when it panicked.
+fn catch<R>(f: impl FnOnce() -> R) -> Option<R> {
+    std::panic::catch_unwind(AssertUnwindSafe(f)).ok()
+}
+
+/// `f(a, b)` over parts `[a, b)` of `[0, len)` (at most `parts` parts of at
+/// least `min` items), in order: the first part on the calling thread, the
+/// others on scoped threads; a part whose thread cannot be started runs on
+/// the calling thread. `None`: a part panicked (every started thread has
+/// been joined, and the results of the other parts dropped). Nothing panics
+/// out of this function.
+fn par_parts<R: Send>(
+    len: usize,
+    parts: usize,
+    min: usize,
+    f: impl Fn(usize, usize) -> R + Sync,
+) -> Option<Vec<R>> {
+    let per = len.div_ceil(parts.max(1)).max(min.max(1));
+    let bounds: Vec<(usize, usize)> = (0..len).step_by(per).map(|a| (a, (a + per).min(len))).collect();
+    if bounds.len() <= 1 {
+        return catch(|| bounds.iter().map(|&(a, b)| f(a, b)).collect());
+    }
+    let f = &f;
+    std::thread::scope(|s| {
+        let started: Vec<_> = bounds[1..]
+            .iter()
+            .map(|&(a, b)| {
+                let h = std::thread::Builder::new().spawn_scoped(s, move || f(a, b)).ok();
+                (a, b, h)
+            })
+            .collect();
+        let mut out = Vec::with_capacity(bounds.len());
+        let mut ok = true;
+        match catch(|| f(bounds[0].0, bounds[0].1)) {
+            Some(r) => out.push(r),
+            None => ok = false,
+        }
+        for (a, b, h) in started {
+            let r = match h {
+                Some(h) => h.join().ok(),
+                None if ok => catch(|| f(a, b)),
+                None => None,
+            };
+            match r {
+                Some(r) => out.push(r),
+                None => ok = false,
+            }
+        }
+        ok.then_some(out)
+    })
+}
+
+/// Points compared per step of [`points_equal`] (and checked per step of
+/// the G1 checks) before the shared flag is read again.
+const POINT_BLOCK: usize = 1 << 12;
+
+/// Whether `a == b` (equal lengths), every point compared, on several
+/// threads (a 2^20-point table is 96 MiB); a part that panicked counts as a
+/// difference.
+fn points_equal(a: &[G1AffineLimbs], b: &[G1AffineLimbs]) -> bool {
+    if a.len() != b.len() {
+        return false;
+    }
+    let differs = AtomicBool::new(false);
+    let done = par_parts(a.len(), host_threads(), 1 << 14, |lo, hi| {
+        for s in (lo..hi).step_by(POINT_BLOCK) {
+            if differs.load(Relaxed) {
+                return;
+            }
+            let e = (s + POINT_BLOCK).min(hi);
+            if a[s..e] != b[s..e] {
+                differs.store(true, Relaxed);
+                return;
+            }
+        }
+    });
+    done.is_some() && !differs.load(Relaxed)
+}
+
+/// Whether `p` is a point of G1: the point at infinity (all zero), or a
+/// point on the curve (blst) in the prime-order subgroup (midnight-curves
+/// `is_torsion_free`, blst `blst_p1_affine_in_g1`).
+fn in_g1(p: &G1AffineLimbs) -> bool {
+    if p.iter().all(|&w| w == 0) {
+        return true;
+    }
+    // SAFETY: `G1AffineLimbs` is the layout of `blst_p1_affine` and of the
+    // transparent `G1Affine` (sizes and alignments checked below).
+    let (raw, aff) = unsafe {
+        (
+            &*(p as *const G1AffineLimbs as *const blst_p1_affine),
+            &*(p as *const G1AffineLimbs as *const midnight_curves::G1Affine),
+        )
+    };
+    // SAFETY: a valid pointer to an affine point.
+    let on_curve = unsafe { blst_p1_affine_on_curve(raw) };
+    on_curve && bool::from(aff.is_torsion_free())
+}
+
+/// The first index of `bases` whose point is not in G1 ([`in_g1`]), or
+/// `bases.len()`; every point checked, on several threads. A part that
+/// panicked counts from its start.
+fn first_not_in_g1(bases: &[G1AffineLimbs]) -> usize {
+    let n = bases.len();
+    let firsts = par_parts(n, host_threads(), POINT_BLOCK, |lo, hi| {
+        (lo..hi).find(|&i| !in_g1(&bases[i])).unwrap_or(n)
+    });
+    firsts.map_or(0, |f| f.into_iter().min().unwrap_or(n))
+}
+
+/// Whether every point of `bases` is in G1 ([`in_g1`]), on several threads,
+/// stopping at the first that is not; a part that panicked counts as a
+/// failure.
+fn all_in_g1(bases: &[G1AffineLimbs]) -> bool {
+    let bad = AtomicBool::new(false);
+    let done = par_parts(bases.len(), host_threads(), POINT_BLOCK, |lo, hi| {
+        for s in (lo..hi).step_by(POINT_BLOCK) {
+            if bad.load(Relaxed) {
+                return;
+            }
+            let e = (s + POINT_BLOCK).min(hi);
+            if !bases[s..e].iter().all(in_g1) {
+                bad.store(true, Relaxed);
+                return;
+            }
+        }
+    });
+    done.is_some() && !bad.load(Relaxed)
+}
+
+// ---------------------------------------------------------------------------
+// Host buffers of secret values.
+
+/// Writes zero over `len` bytes at `p` with volatile writes (words where
+/// aligned), then a compiler fence: the zeroing is never elided, even right
+/// before the memory is freed.
+fn zero_volatile(p: *mut u8, len: usize) {
+    // SAFETY (callers): `p` is valid for writes of `len` bytes.
+    unsafe {
+        let head = p.align_offset(8).min(len);
+        for i in 0..head {
+            std::ptr::write_volatile(p.add(i), 0u8);
+        }
+        let words = (len - head) / 8;
+        let w = p.add(head).cast::<u64>();
+        for i in 0..words {
+            std::ptr::write_volatile(w.add(i), 0u64);
+        }
+        for i in head + 8 * words..len {
+            std::ptr::write_volatile(p.add(i), 0u8);
+        }
+    }
+    std::sync::atomic::compiler_fence(std::sync::atomic::Ordering::SeqCst);
+}
+
+/// One value derived from the scalars (a partial sum, a bucket sum): zeroed
+/// when dropped, on every exit, unwinding included.
+struct Secret<T: Copy>(T);
+
+impl<T: Copy> Deref for Secret<T> {
+    type Target = T;
+    fn deref(&self) -> &T {
+        &self.0
+    }
+}
+
+impl<T: Copy> DerefMut for Secret<T> {
+    fn deref_mut(&mut self) -> &mut T {
+        &mut self.0
+    }
+}
+
+impl<T: Copy> Drop for Secret<T> {
+    fn drop(&mut self) {
+        let p = (&mut self.0 as *mut T).cast::<u8>();
+        zero_volatile(p, size_of::<T>());
+        #[cfg(test)]
+        tests::observe_wipe(p, size_of::<T>());
+    }
+}
+
+/// A host vector of values derived from the scalars (copies of the bucket
+/// sums, window sums): its whole allocation is zeroed when it is dropped, on
+/// every exit, unwinding included. It is made with its final capacity and
+/// never grows past it (a reallocation would leave the old block unzeroed).
+struct SecretVec<T: Copy>(Vec<T>);
+
+impl<T: Copy> SecretVec<T> {
+    fn with_capacity(n: usize) -> Self {
+        SecretVec(Vec::with_capacity(n))
+    }
+
+    /// Appends `s` if it fits in the capacity; `false` (nothing appended)
+    /// otherwise.
+    fn extend_within(&mut self, s: &[T]) -> bool {
+        if self.0.capacity() - self.0.len() < s.len() {
+            return false;
+        }
+        self.0.extend_from_slice(s);
+        true
+    }
+
+    /// Appends `v` if it fits in the capacity.
+    fn push_within(&mut self, v: T) -> bool {
+        self.extend_within(std::slice::from_ref(&v))
+    }
+}
+
+impl<T: Copy> Deref for SecretVec<T> {
+    type Target = [T];
+    fn deref(&self) -> &[T] {
+        &self.0
+    }
+}
+
+impl<T: Copy> Drop for SecretVec<T> {
+    fn drop(&mut self) {
+        let p = self.0.as_mut_ptr().cast::<u8>();
+        let bytes = self.0.capacity() * size_of::<T>();
+        zero_volatile(p, bytes);
+        #[cfg(test)]
+        tests::observe_wipe(p, bytes);
+    }
+}
+
+/// Bytes of stack [`scrub_stack`] zeroes (the CUDA patch's `SCRUB_BYTES`).
+const SCRUB_BYTES: usize = 64 * 1024;
+
+/// Zeroes [`SCRUB_BYTES`] of the calling thread's stack below the caller's
+/// frame, where the host collection (`integrate_row`, the window ladder,
+/// `blst` additions and their spilled coordinates: functions of the scalar
+/// digits) kept its temporaries; the counterpart of the CUDA patch's
+/// `scrub_stack` (`explicit_bzero` plus an asm barrier). The writes are
+/// volatile and the buffer escapes through `black_box`, so neither is
+/// elided; out of line, so the buffer lies below the caller's frame.
+#[inline(never)]
+fn scrub_stack() {
+    let mut buf = std::mem::MaybeUninit::<[u64; SCRUB_BYTES / 8]>::uninit();
+    let p = buf.as_mut_ptr().cast::<u64>();
+    for i in 0..SCRUB_BYTES / 8 {
+        // SAFETY: within `buf`.
+        unsafe { std::ptr::write_volatile(p.add(i), 0) };
+    }
+    std::hint::black_box(p);
+    std::sync::atomic::compiler_fence(std::sync::atomic::Ordering::SeqCst);
+}
+
+/// Runs [`scrub_stack`] when dropped: on every exit of the frame that holds
+/// it, unwinding included (the CUDA patch's `worker_exit_t`).
+struct ScrubOnExit;
+
+impl Drop for ScrubOnExit {
+    fn drop(&mut self) {
+        scrub_stack();
+    }
 }
 
 // ---------------------------------------------------------------------------
@@ -634,7 +1038,6 @@ pub(crate) const SPARSE_ONE_SHOT_DIV: usize = 3;
 /// the rest is counted on several threads, each stopping once the shared
 /// total reaches `need`.
 pub(crate) fn effective_size_reaches(scalars: &[Scalar], need: usize) -> bool {
-    use std::sync::atomic::AtomicUsize;
     const BLOCK: usize = 1 << 13;
     if need <= 1 {
         return true;
@@ -653,19 +1056,14 @@ pub(crate) fn effective_size_reaches(scalars: &[Scalar], need: usize) -> bool {
         return false;
     }
     let total = AtomicUsize::new(seen);
-    let threads = std::thread::available_parallelism().map_or(4, |t| t.get()).min(16);
-    let per = rest.len().div_ceil(threads).max(BLOCK);
-    std::thread::scope(|s| {
-        for part in rest.chunks(per) {
-            let total = &total;
-            s.spawn(move || {
-                for b in part.chunks(BLOCK) {
-                    if total.load(Relaxed) >= need {
-                        return;
-                    }
-                    total.fetch_add(b.iter().map(nz).sum::<usize>(), Relaxed);
-                }
-            });
+    // a part that panicked leaves the count short: the call then declines
+    // `below-min-k` (the stock CPU code runs)
+    let _ = par_parts(rest.len(), host_threads(), BLOCK, |lo, hi| {
+        for b in rest[lo..hi].chunks(BLOCK) {
+            if total.load(Relaxed) >= need {
+                return;
+            }
+            total.fetch_add(b.iter().map(nz).sum::<usize>(), Relaxed);
         }
     });
     total.load(Relaxed) >= need
@@ -686,24 +1084,63 @@ pub(crate) fn has_table(bases: &[G1AffineLimbs]) -> bool {
 /// serves `bases` (none registered, or the registered one no longer matches),
 /// an MSM whose effective size is below `one_shot_min` (the one-shot path's
 /// [`effective_need`]) declines `below-min-k`.
+///
+/// A base that is not a point of G1 declines [`BASES_REASON`] (see "Bases
+/// outside G1" in the module text). Nothing panics out of this function: a
+/// panic under it is a `panic` decline. Every host buffer of values
+/// derived from the scalars is zeroed before it returns, and so are
+/// [`SCRUB_BYTES`] of the calling thread's stack below this frame.
 pub(crate) fn msm_g1(
     scalars: &[Scalar],
     bases: &[G1AffineLimbs],
     one_shot_min: usize,
 ) -> Option<G1JacobianLimbs> {
-    match dispatch(scalars, bases, one_shot_min, None) {
-        Ok(Some((r, ns))) => {
+    if scalars.is_empty() || scalars.len() != bases.len() {
+        account::decline(Class::Msm, Reason::Shape);
+        return None;
+    }
+    let ran = catch(|| dispatch(scalars, bases, one_shot_min, None));
+    scrub_stack();
+    match ran {
+        Some(Ok(Some((r, ns)))) => {
             account::served(Class::Msm, ns);
-            Some(r)
+            // the result leaves; the guard `r` zeroes its own copy
+            Some(*r)
         }
-        Ok(None) => {
+        Some(Ok(None)) => {
             account::decline(Class::Msm, Reason::BelowMinK);
             None
         }
-        Err(e) => {
+        Some(Err(Fail::Bases)) => {
+            account::decline(Class::Msm, BASES_REASON);
+            None
+        }
+        Some(Err(Fail::Ctx(e))) => {
             account::decline(Class::Msm, Reason::of(&e));
             None
         }
+        None => {
+            account::decline(Class::Msm, Reason::Panic);
+            None
+        }
+    }
+}
+
+/// The decline reason of an MSM with a base that is not a point of G1:
+/// `bases-not-in-subgroup`.
+pub(crate) const BASES_REASON: Reason = Reason::BasesNotInSubgroup;
+
+/// Why [`dispatch`] did not serve a call (besides `Ok(None)`).
+enum Fail {
+    /// A base the device would use is not a point of G1.
+    Bases,
+    /// The device context failed.
+    Ctx(Error),
+}
+
+impl From<Error> for Fail {
+    fn from(e: Error) -> Fail {
+        Fail::Ctx(e)
     }
 }
 
@@ -752,8 +1189,15 @@ pub struct MsmStages {
 /// measurement entry: the stages do not overlap and the host collection
 /// does not overlap the device, so the total is above that of
 /// [`crate::msm_g1`]). Not counted in [`crate::stats`] or
-/// [`crate::declines`]. `None`: a shape or scalar [`crate::msm_g1`] would
-/// decline, or a device failure.
+/// [`crate::declines`]. `None`: a shape, scalar or base [`crate::msm_g1`]
+/// would decline, or a device failure.
+///
+/// Not a stable interface, and not for secret scalars: it reports bucket
+/// loads (`bucket_max`, `bucket_entries`), which are functions of the
+/// masked scalar digits. Only with the feature `test-support` (this crate's
+/// tests and measurements); no other build has it.
+#[doc(hidden)]
+#[cfg(any(test, feature = "test-support"))]
 pub fn msm_g1_stages(
     scalars: &[Scalar],
     bases: &[G1AffineLimbs],
@@ -766,64 +1210,81 @@ pub fn msm_g1_stages(
         return None;
     }
     let mut st = MsmStages::default();
-    let (r, _) = dispatch(scalars, bases, 0, Some(&mut st)).ok()??;
-    Some((r, st))
+    let ran = catch(|| dispatch(scalars, bases, 0, Some(&mut st)));
+    scrub_stack();
+    let (r, _) = ran?.ok()??;
+    Some((*r, st))
 }
 
 /// The table or one-shot path, then the masked MSM. `Ok(None)`: no table
 /// serves `bases` and the MSM's effective size is below `one_shot_min` (no
 /// device work was done).
+#[allow(clippy::type_complexity)]
 fn dispatch(
     scalars: &[Scalar],
     bases: &[G1AffineLimbs],
     one_shot_min: usize,
     mut prof: Option<&mut MsmStages>,
-) -> Result<Option<(G1JacobianLimbs, u64)>, Error> {
+) -> Result<Option<(Secret<G1JacobianLimbs>, u64)>, Fail> {
     let n = scalars.len();
-    let key = (bases.as_ptr() as usize, bases.len());
-    let mut guard = tables();
-    if let Some(t) = guard.as_mut() {
-        while let Some(tk) = table_for(t, key, n).filter(|tk| !t[tk].serves(bases)) {
-            STALE.fetch_add(1, Relaxed);
-            t.remove(&tk);
+    if let Some(t) = serving_table(bases, n) {
+        // every point of `bases` equals the table's: the table's G1 check
+        // applies to them
+        if n > t.first_bad {
+            return Err(Fail::Bases);
         }
-        if let Some(tk) = table_for(t, key, n) {
-            let Table {
-                host, dev, masks, ..
-            } = t.get_mut(&tk).unwrap();
-            let mut s = ctx::lock()?;
-            if dev.is_none() {
-                let t0 = Instant::now();
-                *dev = Some(s.ctx().upload(host)?);
-                *host = Vec::new();
+        let mut s = ctx::lock()?;
+        if matches!(*read(&t.store), Store::Host(_)) {
+            let t0 = Instant::now();
+            let mut w = write(&t.store);
+            if let Store::Host(h) = &*w {
+                let b = s.ctx().upload(h)?;
+                *w = Store::Device(b);
                 UPLOADS.fetch_add(1, Relaxed);
-                if let Some(p) = prof.as_deref_mut() {
-                    p.upload_ns += t0.elapsed().as_nanos() as u64;
-                }
             }
-            CACHED.fetch_add(1, Relaxed);
             if let Some(p) = prof.as_deref_mut() {
-                p.table = true;
+                p.upload_ns += t0.elapsed().as_nanos() as u64;
             }
-            let points = dev.as_ref().unwrap();
-            return split(
-                &mut s,
-                Points::Table(points),
-                scalars,
-                bases,
-                Some(masks),
-                prof,
-            )
-            .map(Some);
         }
+        CACHED.fetch_add(1, Relaxed);
+        if let Some(p) = prof.as_deref_mut() {
+            p.table = true;
+        }
+        let st = read(&t.store);
+        let Store::Device(points) = &*st else {
+            return Err(Error::Device("msm: the table was not uploaded".into()).into());
+        };
+        let r = split(
+            &mut s,
+            Points::Table(points),
+            scalars,
+            bases,
+            Some(&t.masks),
+            prof,
+        )?;
+        drop(st);
+        // the session ends before the table may be freed (if its handle was
+        // dropped meanwhile, this is the last reference)
+        drop(s);
+        drop(t);
+        return Ok(Some(r));
     }
-    drop(guard);
     if !effective_size_reaches(scalars, one_shot_min) {
         return Ok(None);
     }
+    if !all_in_g1(bases) {
+        return Err(Fail::Bases);
+    }
     ONE_SHOT.fetch_add(1, Relaxed);
     let mut s = ctx::lock()?;
-    split(&mut s, Points::Host(bases), scalars, bases, None, prof).map(Some)
+    Ok(Some(split(
+        &mut s,
+        Points::Host(bases),
+        scalars,
+        bases,
+        None,
+        prof,
+    )?))
 }
 
 /// The device share `m` of an MSM of `n` points on the table path or the
@@ -942,13 +1403,17 @@ const _: () = {
     assert!(align_of::<midnight_curves::Fq>() == align_of::<Scalar>());
     assert!(size_of::<midnight_curves::G1Affine>() == size_of::<G1AffineLimbs>());
     assert!(align_of::<midnight_curves::G1Affine>() == align_of::<G1AffineLimbs>());
+    assert!(size_of::<blst_p1_affine>() == size_of::<G1AffineLimbs>());
+    assert!(align_of::<blst_p1_affine>() <= align_of::<G1AffineLimbs>());
     assert!(size_of::<midnight_curves::G1Projective>() == size_of::<blst_p1>());
 };
 
 /// The CPU share: the stock `msm_pippenger` of midnight-curves, on the
 /// share's own pool. The scalars and points are the caller's slices (no
-/// copy is made here).
-fn cpu_msm(scalars: &[Scalar], bases: &[G1AffineLimbs]) -> blst_p1 {
+/// copy is made here). `None` without the pool (not reached: without it the
+/// device takes every point). Afterwards each thread of the pool zeroes
+/// [`SCRUB_BYTES`] of its stack (the stock MSM's temporaries).
+fn cpu_msm(scalars: &[Scalar], bases: &[G1AffineLimbs]) -> Option<Secret<blst_p1>> {
     use midnight_curves::{Fq, G1Affine, G1Projective, msm::msm_pippenger};
     // SAFETY: `Fq` is a transparent `blst_fr` (`[u64; 4]`), `G1Affine` a
     // transparent `blst_p1_affine` (`[u64; 12]`), `G1Projective` a transparent
@@ -960,22 +1425,27 @@ fn cpu_msm(scalars: &[Scalar], bases: &[G1AffineLimbs]) -> blst_p1 {
             &*(bases as *const [G1AffineLimbs] as *const [G1Affine]),
         )
     };
-    let pool = cpu_pool().expect("the CPU share runs only with its pool");
-    let r: G1Projective = pool.install(|| msm_pippenger(s, b));
-    // SAFETY: as above.
-    unsafe { std::mem::transmute::<G1Projective, blst_p1>(r) }
+    let pool = cpu_pool()?;
+    let r = pool.install(|| {
+        let r: G1Projective = msm_pippenger(s, b);
+        // SAFETY: as above.
+        Secret(unsafe { std::mem::transmute::<G1Projective, blst_p1>(r) })
+    });
+    pool.broadcast(|_| scrub_stack());
+    Some(r)
 }
 
 /// The MSM split between the device (`[0, m)`, masked) and the CPU (`[m, n)`,
-/// on another thread at the same time), the two sums added on the host.
+/// on another thread at the same time, or after the device share on this
+/// thread when no thread can be started), the two sums added on the host.
 fn split(
     s: &mut Session,
     points: Points<'_>,
     scalars: &[Scalar],
     bases: &[G1AffineLimbs],
-    masks: Option<&mut HashMap<usize, G1JacobianLimbs>>,
+    masks: Option<&Mutex<HashMap<usize, G1JacobianLimbs>>>,
     mut prof: Option<&mut MsmStages>,
-) -> Result<(G1JacobianLimbs, u64), Error> {
+) -> Result<(Secret<G1JacobianLimbs>, u64), Error> {
     let n = scalars.len();
     let m = device_share(n, matches!(points, Points::Table(_)));
     if let Some(p) = prof.as_deref_mut() {
@@ -988,32 +1458,36 @@ fn split(
         Points::Host(b) => Points::Host(&b[..m]),
         t => t,
     };
+    let (cs, cb) = (&scalars[m..], &bases[m..]);
+    let cpu_share = move || {
+        let _scrub = ScrubOnExit;
+        let t0 = Instant::now();
+        let r = cpu_msm(cs, cb)?;
+        Some((r, t0.elapsed().as_nanos() as u64))
+    };
     let (dev, cpu) = std::thread::scope(|sc| {
-        let h = sc.spawn(|| {
-            let t0 = Instant::now();
-            let r = cpu_msm(&scalars[m..], &bases[m..]);
-            (r, t0.elapsed().as_nanos() as u64)
-        });
+        let h = std::thread::Builder::new()
+            .name("midnight-metal-msm-share".into())
+            .spawn_scoped(sc, cpu_share)
+            .ok();
         let dev = masked(s, points, &scalars[..m], masks, prof.as_deref_mut());
-        (dev, h.join())
+        let cpu = match h {
+            Some(h) => h.join().ok().flatten(),
+            None => catch(cpu_share).flatten(),
+        };
+        (dev, cpu)
     });
-    let (mut cpu, cpu_ns) = cpu.map_err(|_| Error::Device("msm: the CPU share failed".into()))?;
+    // on every early return below, the guards zero the other share's sum
+    let Some((cpu, cpu_ns)) = cpu else {
+        return Err(Error::Device("msm: the CPU share failed".into()));
+    };
     if let Some(p) = prof {
         p.cpu_ns += cpu_ns;
     }
-    let (d, ns) = match dev {
-        Ok(r) => r,
-        Err(e) => {
-            wipe(std::slice::from_mut(&mut cpu));
-            return Err(e);
-        }
-    };
-    let mut sum = p1_of(&d);
+    let (d, ns) = dev?;
+    let mut sum = Secret(p1_of(&d));
     add(&mut sum, &cpu);
-    let out = limbs_of(&sum);
-    wipe(std::slice::from_mut(&mut sum));
-    wipe(std::slice::from_mut(&mut cpu));
-    Ok((out, ns))
+    Ok((Secret(limbs_of(&sum)), ns))
 }
 
 enum Points<'a> {
@@ -1031,6 +1505,7 @@ const K_COUNTS: &str = "msm-counts";
 const K_HIST: &str = "msm-hist";
 const K_BUCKETS: &str = "msm-buckets";
 const K_ONES: &str = "msm-ones";
+const K_HOT: &str = "msm-hot";
 
 /// `MSM(s + r) - MSM(r)` (see the module text). Returns the result and the
 /// GPU time.
@@ -1038,9 +1513,9 @@ fn masked(
     s: &mut Session,
     points: Points<'_>,
     scalars: &[Scalar],
-    masks: Option<&mut HashMap<usize, G1JacobianLimbs>>,
+    masks: Option<&Mutex<HashMap<usize, G1JacobianLimbs>>>,
     mut prof: Option<&mut MsmStages>,
-) -> Result<(G1JacobianLimbs, u64), Error> {
+) -> Result<(Secret<G1JacobianLimbs>, u64), Error> {
     let n = scalars.len();
     let pl = plan(n);
     let c = s.ctx();
@@ -1055,9 +1530,10 @@ fn masked(
     s.scratch(K_HIST, rows * 4)?;
     s.scratch(K_BUCKETS, rows * size_of::<Xyzz>())?;
     s.scratch(K_ONES, geo.ones_slots() * size_of::<Xyzz>())?;
-    write_parallel(s.scratch(K_SCALARS, size_of_val(scalars))?, scalars);
+    s.scratch(K_HOT, 4)?;
+    write_parallel(s.scratch(K_SCALARS, size_of_val(scalars))?, scalars)?;
     if let Points::Host(b) = points {
-        s.scratch(K_POINTS, size_of_val(b))?.write(b);
+        write_parallel(s.scratch(K_POINTS, size_of_val(b))?, b)?;
     }
     if let Some(p) = prof.as_deref_mut() {
         p.upload_ns += t0.elapsed().as_nanos() as u64;
@@ -1065,9 +1541,9 @@ fn masked(
         p.nwins = pl.nwins;
         p.batches = pl.batch as u32;
     }
-    let [digits, temps, counts, hist, buckets, ones, sc] = s
+    let [digits, temps, counts, hist, buckets, ones, hot, sc] = s
         .scratch_many([
-            K_DIGITS, K_TEMPS, K_COUNTS, K_HIST, K_BUCKETS, K_ONES, K_SCALARS,
+            K_DIGITS, K_TEMPS, K_COUNTS, K_HIST, K_BUCKETS, K_ONES, K_HOT, K_SCALARS,
         ])
         .ok_or_else(|| Error::Memory("msm scratch".into()))?;
     let points = match points {
@@ -1085,10 +1561,11 @@ fn masked(
         hist,
         buckets,
         ones,
+        hot,
     };
 
     let mut ns = 0u64;
-    let cached = masks.as_ref().and_then(|m| m.get(&n).copied());
+    let cached = masks.and_then(|m| lock(m).get(&n).copied());
     let rr = match cached {
         Some(rr) => rr,
         None => {
@@ -1096,7 +1573,7 @@ fn masked(
             ns += t;
             let rr = limbs_of(&rr);
             if let Some(m) = masks {
-                m.insert(n, rr);
+                lock(m).insert(n, rr);
             }
             rr
         }
@@ -1112,27 +1589,30 @@ fn masked(
         blst_p1_cneg(&mut nr, true);
     }
     add(&mut sr, &nr);
-    let out = limbs_of(&sr);
-    wipe(std::slice::from_mut(&mut sr));
-    Ok((out, ns))
+    Ok((Secret(limbs_of(&sr)), ns))
 }
 
 /// Copies `data` to the start of `buf` on a few threads (a 2^20-scalar copy
-/// takes about 0.5 ms on one).
-fn write_parallel<T: ctx::Pod + Sync + Send>(buf: &mut Buffer, data: &[T]) {
+/// takes about 0.5 ms on one); a part whose thread cannot be started is
+/// copied on this thread.
+fn write_parallel<T: ctx::Pod + Sync + Send>(buf: &mut Buffer, data: &[T]) -> Result<(), Error> {
     const PART: usize = 1 << 20;
-    let bytes = size_of_val(data);
-    if bytes <= PART {
-        buf.write(data);
-        return;
+    let short = || Error::Memory("msm scratch".into());
+    let dst = buf.as_mut_slice::<T>().get_mut(..data.len()).ok_or_else(short)?;
+    if size_of_val(data) <= PART {
+        dst.copy_from_slice(data);
+        return Ok(());
     }
-    let per = data.len().div_ceil(4).max(PART / size_of::<T>().max(1));
-    let dst = &mut buf.as_mut_slice::<T>()[..data.len()];
-    std::thread::scope(|s| {
-        for (d, x) in dst.chunks_mut(per).zip(data.chunks(per)) {
-            s.spawn(move || d.copy_from_slice(x));
+    let base = dst.as_mut_ptr() as usize;
+    par_parts(data.len(), 4, PART / size_of::<T>().max(1), |a, b| {
+        // SAFETY: `dst` holds `data.len()` elements and the parts are
+        // disjoint; `dst` is borrowed exclusively for the call.
+        unsafe {
+            std::ptr::copy_nonoverlapping(data[a..b].as_ptr(), (base as *mut T).add(a), b - a)
         }
-    });
+    })
+    .map(|_| ())
+    .ok_or_else(|| Error::Device("msm: a host copy failed".into()))
 }
 
 /// Thread counts that depend on the pipelines.
@@ -1169,6 +1649,7 @@ impl Geometry {
         if pl.low_bits > MAX_LOW_BITS || pl.top_bits > MAX_TOP_BITS {
             return Err(Error::Device("msm: window too wide for the sort".into()));
         }
+        simd_width_ok(c)?;
         Ok(Geometry {
             sort_block,
             ones_block,
@@ -1176,8 +1657,34 @@ impl Geometry {
         })
     }
 
+    /// The records `msm_ones` writes: one per 32 threads of its grid (each
+    /// written at every run, whatever the SIMD-group width, see msm.metal).
     fn ones_slots(&self) -> usize {
-        ONES_GROUPS * self.ones_block / 32
+        ONES_GROUPS * self.ones_block / SIMD_WIDTH
+    }
+}
+
+/// Whether every MSM pipeline runs SIMD-groups of [`SIMD_WIDTH`] threads
+/// (`threadExecutionWidth`), checked once per process: the reduction of
+/// `msm_ones` and the prefix sums of the sort assume it. Another width is a
+/// `device-error` decline.
+fn simd_width_ok(c: &Ctx) -> Result<(), Error> {
+    static OK: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    if let Some(&ok) = OK.get() {
+        return width_result(ok);
+    }
+    let mut ok = true;
+    for k in KERNELS {
+        ok &= c.pipeline(k)?.threadExecutionWidth() == SIMD_WIDTH;
+    }
+    width_result(*OK.get_or_init(|| ok))
+}
+
+fn width_result(ok: bool) -> Result<(), Error> {
+    if ok {
+        Ok(())
+    } else {
+        Err(Error::Device("msm: a SIMD-group width other than 32".into()))
     }
 }
 
@@ -1190,13 +1697,16 @@ struct Bufs<'a> {
     hist: &'a Buffer,
     buckets: &'a Buffer,
     ones: &'a Buffer,
+    /// One `uint`: set by `msm_bucket_guard` when a bucket of the chunk
+    /// holds more than [`HOT_BUCKET_LIMIT`] points (reset by `msm_digits`).
+    hot: &'a Buffer,
 }
 
 /// The kernel parameters of one chunk.
 struct ChunkParams {
     digits: [u32; 6],
     sort: Vec<[u32; 9]>,
-    acc: [u32; 3],
+    acc: [u32; 4],
     int: [u32; 3],
 }
 
@@ -1227,7 +1737,7 @@ fn chunk_params(pl: &Plan, mode: u32, h_off: usize, num: usize) -> ChunkParams {
             mode,
         ],
         sort,
-        acc: [pl.nwins, pl.bits, pl.stride as u32],
+        acc: [pl.nwins, pl.bits, pl.stride as u32, HOT_BUCKET_LIMIT],
         int: [pl.nwins, pl.wbits, NBITS],
     }
 }
@@ -1239,15 +1749,22 @@ fn enc_digits<'a>(
     h_off: usize,
     num: usize,
 ) -> Result<(), Error> {
+    // the mask mode does not read the scalars: the scalars buffer is bound
+    // (from its start) only so that the input is not the output buffer
     let sc = if p.digits[5] == MODE_MASK {
-        Arg::Buffer(b.digits)
+        Arg::Buffer(b.scalars)
     } else {
         Arg::BufferAt(b.scalars, h_off * size_of::<Scalar>())
     };
     cmd.dispatch(
         "msm_digits",
         num,
-        &[sc, Arg::Buffer(b.digits), Arg::value(&p.digits)],
+        &[
+            sc,
+            Arg::Buffer(b.digits),
+            Arg::value(&p.digits),
+            Arg::Buffer(b.hot),
+        ],
     )
 }
 
@@ -1314,6 +1831,16 @@ fn enc_accumulate<'a>(
     h_off: usize,
 ) -> Result<(), Error> {
     let pts = Arg::BufferAt(b.points, h_off * size_of::<G1AffineLimbs>());
+    let total = (pl.nwins as usize) << pl.bits;
+    cmd.dispatch(
+        "msm_bucket_guard",
+        total,
+        &[
+            Arg::Buffer(b.hist),
+            Arg::Buffer(b.hot),
+            Arg::value(&p.acc),
+        ],
+    )?;
     cmd.dispatch_groups(
         "msm_ones",
         ONES_GROUPS,
@@ -1328,7 +1855,7 @@ fn enc_accumulate<'a>(
     )?;
     cmd.dispatch_with(
         "msm_accumulate",
-        (pl.nwins as usize) << pl.bits,
+        total,
         ACC_GROUP,
         &[
             Arg::Buffer(b.buckets),
@@ -1336,6 +1863,7 @@ fn enc_accumulate<'a>(
             Arg::Buffer(b.digits),
             Arg::Buffer(b.hist),
             Arg::value(&p.acc),
+            Arg::Buffer(b.hot),
         ],
         &[],
     )
@@ -1359,6 +1887,12 @@ fn enc_integrate<'a>(
 
 /// One device MSM (sppark `invoke`) over the first `pl.n` points of
 /// `b.points` with the scalars of `mode`. Returns the sum and the GPU time.
+///
+/// Each chunk's partial sums are copied into guards ([`SecretVec`]) and
+/// combined on a host thread while the device runs the next chunk (on this
+/// thread when no thread can be started). A failure of any chunk or of any
+/// collection is an error, after every started collection has been joined;
+/// every copy and partial sum is zeroed on every exit.
 fn run(
     c: &Ctx,
     b: &Bufs<'_>,
@@ -1366,15 +1900,29 @@ fn run(
     g: &Geometry,
     mode: u32,
     mut prof: Option<&mut MsmStages>,
-) -> Result<(blst_p1, u64), Error> {
+) -> Result<(Secret<blst_p1>, u64), Error> {
     let per_row = 2 * g.nthr;
     let row_len = 1usize << pl.bits;
+    let nthr = g.nthr;
+    // the inputs of each chunk's collection, taken by its thread, or by this
+    // thread when that thread could not be started
+    type Inputs = Mutex<Option<(SecretVec<Xyzz>, SecretVec<Xyzz>)>>;
+    let inputs: Vec<Inputs> = (0..pl.batch).map(|_| Mutex::new(None)).collect();
+    let take = |i: &Inputs| lock(i).take();
+    let collect_inputs = |i: &Inputs| {
+        let _scrub = ScrubOnExit;
+        take(i).and_then(|(rows, ones)| collect(rows, ones, pl, nthr))
+    };
     std::thread::scope(|sc| {
+        enum Pending<'s> {
+            Thread(std::thread::ScopedJoinHandle<'s, Option<Secret<blst_p1>>>),
+            Done(Option<Secret<blst_p1>>),
+        }
         let mut pending = Vec::with_capacity(pl.batch);
         let mut gpu = 0u64;
         let mut h_off = 0usize;
         let mut err = None;
-        for _ in 0..pl.batch {
+        for slot in &inputs {
             let num = pl.stride.min(pl.n - h_off);
             let p = chunk_params(pl, mode, h_off, num);
             let ran = match prof.as_deref_mut() {
@@ -1395,44 +1943,64 @@ fn run(
                     break;
                 }
             }
+            // a bucket above the bound: the accumulation was skipped and
+            // the chunk declines (see `HOT_BUCKET_LIMIT`; a generic
+            // message, the same as for any failed command buffer)
+            if b.hot.as_slice::<u32>().first().is_none_or(|&h| h != 0) {
+                err = Some(Error::Device("msm: a command buffer failed".into()));
+                break;
+            }
             // the partial sums of this chunk, copied out of the device
             // buffers before the next chunk reuses them
             let t0 = Instant::now();
             let bk = b.buckets.as_slice::<Xyzz>();
-            let mut rows: Vec<Xyzz> = Vec::with_capacity(pl.nwins as usize * per_row);
+            let mut rows = SecretVec::with_capacity(pl.nwins as usize * per_row);
+            let mut ok = true;
             for y in 0..pl.nwins as usize {
-                rows.extend_from_slice(&bk[y * row_len..y * row_len + per_row]);
+                ok &= bk
+                    .get(y * row_len..y * row_len + per_row)
+                    .is_some_and(|r| rows.extend_within(r));
             }
-            let ones = b.ones.as_slice::<Xyzz>()[..g.ones_slots()].to_vec();
+            let mut ones = SecretVec::with_capacity(g.ones_slots());
+            ok &= b.ones.as_slice::<Xyzz>().get(..g.ones_slots()).is_some_and(|o| ones.extend_within(o));
+            if !ok {
+                err = Some(Error::Memory("msm scratch".into()));
+                break;
+            }
+            *lock(slot) = Some((rows, ones));
             match prof.as_deref_mut() {
-                None => pending.push(sc.spawn(move || collect(rows, ones, pl, g.nthr))),
+                None => {
+                    let job = move || collect_inputs(slot);
+                    match std::thread::Builder::new().spawn_scoped(sc, job) {
+                        Ok(h) => pending.push(Pending::Thread(h)),
+                        Err(_) => pending.push(Pending::Done(catch(job).flatten())),
+                    }
+                }
                 Some(st) => {
-                    let r = collect(rows, ones, pl, g.nthr);
+                    let r = catch(|| collect_inputs(slot)).flatten();
                     st.collect_ns += t0.elapsed().as_nanos() as u64;
-                    pending.push(sc.spawn(move || r));
+                    pending.push(Pending::Done(r));
                 }
             }
             h_off += num;
         }
         let t0 = Instant::now();
-        let mut out = blst_p1::default();
+        let mut out = Secret(blst_p1::default());
         for h in pending {
-            match h.join() {
-                Ok(mut p) => {
-                    add(&mut out, &p);
-                    wipe(std::slice::from_mut(&mut p));
-                }
-                Err(_) => err = err.or(Some(Error::Device("msm: host collect failed".into()))),
+            let r = match h {
+                Pending::Thread(h) => h.join().ok().flatten(),
+                Pending::Done(r) => r,
+            };
+            match r {
+                Some(p) => add(&mut out, &p),
+                None => err = err.or(Some(Error::Device("msm: host collect failed".into()))),
             }
         }
         if let Some(st) = prof {
             st.collect_ns += t0.elapsed().as_nanos() as u64;
         }
         match err {
-            Some(e) => {
-                wipe(std::slice::from_mut(&mut out));
-                Err(e)
-            }
+            Some(e) => Err(e),
             None => Ok((out, gpu)),
         }
     })
@@ -1460,7 +2028,7 @@ fn staged(
         let h = &hist[y * row_len..(y + 1) * row_len];
         let mut prev = 0;
         for &e in h {
-            st.bucket_max = st.bucket_max.max(e - prev);
+            st.bucket_max = st.bucket_max.max(e.saturating_sub(prev));
             prev = e;
         }
         total += u64::from(prev);
@@ -1494,8 +2062,10 @@ fn dbl(a: &mut blst_p1) {
 /// An XYZZ record as Jacobian coordinates `(X ZZ, Y ZZZ, ZZ)` (sppark's
 /// `xyzz_t` to `jacobian_t` conversion); infinity (`ZZ = 0`) stays infinity.
 fn p1_of_xyzz(r: &Xyzz) -> blst_p1 {
-    let fp = |i: usize| blst_fp {
-        l: r[6 * i..6 * i + 6].try_into().unwrap(),
+    let fp = |i: usize| {
+        let mut l = [0u64; 6];
+        l.copy_from_slice(&r[6 * i..6 * i + 6]);
+        blst_fp { l }
     };
     let (x, y, zzz, zz) = (fp(0), fp(1), fp(2), fp(3));
     let mut p = blst_p1 {
@@ -1511,8 +2081,10 @@ fn p1_of_xyzz(r: &Xyzz) -> blst_p1 {
 }
 
 fn p1_of(l: &G1JacobianLimbs) -> blst_p1 {
-    let fp = |i: usize| blst_fp {
-        l: l[6 * i..6 * i + 6].try_into().unwrap(),
+    let fp = |i: usize| {
+        let mut f = [0u64; 6];
+        f.copy_from_slice(&l[6 * i..6 * i + 6]);
+        blst_fp { l: f }
     };
     blst_p1 {
         x: fp(0),
@@ -1529,12 +2101,9 @@ fn limbs_of(p: &blst_p1) -> G1JacobianLimbs {
     out
 }
 
-/// Writes zero over `v` (host copies of values derived from the scalars).
-fn wipe<T: Copy>(v: &mut [T]) {
-    // SAFETY: `T` here is a plain-data type (limb arrays, blst points) for
-    // which all-zero bytes are a valid value.
-    unsafe { std::ptr::write_bytes(v.as_mut_ptr(), 0, v.len()) };
-    std::sync::atomic::compiler_fence(std::sync::atomic::Ordering::SeqCst);
+/// Writes zero over `v` (a local derived from the scalars), volatile.
+fn wipe<T: Copy>(v: &mut T) {
+    zero_volatile((v as *mut T).cast::<u8>(), size_of::<T>());
 }
 
 /// sppark `integrate_row`: the window sum from its `nthr` pairs (weighted
@@ -1554,7 +2123,7 @@ fn integrate_row(row: &[Xyzz], lsbits: u32, nthrbits: u32) -> blst_p1 {
                 add(&mut res, &acc);
             }
         }
-        wipe(std::slice::from_mut(&mut acc));
+        wipe(&mut acc);
         return res;
     }
     // sppark adds `acc * 2^(lsbits - 1 - nthrbits)` at every step; the sum of
@@ -1574,54 +2143,238 @@ fn integrate_row(row: &[Xyzz], lsbits: u32, nthrbits: u32) -> blst_p1 {
         dbl(&mut raised);
     }
     add(&mut res, &raised);
-    wipe(std::slice::from_mut(&mut raised));
-    wipe(std::slice::from_mut(&mut acc));
+    wipe(&mut raised);
+    wipe(&mut acc);
     res
 }
 
-/// sppark `collect`: the window sums (rows integrated in parallel), the
-/// doubling ladder from the top window, plus the bucket of digit 1 of window
-/// 0 (`ones`). Zeroes its inputs.
-fn collect(mut rows: Vec<Xyzz>, mut ones: Vec<Xyzz>, pl: &Plan, nthr: usize) -> blst_p1 {
+/// The window sums of windows `[lo, hi)` (sppark `collect_rows`): out of
+/// line, so that its frames (and those of `integrate_row` and `blst`) lie
+/// below the worker's frame, where [`scrub_stack`] runs afterwards.
+#[inline(never)]
+fn collect_rows(
+    rows: &[Xyzz],
+    lo: usize,
+    hi: usize,
+    pl: &Plan,
+    per_row: usize,
+    nthrbits: u32,
+) -> SecretVec<blst_p1> {
+    let nwins = pl.nwins as usize;
+    let mut out = SecretVec::with_capacity(hi - lo);
+    for y in lo..hi {
+        let dy = if y == nwins - 1 { pl.top } else { pl.wbits };
+        let mut s = integrate_row(&rows[y * per_row..(y + 1) * per_row], dy, nthrbits);
+        out.push_within(s);
+        wipe(&mut s);
+    }
+    out
+}
+
+/// sppark `collect`: the window sums (rows integrated in parallel, a part
+/// whose thread cannot be started on this thread), the doubling ladder from
+/// the top window, plus the bucket of digit 1 of window 0 (`ones`). `None`:
+/// a worker panicked. Its inputs, the window sums and the partial results
+/// are guards (zeroed on every exit), and every worker scrubs its stack
+/// ([`ScrubOnExit`]); the caller scrubs this thread's.
+fn collect(
+    rows: SecretVec<Xyzz>,
+    ones: SecretVec<Xyzz>,
+    pl: &Plan,
+    nthr: usize,
+) -> Option<Secret<blst_p1>> {
     let nwins = pl.nwins as usize;
     let per_row = 2 * nthr;
     let nthrbits = lg2(nthr);
-    let mut sums = vec![blst_p1::default(); nwins];
-    let workers = std::thread::available_parallelism().map_or(4, |t| t.get()).clamp(1, nwins);
-    let per = nwins.div_ceil(workers);
-    std::thread::scope(|s| {
-        for (k, out) in sums.chunks_mut(per).enumerate() {
-            let rows = &rows;
-            s.spawn(move || {
-                for (j, o) in out.iter_mut().enumerate() {
-                    let y = k * per + j;
-                    let dy = if y == nwins - 1 { pl.top } else { pl.wbits };
-                    *o = integrate_row(&rows[y * per_row..(y + 1) * per_row], dy, nthrbits);
-                }
-            });
-        }
-    });
-    let mut out = blst_p1::default();
+    if rows.len() < nwins * per_row {
+        return None;
+    }
+    let parts = par_parts(nwins, host_threads(), 1, |lo, hi| {
+        let _scrub = ScrubOnExit;
+        collect_rows(&rows, lo, hi, pl, per_row, nthrbits)
+    })?;
+    let sums: Vec<&blst_p1> = parts.iter().flat_map(|p| p.iter()).collect();
+    if sums.len() != nwins {
+        return None;
+    }
+    let mut out = Secret(blst_p1::default());
     for y in (0..nwins).rev() {
-        add(&mut out, &sums[y]);
+        add(&mut out, sums[y]);
         if y > 0 {
             for _ in 0..pl.wbits {
                 dbl(&mut out);
             }
         }
     }
-    for r in &ones {
-        add(&mut out, &p1_of_xyzz(r));
+    for r in ones.iter() {
+        let mut p = p1_of_xyzz(r);
+        add(&mut out, &p);
+        wipe(&mut p);
     }
-    wipe(&mut sums);
-    wipe(&mut rows);
-    wipe(&mut ones);
-    out
+    Some(out)
 }
 
 #[cfg(test)]
 mod tests {
+    use std::cell::RefCell;
+
     use super::*;
+
+    thread_local! {
+        /// (bytes, whether all were zero) of each guard dropped on this
+        /// thread, read just before the memory is released.
+        static WIPES: RefCell<Vec<(usize, bool)>> = const { RefCell::new(Vec::new()) };
+    }
+
+    /// Called by the guards' `Drop` after their zeroing.
+    pub(super) fn observe_wipe(p: *const u8, len: usize) {
+        // SAFETY: the guard's memory, still allocated (called before it is
+        // released).
+        let zero = (0..len).all(|i| unsafe { std::ptr::read_volatile(p.add(i)) } == 0);
+        WIPES.with(|w| w.borrow_mut().push((len, zero)));
+    }
+
+    fn wipes() -> Vec<(usize, bool)> {
+        WIPES.with(|w| std::mem::take(&mut *w.borrow_mut()))
+    }
+
+    #[test]
+    fn guards_zero_on_drop() {
+        let _ = wipes();
+        let mut v = SecretVec::<Xyzz>::with_capacity(5);
+        assert!(v.extend_within(&[[7u64; 24]; 3]));
+        assert!(!v.extend_within(&[[7u64; 24]; 3]), "past the capacity");
+        assert!(v.push_within([9u64; 24]));
+        drop(v);
+        let s = Secret([5u64; 18]);
+        drop(s);
+        // the whole allocation (capacity, not length) of the vector
+        assert_eq!(wipes(), vec![(5 * 192, true), (144, true)]);
+    }
+
+    #[test]
+    fn guards_zero_on_unwind() {
+        let _ = wipes();
+        let r = std::panic::catch_unwind(|| {
+            let mut v = SecretVec::<blst_p1>::with_capacity(4);
+            let mut p = blst_p1::default();
+            p.x.l = [3; 6];
+            assert!(v.push_within(p));
+            let _s = Secret([1u64; 18]);
+            panic!("unwind with secrets held");
+        });
+        assert!(r.is_err());
+        assert_eq!(wipes(), vec![(144, true), (4 * 144, true)]);
+    }
+
+    #[test]
+    fn par_parts_covers_and_reports_panics() {
+        let got = par_parts(1000, 7, 10, |a, b| (a, b)).unwrap();
+        assert_eq!(got.first().map(|p| p.0), Some(0));
+        assert_eq!(got.last().map(|p| p.1), Some(1000));
+        assert!(got.windows(2).all(|w| w[0].1 == w[1].0));
+        assert_eq!(par_parts(0, 4, 1, |a, b| (a, b)).unwrap(), vec![]);
+        // a panic in a part (on the calling thread or another) is `None`
+        assert!(par_parts(1000, 4, 1, |a, _| assert!(a != 0)).is_none());
+        assert!(par_parts(1000, 4, 1, |a, _| assert!(a != 750)).is_none());
+    }
+
+    #[test]
+    fn g1_check_takes_infinity_and_rejects_others() {
+        use group::prime::PrimeCurveAffine;
+        let g = midnight_curves::G1Affine::generator();
+        // SAFETY: the layout checked at the top of the module.
+        let lim = |p: &midnight_curves::G1Affine| unsafe {
+            *(p as *const midnight_curves::G1Affine as *const G1AffineLimbs)
+        };
+        let inf = [0u64; 12];
+        assert!(in_g1(&lim(&g)) && in_g1(&inf));
+        // a point off the curve: the generator with its y coordinate changed
+        let mut off = lim(&g);
+        off[6] ^= 1;
+        assert!(!in_g1(&off));
+        let pts = vec![lim(&g), inf, off, lim(&g), off];
+        assert_eq!(first_not_in_g1(&pts), 2);
+        assert!(!all_in_g1(&pts));
+        assert!(all_in_g1(&pts[..2]));
+        assert_eq!(first_not_in_g1(&pts[..2]), 2);
+    }
+
+    /// The cost of the identity comparison and of the G1 checks (run once:
+    /// `cargo test --release --lib msm::tests::identity_and_g1_check_costs
+    /// -- --ignored --nocapture`).
+    #[test]
+    #[ignore = "measurement"]
+    fn identity_and_g1_check_costs() {
+        use ff::Field;
+        use group::{Curve, Group};
+        let _ = <midnight_curves::G1Projective as Curve>::to_affine;
+        use rand_chacha::ChaCha8Rng;
+        use rand_core::SeedableRng;
+        use rayon::prelude::*;
+        let n = 1usize << 20;
+        let pts: Vec<midnight_curves::G1Affine> = (0..n / 4096)
+            .into_par_iter()
+            .flat_map_iter(|c| {
+                let mut rng = ChaCha8Rng::seed_from_u64(c as u64);
+                let proj: Vec<_> =
+                    (0..4096).map(|_| midnight_curves::G1Projective::random(&mut rng)).collect();
+                let mut aff = vec![midnight_curves::G1Affine::default(); 4096];
+                midnight_curves::G1Projective::batch_normalize(&proj, &mut aff);
+                aff
+            })
+            .collect();
+        // SAFETY: the layout checked at the top of the module.
+        let bases: &[G1AffineLimbs] = unsafe {
+            std::slice::from_raw_parts(pts.as_ptr().cast::<G1AffineLimbs>(), pts.len())
+        };
+        let scal: Vec<midnight_curves::Fq> = {
+            let mut rng = ChaCha8Rng::seed_from_u64(9);
+            (0..1 << 18).map(|_| midnight_curves::Fq::random(&mut rng)).collect()
+        };
+        // SAFETY: as above.
+        let scalars: &[Scalar] = unsafe {
+            std::slice::from_raw_parts(scal.as_ptr().cast::<Scalar>(), scal.len())
+        };
+        let ms = |t: Instant| t.elapsed().as_secs_f64() * 1e3;
+
+        let t = Instant::now();
+        assert_eq!(first_not_in_g1(bases), n);
+        println!("G1 check of 2^20 points (registration): {:.1} ms", ms(t));
+        let t = Instant::now();
+        let h = register_srs(bases);
+        println!("register_srs 2^20 (copy + check): {:.1} ms", ms(t));
+        let copy = bases.to_vec();
+        let t = Instant::now();
+        assert!(points_equal(&copy, bases));
+        println!("full compare 2^20, host copy: {:.2} ms", ms(t));
+        assert!(crate::set_min_k(14));
+        assert!(crate::msm_g1(&scalars[..1 << 16], &bases[..1 << 16]).is_some());
+        let t = Instant::now();
+        assert!(h.verify(bases));
+        println!("full compare 2^20, uploaded table (shared buffer): {:.2} ms", ms(t));
+        for _ in 0..2 {
+            let t = Instant::now();
+            assert!(serving_table(bases, n).is_some());
+            println!("table lookup + full compare 2^20: {:.2} ms", ms(t));
+        }
+        drop(h);
+        for k in [16u32, 18] {
+            let m = 1usize << k;
+            let t = Instant::now();
+            assert!(all_in_g1(&bases[..m]));
+            let check = ms(t);
+            // one-shot (the check included), warm: the second call
+            let _ = crate::msm_g1(&scalars[..m], &bases[..m]);
+            let t = Instant::now();
+            assert!(crate::msm_g1(&scalars[..m], &bases[..m]).is_some());
+            println!(
+                "2^{k}: per-call G1 check {check:.1} ms; one-shot MSM with the check {:.1} ms",
+                ms(t)
+            );
+        }
+        crate::reset_min_k();
+    }
 
     #[test]
     fn plan_follows_measured_table() {
