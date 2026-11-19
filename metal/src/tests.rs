@@ -752,6 +752,21 @@ fn entry_points_serve_small_calls() {
     assert!(crate::end_request());
 }
 
+/// The size class of an MSM length: log2 rounded to the nearest integer on
+/// the log scale.
+#[test]
+fn lg2_nearest_rounds_on_the_log_scale() {
+    for k in 2..40u32 {
+        let p = 1usize << k;
+        assert_eq!(crate::lg2_nearest(p), k);
+        assert_eq!(crate::lg2_nearest(p - 1), k);
+        assert_eq!(crate::lg2_nearest(p + p / 3), k);
+    }
+    // the boundary of class 13: 2^12.5 = 5792.6
+    assert_eq!(crate::lg2_nearest(5793), 12);
+    assert_eq!(crate::lg2_nearest(5794), 13);
+}
+
 /// Without an explicit threshold each class takes its measured default; an
 /// explicit one applies to every class; an MSM below the one-shot threshold
 /// is served from a registered table and declines without one.
@@ -767,11 +782,11 @@ fn per_class_thresholds() {
         return;
     }
     assert_eq!(crate::thresholds(), crate::DEFAULT_THRESHOLDS);
-    assert_eq!(crate::min_k(), 14);
+    assert_eq!(crate::min_k(), 13);
     let d = crate::DEFAULT_THRESHOLDS;
     assert_eq!(
         (d.fft, d.ifft, d.msm_table, d.msm_one_shot, d.quotient),
-        (15, 15, 14, 18, 14)
+        (15, 15, 13, 18, 14)
     );
 
     // a transform below its threshold declines, unchanged
@@ -799,9 +814,20 @@ fn per_class_thresholds() {
     let (cached2, one_shot2, uploads2) = crate::msm_counts();
     assert_eq!((cached2 - cached, one_shot2 - one_shot, uploads2 - uploads), (1, 0, 1));
     assert_eq!(h.device_bytes(), (points.len() * 96) as u64);
-    // below the table threshold even a table does not take it
-    let half = 1 << 13;
-    assert!(crate::msm_g1(scalars(&input[..half]), affine(&points[..half])).is_none());
+    // the table threshold goes by the size class of the length (its log2
+    // rounded to the nearest integer): 2^13 - 1 is taken, a length of class
+    // 12 is not, even from a table
+    let below = (1 << 13) - 1;
+    let r = crate::msm_g1(scalars(&input[..below]), affine(&points[..below]))
+        .expect("class 13, served from the table");
+    assert_eq!(
+        from_jacobian(r).to_affine(),
+        stock::msm(&input[..below], &points[..below])
+    );
+    let quarter = 1 << 12;
+    assert!(crate::msm_g1(scalars(&input[..quarter]), affine(&points[..quarter])).is_none());
+    assert_eq!(crate::msm_admission(5793, 5793, crate::MAX_MSM_LOG), Err("below-min-k"));
+    assert_eq!(crate::msm_admission(5794, 5794, crate::MAX_MSM_LOG), Ok(()));
     drop(h);
 
     // an explicit threshold applies to every class

@@ -590,10 +590,10 @@ fn sparse_msm_declines_below_min_k() {
     let n = 1usize << 20;
     let bases = &points_cache()[..n];
     // the needs with the default thresholds: max(2^threshold, n/3) one-shot,
-    // max(2^threshold, n/5) on a table (the measured sparse crossovers)
+    // 2^12 + n/5 on a table (the measured sparse crossovers)
     let one_shot = (1usize << t.msm_one_shot).max(n / 3);
-    let table = (1usize << t.msm_table).max(n / 5);
-    assert_eq!((one_shot, table), (n / 3, n / 5));
+    let table = (1usize << 12) + n / 5;
+    assert_eq!(one_shot, n / 3);
 
     let served = |nz: usize, seed: u64| {
         let s = sparse_scalars(n, nz, seed);
@@ -623,6 +623,20 @@ fn sparse_msm_declines_below_min_k() {
         );
     }
     served(table, 6);
+
+    // at the table threshold: a dense MSM with a few zero scalars (a column
+    // with zero rows before its blinding rows) is served, a half-zero one is
+    // not; the multi-open's length n - 1 is in the class of n
+    let m = 1usize << t.msm_table;
+    for len in [m, m - 1] {
+        let mut s = random_scalars(len, 13);
+        for z in &mut s[len - 20..len - 4] {
+            *z = Fq::ZERO;
+        }
+        let got = try_device_msm(&s, &bases[..len]).expect("a dense MSM at the threshold");
+        assert!(got == msm_pippenger(&s, &bases[..len]), "{len}");
+    }
+    assert!(try_device_msm(&sparse_scalars(m, m / 2, 14), &bases[..m]).is_none());
 
     // an explicit threshold replaces the need: 2^k alone, on both paths
     assert!(midnight_metal::set_min_k(14));

@@ -276,15 +276,17 @@ impl<E: KZGEngine> PolynomialCommitmentScheme<E::Fr> for KZGCommitmentScheme<E> 
         /// Fused parallel implementation: a single pass accumulates all
         /// scaled contributions directly into the output buffer, avoiding
         /// M intermediate allocations and the sequential reduce chain.
-        #[cfg_attr(feature = "prover-par", allow(unreachable_code))]
         fn poly_inner_product<F: ff::PrimeField>(
             polys: &[&Polynomial<F, Coeff>],
             scalars: impl IntoIterator<Item = F>,
         ) -> Polynomial<F, Coeff> {
-            // With the feature `prover-par`, the same sums in tasks of
-            // bounded size (see `crate::par::open`).
+            // With the feature `prover-par`, the same sums of long
+            // polynomials in tasks of bounded size (see `crate::par::open`).
             #[cfg(feature = "prover-par")]
-            return crate::par::open::poly_inner_product(polys, scalars);
+            if polys.iter().map(|p| p.len()).max().unwrap_or(0) >= crate::par::open::SUM_PAR_MIN_LEN
+            {
+                return crate::par::open::poly_inner_product(polys, scalars);
+            }
             let scalars: Vec<F> = scalars.into_iter().take(polys.len()).collect();
             let max_len = polys.iter().map(|p| p.len()).max().unwrap_or(0);
             let mut values = vec![F::ZERO; max_len];

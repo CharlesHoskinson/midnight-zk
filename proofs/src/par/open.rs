@@ -50,8 +50,50 @@ const SUM_CHUNK: usize = 1 << 12;
 /// Rows per block of a division.
 const DIV_BLOCK: usize = 1 << 13;
 
-/// Shorter polynomials are divided by the stock code.
-pub(crate) const PAR_MIN_LEN: usize = 1 << 14;
+/// Shorter polynomials are divided by the stock code (`divide_by_roots` and
+/// `kate_division` of `crate::utils::arithmetic`).
+///
+/// Measured on Apple M4 Max (16 cores), 2026-11-19, release build, 16
+/// threads, random polynomials, minimum of 30 calls (5 from `2^18`), load
+/// average 4 to 7 from other processes. Wall time (ms) of the stock
+/// function and of the one here, by length:
+///
+/// | length | `divide_by_roots`, 2 roots | 1 root      | `kate_division` |
+/// |--------|----------------------------|-------------|-----------------|
+/// | 2^13   | 0.25 / 0.37                | 0.19 / 0.33 | 0.15 / 0.36     |
+/// | 2^14   | 0.49 / 0.54                | 0.37 / 0.42 | 0.30 / 0.46     |
+/// | 2^15   | 0.99 / 0.58                | 0.75 / 0.52 | 0.61 / 0.53     |
+/// | 2^16   | 1.97 / 0.59                | 1.48 / 0.55 | 1.21 / 0.57     |
+/// | 2^20   | 31.8 / 4.39                | 23.9 / 3.32 | 19.5 / 3.22     |
+///
+/// The blocks are solved in parallel and joined by a scan, which costs
+/// about as much as the stock loop up to `2^14` (two blocks); from `2^15`
+/// the parallel division is faster. (The stock `kate_division` timed here
+/// is the bare division; the stock multi-open also evaluates the dividend
+/// and copies it, which [`kate_division`] does not need.)
+pub(crate) const PAR_MIN_LEN: usize = 1 << 15;
+
+/// Shorter inner products ([`poly_inner_product`]) are computed by the
+/// stock code.
+///
+/// Measured as [`PAR_MIN_LEN`], for the inner product of 5 polynomials, and
+/// of 4 groups of 6 polynomials computed at the same time (as the multi-open
+/// does for its point sets). Wall time (ms) of the stock helper and of the
+/// one here, by length:
+///
+/// | length | 5 polynomials | 4 groups of 6 |
+/// |--------|---------------|---------------|
+/// | 2^13   | 0.11 / 0.33   | 0.22 / 0.45   |
+/// | 2^15   | 0.28 / 0.40   | 0.71 / 0.89   |
+/// | 2^17   | 0.74 / 0.82   | 2.61 / 2.83   |
+/// | 2^18   | 1.40 / 1.41   | 5.33 / 5.76   |
+/// | 2^19   | 2.73 / 2.59   | 10.5 / 11.2   |
+/// | 2^20   | 4.86 / 4.54   | 20.5 / 21.7   |
+///
+/// The tasks here start from a vector of zeros built in parallel and are
+/// shorter than the stock helper's one chunk per thread; below `2^19` that
+/// costs more than it balances.
+pub(crate) const SUM_PAR_MIN_LEN: usize = 1 << 19;
 
 /// The evaluation of each `(polynomial, point)` of `jobs`, in order: the
 /// values of [`crate::utils::arithmetic::eval_polynomial`].
@@ -264,13 +306,17 @@ pub(crate) fn divide_by_roots<F: Field>(poly: &[F], roots: &[F]) -> Vec<F> {
 /// so `a` is divided as it is, without the copy that subtracting `c` makes.
 /// The same values as the stock `kate_division`, through
 /// [`divide_by_roots`] with the single root `b` (its recurrence is the one
-/// of `kate_division`: `q_k = a_{k+1} + b · q_{k+1}`).
+/// of `kate_division`: `q_k = a_{k+1} + b · q_{k+1}`); below
+/// [`PAR_MIN_LEN`], by the stock `kate_division` of `a` itself.
 ///
 /// # Panics
 ///
 /// If `a` is empty, as `kate_division`.
 pub(crate) fn kate_division<F: Field>(a: &[F], b: F) -> Vec<F> {
     assert!(!a.is_empty(), "kate_division of an empty polynomial");
+    if a.len() < PAR_MIN_LEN {
+        return crate::utils::arithmetic::kate_division(a, b);
+    }
     divide_by_roots(a, &[b])
 }
 
@@ -383,6 +429,9 @@ mod tests {
             vec![0],
             vec![3, 1],
             vec![SUM_CHUNK + 3, 7, 2 * SUM_CHUNK, 0, 40_000],
+            // around the floor of the multi-open's dispatch
+            vec![SUM_PAR_MIN_LEN - 1, 3],
+            vec![SUM_PAR_MIN_LEN, SUM_PAR_MIN_LEN - 5],
         ] {
             let polys: Vec<Polynomial<Fq, Coeff>> = lens
                 .iter()
@@ -452,6 +501,8 @@ mod tests {
             DIV_BLOCK,
             DIV_BLOCK + 2,
             3 * DIV_BLOCK + 17,
+            PAR_MIN_LEN - 1,
+            PAR_MIN_LEN,
             70_000,
         ];
         for roots in &root_sets {
@@ -493,6 +544,8 @@ mod tests {
             DIV_BLOCK,
             DIV_BLOCK + 1,
             2 * DIV_BLOCK + 9,
+            PAR_MIN_LEN - 1,
+            PAR_MIN_LEN,
             1 << 17,
         ] {
             let a = random_poly(&mut rng, n);

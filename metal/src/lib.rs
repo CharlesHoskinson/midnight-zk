@@ -104,9 +104,10 @@
 //! - `MIDNIGHT_METAL_MIN_K` (unset by default): one log2 size threshold for
 //!   every class, replacing the per-class defaults (see "Size thresholds").
 //! - `MIDNIGHT_METAL_MSM_CPU_SHARE=off`: run every G1 MSM on the device
-//!   only. By default a measured share of the points of an MSM of `2^14` or
-//!   more goes to the stock CPU MSM, which runs at the same time as the
-//!   device (see the `msm` module text, "The CPU share").
+//!   only. By default a measured share of the points of an MSM goes to the
+//!   stock CPU MSM, which runs at the same time as the device: from `2^17`
+//!   on a registered table, from `2^13` on the one-shot path (see the `msm`
+//!   module text, "The CPU share").
 //! - `MIDNIGHT_METAL_SHADER_SOURCE=1` (run time): compile the embedded source
 //!   instead of loading the embedded metallib. At build time it skips the
 //!   toolchain.
@@ -123,25 +124,61 @@
 //! | Class | Threshold (log2) | Measured |
 //! |---|---|---|
 //! | `fft`, `ifft` | 15 (`log_n`) | the device wins from `2^15`, loses at `2^14` |
-//! | `msm` on a registered SRS table | 14 (length) | wins from `2^14` |
-//! | `msm` without a table (one-shot) | 18 (length) | wins from `2^18` |
-//! | `quotient` | 14 (`ext_k`) | wins from `ext_k = 14` |
+//! | `msm` on a registered SRS table | 13 (size class of the length) | wins from `2^13` in a proof |
+//! | `msm` without a table (one-shot) | 18 (size class of the length) | wins from `2^18` |
+//! | `quotient` | 14 (`ext_k`) | wins from `ext_k = 14` in a proof |
 //!
 //! Measured on Apple M4 Max (40-core GPU, 128 GB), 2026-11-18, release
 //! builds, against the stock CPU code of `midnight-proofs` on the same
-//! machine. Other machines may break even elsewhere: set one threshold
-//! explicitly there. [`thresholds`] gives the effective values (for reports).
+//! machine; the table MSM and quotient rows again on 2026-11-19 inside
+//! proofs (below). Other machines may break even elsewhere: set one
+//! threshold explicitly there. [`thresholds`] gives the effective values
+//! (for reports).
+//!
+//! The size class of an MSM length is its log2 rounded to the nearest
+//! integer ([`msm_admission`]): the multi-open commits `n - 1`
+//! coefficients, which are in the class of `n`.
+//!
+//! An isolated kernel and the same kernel inside a proof do not break even
+//! at the same size. Between device calls of a proof the GPU idles for
+//! milliseconds while the CPU works, and an idle GPU runs the next command
+//! buffer at a lower clock: measured on 2026-11-19, a `2^14` MSM after 100
+//! ms of idle took 10.1 to 10.8 ms of GPU time for its first one or two
+//! calls and 3.4 to 3.9 ms from the next one, and a burst of short
+//! transforms did not raise the clock. A proof that sends the device only
+//! its quotient and a few MSMs runs them at the low clock; one that sends
+//! its dense commitments as well keeps the GPU busy enough to run at the
+//! high clock. The thresholds of the table MSM and of the quotient are
+//! therefore the result of whole proofs: the rc1 chain circuit
+//! (`gpu-prover/bench/rc1`) at `k = 13`, warm proofs, 8 to 12 per process,
+//! two to four processes per setting, the range of the minimum and of the
+//! median per process in ms (load average 3 to 7 from other processes):
+//!
+//! | stock CPU build | `msm_table` 14, `quotient` 14 | 14, 15 | 13, 15 | 13, 14 |
+//! |-----------------|------------|------------|------------|------------|
+//! | 41.3 to 42.1, 42.6 to 43.8 | 44.0, 45.0 to 47.3 | 39.9 to 40.1, 41.5 to 41.9 | 36.8 to 37.0, 37.9 to 40.1 | 33.6 to 34.4, 34.1 to 36.3 |
+//!
+//! (with the MSM need of the next paragraph and the device shares of the
+//! `msm` module). With `msm_table` 14 a `k = 13` proof sends the device its
+//! quotient alone, which runs at the low clock (7.4 to 8.2 ms against 4.5
+//! to 4.9 on the CPU); with 13 its dense commitments go first and the
+//! quotient after them wins. At `k = 14` these settings send the same calls
+//! (47.8 to 48.2, 49.4 to 49.5; the stock build 76.9 to 77.1, 77.7 to
+//! 79.1). `fft` and `ifft` at 13, 14 or 15 gave the same proof times within
+//! 1 ms at `k = 13` and `k = 14`; they stay at 15.
 //!
 //! An MSM is compared twice: by its length against its threshold, and by its
 //! effective size, the count of its non-zero scalars (1 when all are zero),
-//! against `max(2^msm_table, n/5)` on a registered table and
-//! `max(2^msm_one_shot, n/3)` otherwise (`n` the length). A mostly-zero MSM
+//! against `2^12 + n/5` on a registered table and `max(2^msm_one_shot,
+//! n/3)` otherwise (`n` the length). A mostly-zero MSM
 //! (a permutation product or quotient limb with a handful of non-zero
 //! coefficients) costs the masked device MSM as much as a dense one of its
 //! length, while the stock CPU MSM, whose time follows the sparsity,
 //! finishes in about a millisecond; the fractions are the measured
 //! crossovers on Apple M4 Max, 2026-11-19 (`n/5.3` and `n/2.9` on `2^20`
 //! points, with the CPU share of the split active; measured under load, see
+//! the `msm` module), and `2^12` is the part of the table path's crossover
+//! that does not grow with the length (measured at `2^13` to `2^15`, see
 //! the `msm` module). Below its need the MSM declines `below-min-k` before
 //! any device work. The count is not kept, logged, counted or returned: the
 //! ordinary `below-min-k` decline is the only observable. An explicit
@@ -228,6 +265,22 @@ pub type G1JacobianLimbs = [u64; 18];
 pub const MAX_LOG_N: u32 = 28;
 /// The largest log2 MSM length taken; a longer one declines (`shape`).
 pub const MAX_MSM_LOG: u32 = 28;
+
+/// log2 rounded to the nearest integer on the log scale: the floor of
+/// `log2(n sqrt 2)`. The size class of an MSM length: its admission (see
+/// "Size thresholds"), its window plan and its CPU share (the `msm`
+/// module) all go by it, so that a length just below a power of two (the
+/// `n - 1` coefficients of a multi-open quotient) is treated as that power.
+pub(crate) const fn lg2_nearest(n: usize) -> u32 {
+    // 181 / 128 = 1.4140625, just below sqrt 2
+    let mut m = ((n as u128 * 181) >> 7) as usize;
+    let mut r = 0;
+    while m > 1 {
+        m >>= 1;
+        r += 1;
+    }
+    r
+}
 
 /// The Metal device as its properties describe it.
 #[derive(Clone, Debug, PartialEq, Eq)]
@@ -357,7 +410,7 @@ impl Thresholds {
 pub const DEFAULT_THRESHOLDS: Thresholds = Thresholds {
     fft: 15,
     ifft: 15,
-    msm_table: 14,
+    msm_table: 13,
     msm_one_shot: 18,
     quotient: 14,
     explicit: false,
@@ -468,15 +521,16 @@ pub fn reset_stats() {
 }
 
 /// The admission of an MSM on its lengths: an empty input, unequal lengths
-/// or a length above `2^max_log` is `shape`; below `2^msm_table` of
-/// [`thresholds`] (the lower of the two MSM thresholds) is `below-min-k`.
-/// [`msm_g1`] also declines `below-min-k` below `2^msm_one_shot` when no
-/// registered table serves the bases.
+/// or a length above `2^max_log` is `shape`; a length whose size class (its
+/// log2 rounded to the nearest integer, so `2^k - 1` is in class `k`) is
+/// below `msm_table` of [`thresholds`] (the lower of the two MSM thresholds)
+/// is `below-min-k`. [`msm_g1`] also declines `below-min-k` below the class
+/// `msm_one_shot` when no registered table serves the bases.
 pub fn msm_admission(scalars: usize, bases: usize, max_log: u32) -> Result<(), &'static str> {
     if scalars == 0 || scalars != bases || scalars > (1usize << max_log.min(62)) {
         return Err(Reason::Shape.name());
     }
-    if scalars < (1usize << thresholds().msm_table.min(40)) {
+    if lg2_nearest(scalars) < thresholds().msm_table {
         return Err(Reason::BelowMinK.name());
     }
     Ok(())
@@ -485,12 +539,14 @@ pub fn msm_admission(scalars: usize, bases: usize, max_log: u32) -> Result<(), &
 /// G1 MSM `sum scalars[i] * bases[i]` (equal lengths): the hook
 /// `GpuHooks::msm_g1`. `None`: declined.
 ///
-/// An MSM on a registered SRS table ([`register_srs`]) is taken from
-/// `2^msm_table`, any other from `2^msm_one_shot` ([`thresholds`]); the
-/// shorter one-shot MSM declines `below-min-k` before any device work. The
-/// count of non-zero scalars (the effective size, 1 when all are zero) is
-/// held to the same threshold and, with the default thresholds, to `n/5`
-/// (table) or `n/3` (one-shot), with the same decline.
+/// An MSM on a registered SRS table ([`register_srs`]) is taken from the
+/// size class `msm_table`, any other from `msm_one_shot` ([`thresholds`],
+/// [`msm_admission`]); the shorter one-shot MSM declines `below-min-k`
+/// before any device work. The count of non-zero scalars (the effective
+/// size, 1 when all are zero) is held, with the default thresholds, to
+/// `2^12 + n/5` (table) or `max(2^msm_one_shot, n/3)`
+/// (one-shot), and with an explicit threshold to `2^min_k`, with the same
+/// decline.
 pub fn msm_g1(scalars: &[Scalar], bases: &[G1AffineLimbs]) -> Option<G1JacobianLimbs> {
     if let Err(why) = msm_admission(scalars.len(), bases.len(), MAX_MSM_LOG) {
         let r = if why == Reason::Shape.name() {
@@ -501,12 +557,11 @@ pub fn msm_g1(scalars: &[Scalar], bases: &[G1AffineLimbs]) -> Option<G1JacobianL
         account::decline(Class::Msm, r);
         return None;
     }
-    let one_shot_min = 1usize << thresholds().msm_one_shot.min(40);
     #[cfg(target_os = "macos")]
     let tabled = msm::has_table(bases);
     #[cfg(not(target_os = "macos"))]
     let tabled = false;
-    if scalars.len() < one_shot_min && !tabled {
+    if lg2_nearest(scalars.len()) < thresholds().msm_one_shot && !tabled {
         account::decline(Class::Msm, Reason::BelowMinK);
         return None;
     }

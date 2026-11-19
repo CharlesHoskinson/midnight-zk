@@ -38,7 +38,7 @@
 //! millisecond. [`crate::msm_g1`] checks it (with
 //! [`effective_size_reaches`]) after the length admission and before any
 //! device work, against the need of the path the call would take
-//! ([`effective_need`]): `max(2^msm_table, n/5)` with a registered table,
+//! ([`effective_need`]): `2^12 + n/5` with a registered table,
 //! else `max(2^msm_one_shot, n/3)`, the measured crossovers of the stock CPU
 //! MSM on sparse inputs ([`SPARSE_TABLE_DIV`]); below it, the call declines
 //! `below-min-k`, the ordinary reason of a short MSM. The count itself is
@@ -184,6 +184,7 @@ use crate::{
     G1AffineLimbs, G1JacobianLimbs, Scalar,
     account::{self, Class, Reason},
     ctx::{self, Arg, Buffer, Command, Ctx, Error, Session},
+    lg2_nearest,
 };
 
 /// Bits of a scalar (sppark `scalar_t::bit_length()`).
@@ -301,13 +302,21 @@ const fn lg2(mut n: usize) -> u32 {
 /// (*) At 2^21.81 (the device share of 2^22) the two rounds disagreed
 /// (16: 243.1 then 307.8; 17: 269.6 once); the 2^22 entry, 16, applies.
 ///
-/// Outside the table: below `2^14` the `2^14` entry; from `2^23` the
+/// 2^13 (taken on a registered table with the default thresholds since the
+/// table threshold became 13, see the crate text): measured on 2026-11-19 on
+/// the table path, warm device, `wbits` 10 to 12 with the device shares 64,
+/// 56 and 48, minimum of 15 calls (load average 4 to 6 from other
+/// processes). `wbits` 11 was the best at every share (device only: 2.80
+/// ms; 10: 4.56; 12: 2.98), as at 2^14.
+///
+/// Outside the table: below `2^13` the `2^13` entry; from `2^23` the
 /// `2^22` entry, where the command-buffer bound makes every chunk at most
 /// `CHUNK_ADDS / nwins` points, the chunk size measured at `2^22`. A length
 /// that is not a power of two takes the entry of its nearest log2 (on the
 /// log scale), so that the device share of a split MSM, 81% to 84% of a
 /// power of two, takes that power's entry.
-const MEASURED: [(u32, u32, usize); 9] = [
+const MEASURED: [(u32, u32, usize); 10] = [
+    (13, 11, 1),
     (14, 11, 1),
     (15, 11, 1),
     (16, 13, 1),
@@ -325,13 +334,6 @@ fn measured(n: usize) -> (u32, usize) {
     let k = lg2_nearest(n).clamp(lo, hi);
     let e = MEASURED[(k - lo) as usize];
     (e.1, e.2)
-}
-
-/// log2 rounded to the nearest integer on the log scale: the floor of
-/// `log2(n sqrt 2)`.
-const fn lg2_nearest(n: usize) -> u32 {
-    // 181 / 128 = 1.4140625, just below sqrt 2
-    lg2(((n as u128 * 181) >> 7) as usize)
 }
 
 fn plan(n: usize) -> Plan {
@@ -541,8 +543,10 @@ fn table_for(
 
 /// The non-zero scalars an MSM of `n` scalars needs for the device, under
 /// the log2 threshold `k` of its path (`table`: a registered table serves
-/// it). With the default thresholds, `max(2^k, n / SPARSE_TABLE_DIV)` on the
-/// table path and `max(2^k, n / SPARSE_ONE_SHOT_DIV)` on the one-shot path;
+/// it). With the default thresholds, `SPARSE_TABLE_FIXED + n /
+/// SPARSE_TABLE_DIV` on the table path (`k` is not used: the length
+/// admission has applied it) and `max(2^k, n / SPARSE_ONE_SHOT_DIV)` on the
+/// one-shot path;
 /// with an explicit threshold (`explicit`, [`crate::set_min_k`] or
 /// `MIDNIGHT_METAL_MIN_K`), `2^k` alone.
 pub(crate) fn effective_need(n: usize, k: u32, table: bool, explicit: bool) -> usize {
@@ -550,18 +554,17 @@ pub(crate) fn effective_need(n: usize, k: u32, table: bool, explicit: bool) -> u
     if explicit {
         return min;
     }
-    let div = if table {
-        SPARSE_TABLE_DIV
+    if table {
+        SPARSE_TABLE_FIXED + n / SPARSE_TABLE_DIV
     } else {
-        SPARSE_ONE_SHOT_DIV
-    };
-    min.max(n / div)
+        min.max(n / SPARSE_ONE_SHOT_DIV)
+    }
 }
 
 /// The sparse crossovers: the device takes an MSM of `n` scalars only from
-/// `n / SPARSE_TABLE_DIV` non-zero scalars on the table path and from
-/// `n / SPARSE_ONE_SHOT_DIV` on the one-shot path (with the default
-/// thresholds).
+/// `SPARSE_TABLE_FIXED + n / SPARSE_TABLE_DIV` non-zero scalars on the
+/// table path and from `max(2^msm_one_shot, n / SPARSE_ONE_SHOT_DIV)` on
+/// the one-shot path (with the default thresholds).
 ///
 /// The device MSM costs the same for any number of non-zero scalars of a
 /// given length (the masked scalars are dense), while the stock CPU MSM
@@ -587,8 +590,37 @@ pub(crate) fn effective_need(n: usize, k: u32, table: bool, explicit: bool) -> u
 /// path's at about `n/2.9`: hence `n/5` and `n/3`. (Before the split, on a
 /// busier machine, the crossovers were about `n/3.4` and `n/1.5`; the
 /// device-only figures are in the report of that measurement, not here.)
-/// The fractions are a function of the length only, never of the values.
+///
+/// Near the table threshold the device's fixed cost (the host collection,
+/// the command buffer) is a larger part of its time, and the crossover is a
+/// larger fraction of `n`. Measured on Apple M4 Max, 2026-11-19, release
+/// build, warm device, the table path (device shares of that time: 56/64 at
+/// `2^14` and `2^15`, device only at `2^13`), on random points with the
+/// scalars at every index `i` with `i mod d >= m` zero (`m/d` of them
+/// non-zero), minimum of 9 calls (load average 4 to 7 from other
+/// processes). Wall time per call (ms):
+///
+/// | n    | device | CPU: n | 3n/4 | n/2 | 3n/8 | n/4 | crossover |
+/// |------|--------|------|------|------|------|------|-----------|
+/// | 2^13 | 2.8    | 3.4  | 2.6  | 1.9  | 1.6  | 1.3  | ~0.80 n   |
+/// | 2^14 | 3.5    | 6.4  | 5.6  | 3.9  | 2.9  | 2.2  | ~0.45 n   |
+/// | 2^15 | 5.2    | 12.2 | 9.7  | 7.8  | 5.4  | 3.7  | ~0.36 n   |
+///
+/// With `n/5` for the part that grows with the length, the rest is about
+/// 4000 to 5300 non-zero scalars at the three sizes: the need on the table
+/// path is `2^12 + n/5` ([`SPARSE_TABLE_FIXED`]; 0.70 n, 0.45 n, 0.33 n and
+/// 0.20 n at `2^13`, `2^14`, `2^15` and `2^20`; at `2^13` an MSM with 70% to
+/// 80% non-zero scalars goes to the device and is up to about 0.3 ms
+/// slower there). A dense MSM at the table threshold (a column with a few
+/// zero rows before its blinding rows) is taken; it was declined while the
+/// need was `max(2^msm_table, n/5)`, which asks every scalar of a
+/// `2^msm_table` MSM to be non-zero.
+///
+/// The need is a function of the length only, never of the values.
 pub(crate) const SPARSE_TABLE_DIV: usize = 5;
+/// See [`SPARSE_TABLE_DIV`]: the part of the table path's need that does not
+/// grow with the length, in non-zero scalars.
+pub(crate) const SPARSE_TABLE_FIXED: usize = 1 << 12;
 /// See [`SPARSE_TABLE_DIV`].
 pub(crate) const SPARSE_ONE_SHOT_DIV: usize = 3;
 
@@ -837,8 +869,9 @@ const SHARE_DEN: usize = 64;
 ///
 /// | n    | table: device only | best share (runs) | taken | one-shot: device only | best share | taken |
 /// |------|-----------|-------------------------------|----|-------|----------|----|
-/// | 2^14 | 5.7, 6.8  | 48: 6.5; 58 or 50: 5.2        | 56 | 11.0  | 40: 9.1  | 40 |
-/// | 2^15 | 6.8, 7.1  | 56: 6.2; 50: 6.1              | 56 | 20.9  | 40: 13.9 | 40 |
+/// | 2^13 | 3.6, 2.7  | 48: 2.42; 48: 2.41            | 64*| 5.5, 5.4 | 40: 4.7; 40: 4.9 | 40 |
+/// | 2^14 | 5.7, 6.8  | 48: 6.5; 58 or 50: 5.2        | 64*| 11.0  | 40: 9.1  | 40 |
+/// | 2^15 | 6.8, 7.1  | 56: 6.2; 50: 6.1              | 64*| 20.9  | 40: 13.9 | 40 |
 /// | 2^16 | 9.0, 8.5  | 64; 64 (58: 8.6)              | 64 | 21.8  | 48: 17.8 | 48 |
 /// | 2^17 | 14.0, 13.4| 58: 13.2; 52: 11.3; 54: 11.5  | 54 | 25.8  | 52: 22.3 | 52 |
 /// | 2^18 | 24.2, 31.3| 56: 21.9; 50: 25.7           | 54 | 45.1  | 40: 35.4 | 40 |
@@ -847,17 +880,39 @@ const SHARE_DEN: usize = 64;
 /// | 2^21 | 139.6, 161| 52: 131.9; 52: 134.5        | 52 | 287.5 | 48: 232.0| 48 |
 /// | 2^22 | 314, 311  | 54: 237.4; 52: 266.7         | 52 | 558.7 | 44: 412.1| 44 |
 ///
-/// The stock CPU MSM alone took 9.3, 15.4, 25.5, 39.2, 78, 144, 288, 586 and
-/// 1175 ms (best of the runs). At 2^14 and 2^15 the one-shot optimum is at
-/// the end of the swept range (40); the one-shot path is taken there only
-/// with an explicit threshold.
+/// The 2^13 row was measured on 2026-11-19 (warm device, shares 64, 56, 48,
+/// 40 and 32 on both paths, two rounds of 15 calls each, minimum per round,
+/// load average 4 to 6 from other processes); the stock CPU MSM took 3.4 ms.
 ///
-/// Outside the table: below `2^14` (reached only with an explicit
+/// The stock CPU MSM alone took 9.3, 15.4, 25.5, 39.2, 78, 144, 288, 586 and
+/// 1175 ms (best of the runs, 2^14 to 2^22). At 2^13 to 2^15 the one-shot
+/// optimum is at or near the end of the swept range (40); the one-shot path
+/// is taken there only with an explicit threshold.
+///
+/// (*) Inside a proof the share does not pay at `2^13` to `2^15`: the CPU
+/// share of the 8 MSMs of a proof keeps all CPU threads busy at every call,
+/// and over successive proofs the GPU time of the same device share grows
+/// (at `2^14` from 2.3 ms to 5 to 7 ms within 8 to 16 proofs, the proof
+/// from 47 ms to 60 to 98 ms), while with the device alone it stays put.
+/// Measured on 2026-11-19 with the rc1 chain circuit (`gpu-prover/bench/rc1`),
+/// 16 warm proofs per process at `k = 14` and 6 at `k = 15` (load average 5
+/// to 7 from other processes), proof time in ms: `k = 14`, share 56: 51.5
+/// to 93.8, device only: 48.1 to 55.6 (median 49.2); `k = 15`, share 56:
+/// 80.7 to 93.6, device only: 69.4 to 75.1. At `2^16` the table entry is
+/// already 64; at `k = 18` and `k = 20` the shares of `2^18` and `2^20`
+/// still pay inside the proof (`k = 18`: 261 to 279 ms with the share, 284
+/// to 288 without; `k = 20`: 907 against 1000 to 1017). At `k = 13`, with
+/// the table threshold at 13, a share of 48 gave 54.7 to 65.8 ms per proof
+/// (8 proofs per process, two processes) and the device alone 33.6 to 36.3
+/// ms (12 proofs per process, two processes).
+///
+/// Outside the table: below `2^13` (reached only with an explicit
 /// threshold) device only; from `2^23` the `2^22` shares. A length that is
 /// not a power of two takes the entry of its nearest log2, as the plan does.
-const MEASURED_SHARE: [(u32, usize, usize); 9] = [
-    (14, 56, 40),
-    (15, 56, 40),
+const MEASURED_SHARE: [(u32, usize, usize); 10] = [
+    (13, 64, 40),
+    (14, 64, 40),
+    (15, 64, 40),
     (16, 64, 48),
     (17, 54, 52),
     (18, 54, 40),
@@ -1572,6 +1627,7 @@ mod tests {
     fn plan_follows_measured_table() {
         // (log2 n, wbits, nwins, chunks after the command-buffer bound)
         for (k, wbits, nwins, batch) in [
+            (13, 11, 24, 1),
             (14, 11, 24, 1),
             (15, 11, 24, 1),
             (16, 13, 20, 1),
@@ -1626,7 +1682,9 @@ mod tests {
             assert_eq!(device_share(n, false), n * o / SHARE_DEN, "2^{k}");
         }
         assert_eq!(device_share(1000, true), 1000);
-        assert_eq!(device_share(1 << 13, false), 1 << 13);
+        assert_eq!(device_share(1 << 12, false), 1 << 12);
+        // a length just below a power of two takes that power's share
+        assert_eq!(device_share((1 << 20) - 1, true), ((1 << 20) - 1) * 52 / 64);
         assert_eq!(device_share(1 << 24, true), (1 << 24) * 52 / 64);
     }
 }
