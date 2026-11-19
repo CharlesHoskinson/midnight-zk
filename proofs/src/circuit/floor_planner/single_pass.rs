@@ -360,7 +360,8 @@ impl<'a, F: Field, CS: Assignment<F> + 'a + SyncDeps> SingleChipLayouter<'a, F, 
     ///
     /// Checking: the region is placed at the start of the expected layout
     /// at its index and assigned once, measured as the shape pass measures
-    /// (the same `RegionShape` sees the same calls). The region must have
+    /// ([`RegionMeasure`] records what `RegionShape` records from the same
+    /// calls). The region must have
     /// the expected columns, row count and number of constants, and the
     /// start the stock shape pass computes from the regions before it (the
     /// first free rows of `self.columns`, kept as that pass keeps them) must
@@ -441,7 +442,7 @@ impl<'a, F: Field, CS: Assignment<F> + 'a + SyncDeps> SingleChipLayouter<'a, F, 
                     self.assign_measured(region_index, name, &mut assignment)?;
 
                 state.regions += 1;
-                if measured.row_count != shape.row_count || measured.columns != shape.columns {
+                if measured.row_count != shape.row_count || !measured.has_columns(&shape.columns) {
                     state.mismatch = true;
                 }
                 let mut columns: Vec<RegionColumn> = shape.columns.iter().copied().collect();
@@ -508,13 +509,13 @@ impl<'a, F: Field, CS: Assignment<F> + 'a + SyncDeps> SingleChipLayouter<'a, F, 
         let mut region = SingleChipLayouterRegion::new(self, region_index.into());
         let mut measuring = Measuring {
             inner: &mut region,
-            shape: RegionShape::new(region_index.into()),
+            measure: RegionMeasure::default(),
         };
         let result = {
             let region: &mut dyn RegionLayouter<F> = &mut measuring;
             assignment(region.into())
         };
-        let measured = measuring.shape;
+        let measured = measuring.measure;
         let result = result?;
         let constants_to_assign = region.constants;
         self.cs.exit_region();
@@ -525,7 +526,7 @@ impl<'a, F: Field, CS: Assignment<F> + 'a + SyncDeps> SingleChipLayouter<'a, F, 
 /// With the feature `prover-par`: the result of the closure of a region, the
 /// shape of its assignment, and the constants it assigns.
 #[cfg(feature = "prover-par")]
-type MeasuredAssignment<F, AR> = (AR, RegionShape, Vec<(Rational<F>, Cell)>);
+type MeasuredAssignment<F, AR> = (AR, RegionMeasure, Vec<(Rational<F>, Cell)>);
 
 /// With the feature `prover-par`: whether `region` of `layout` has the
 /// columns, the row count and the number of constants of the assignment
@@ -534,7 +535,7 @@ type MeasuredAssignment<F, AR> = (AR, RegionShape, Vec<(Rational<F>, Cell)>);
 fn region_matches(
     layout: &MeasuredLayout,
     region: &MeasuredRegion,
-    measured: &RegionShape,
+    measured: &RegionMeasure,
     constants: usize,
 ) -> bool {
     let Some(columns) = layout.column_sets.get(region.columns) else {
@@ -542,38 +543,124 @@ fn region_matches(
     };
     region.row_count == measured.row_count
         && region.constants == constants
-        && columns.len() == measured.columns.len()
-        && columns.iter().all(|c| measured.columns.contains(c))
+        && measured.has_columns(columns)
+}
+
+/// With the feature `prover-par`: the columns and the row count of a
+/// region's assignment, as `RegionShape` records them from the same calls,
+/// with constant work per call: a column is looked up in a bitset by its
+/// kind and index instead of being hashed into a set (a region of a large
+/// circuit makes millions of calls).
+#[cfg(feature = "prover-par")]
+#[derive(Debug, Default)]
+struct RegionMeasure {
+    /// One bit per column index below [`RegionMeasure::BITSET_COLUMNS`], per
+    /// kind ([`RegionMeasure::key`]): whether `columns` holds that column.
+    seen: [Vec<u64>; 5],
+    /// The distinct columns touched, in the order of their first call.
+    columns: Vec<RegionColumn>,
+    /// One past the largest row offset touched.
+    row_count: usize,
+}
+
+#[cfg(feature = "prover-par")]
+impl RegionMeasure {
+    /// Column indices from this one on are looked up in `columns` instead
+    /// of a bitset, so a sparse large index never allocates a large bitset.
+    const BITSET_COLUMNS: usize = 1 << 16;
+
+    /// The kind (the column type, or a simple or complex selector) and the
+    /// index of `column`: two columns are equal exactly when both are.
+    fn key(column: &RegionColumn) -> (usize, usize) {
+        match column {
+            RegionColumn::Column(c) => {
+                let kind = match c.column_type() {
+                    Any::Advice => 0,
+                    Any::Fixed => 1,
+                    Any::Instance => 2,
+                };
+                (kind, c.index())
+            }
+            RegionColumn::Selector(s) => (if s.is_simple() { 3 } else { 4 }, s.index()),
+        }
+    }
+
+    /// Records a call of the region on `column` at row `offset`.
+    #[inline]
+    fn touch(&mut self, column: RegionColumn, offset: usize) {
+        self.row_count = cmp::max(self.row_count, offset + 1);
+        let (kind, index) = Self::key(&column);
+        if index >= Self::BITSET_COLUMNS {
+            if !self.columns.contains(&column) {
+                self.columns.push(column);
+            }
+            return;
+        }
+        let (word, bit) = (index / 64, 1u64 << (index % 64));
+        let seen = &mut self.seen[kind];
+        if seen.len() <= word {
+            seen.resize(word + 1, 0);
+        }
+        if seen[word] & bit == 0 {
+            seen[word] |= bit;
+            self.columns.push(column);
+        }
+    }
+
+    /// Whether the region touched `column`.
+    fn contains(&self, column: &RegionColumn) -> bool {
+        let (kind, index) = Self::key(column);
+        if index >= Self::BITSET_COLUMNS {
+            return self.columns.contains(column);
+        }
+        self.seen[kind].get(index / 64).is_some_and(|w| w & (1u64 << (index % 64)) != 0)
+    }
+
+    /// Whether the region touched exactly the distinct columns `columns`.
+    fn has_columns<'c>(&self, columns: impl IntoIterator<Item = &'c RegionColumn>) -> bool {
+        let mut count = 0;
+        for column in columns {
+            if !self.contains(column) {
+                return false;
+            }
+            count += 1;
+        }
+        count == self.columns.len()
+    }
 }
 
 /// With the feature `prover-par`: a region that forwards every call to
-/// `inner` and also passes it to `shape`, which records the columns and the
-/// row count as in the shape pass.
+/// `inner` and also records it in `measure`, which takes the columns and the
+/// row count as the shape pass does. `inner` is the concrete region, so the
+/// forwarded calls are direct calls.
 #[cfg(feature = "prover-par")]
-struct Measuring<'r, F: Field> {
-    inner: &'r mut dyn RegionLayouter<F>,
-    shape: RegionShape,
+struct Measuring<'r, R> {
+    inner: &'r mut R,
+    measure: RegionMeasure,
 }
 
 #[cfg(feature = "prover-par")]
-impl<F: Field> fmt::Debug for Measuring<'_, F> {
+impl<R: fmt::Debug> fmt::Debug for Measuring<'_, R> {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         f.debug_struct("Measuring")
             .field("inner", &self.inner)
-            .field("shape", &self.shape)
+            .field("measure", &self.measure)
             .finish()
     }
 }
 
+/// The calls `RegionShape` records: a selector, an advice column (also when
+/// assigned from a constant or an instance) or a fixed column, at an offset.
+/// Naming a column, reading an instance and the constraints add nothing.
 #[cfg(feature = "prover-par")]
-impl<F: Field> RegionLayouter<F> for Measuring<'_, F> {
+impl<F: Field, R: RegionLayouter<F>> RegionLayouter<F> for Measuring<'_, R> {
     fn enable_selector<'v>(
         &'v mut self,
         annotation: &'v (dyn Fn() -> String + 'v),
         selector: &Selector,
         offset: usize,
     ) -> Result<(), Error> {
-        RegionLayouter::<F>::enable_selector(&mut self.shape, annotation, selector, offset)?;
+        self.measure.touch((*selector).into(), offset);
         self.inner.enable_selector(annotation, selector, offset)
     }
 
@@ -582,7 +669,6 @@ impl<F: Field> RegionLayouter<F> for Measuring<'_, F> {
         annotation: &'v (dyn Fn() -> String + 'v),
         column: Column<Any>,
     ) {
-        RegionLayouter::<F>::name_column(&mut self.shape, annotation, column);
         self.inner.name_column(annotation, column)
     }
 
@@ -593,13 +679,7 @@ impl<F: Field> RegionLayouter<F> for Measuring<'_, F> {
         offset: usize,
         to: &'v mut (dyn FnMut() -> Value<Rational<F>> + 'v),
     ) -> Result<Cell, Error> {
-        RegionLayouter::<F>::assign_advice(
-            &mut self.shape,
-            annotation,
-            column,
-            offset,
-            &mut Value::unknown,
-        )?;
+        self.measure.touch(Column::<Any>::from(column).into(), offset);
         self.inner.assign_advice(annotation, column, offset, to)
     }
 
@@ -610,13 +690,7 @@ impl<F: Field> RegionLayouter<F> for Measuring<'_, F> {
         offset: usize,
         constant: Rational<F>,
     ) -> Result<Cell, Error> {
-        RegionLayouter::<F>::assign_advice_from_constant(
-            &mut self.shape,
-            annotation,
-            column,
-            offset,
-            constant,
-        )?;
+        self.measure.touch(Column::<Any>::from(column).into(), offset);
         self.inner.assign_advice_from_constant(annotation, column, offset, constant)
     }
 
@@ -628,14 +702,7 @@ impl<F: Field> RegionLayouter<F> for Measuring<'_, F> {
         advice: Column<Advice>,
         offset: usize,
     ) -> Result<(Cell, Value<F>), Error> {
-        RegionLayouter::<F>::assign_advice_from_instance(
-            &mut self.shape,
-            annotation,
-            instance,
-            row,
-            advice,
-            offset,
-        )?;
+        self.measure.touch(Column::<Any>::from(advice).into(), offset);
         self.inner
             .assign_advice_from_instance(annotation, instance, row, advice, offset)
     }
@@ -655,23 +722,15 @@ impl<F: Field> RegionLayouter<F> for Measuring<'_, F> {
         offset: usize,
         to: &'v mut (dyn FnMut() -> Value<Rational<F>> + 'v),
     ) -> Result<Cell, Error> {
-        RegionLayouter::<F>::assign_fixed(
-            &mut self.shape,
-            annotation,
-            column,
-            offset,
-            &mut Value::unknown,
-        )?;
+        self.measure.touch(Column::<Any>::from(column).into(), offset);
         self.inner.assign_fixed(annotation, column, offset, to)
     }
 
     fn constrain_constant(&mut self, cell: Cell, constant: Rational<F>) -> Result<(), Error> {
-        RegionLayouter::<F>::constrain_constant(&mut self.shape, cell, constant)?;
         self.inner.constrain_constant(cell, constant)
     }
 
     fn constrain_equal(&mut self, left: Cell, right: Cell) -> Result<(), Error> {
-        RegionLayouter::<F>::constrain_equal(&mut self.shape, left, right)?;
         self.inner.constrain_equal(left, right)
     }
 }
@@ -1262,5 +1321,68 @@ mod tests {
         )
         .unwrap();
         assert!(measured.is_none());
+    }
+
+    /// The measure of a region's calls has the columns and the row count
+    /// that `RegionShape` records from the same calls: column indices in and
+    /// past the first word of a bitset, both kinds of selector, the advice
+    /// column of an assignment from an instance or a constant, an index past
+    /// the bitsets, and calls that record nothing.
+    #[cfg(feature = "prover-par")]
+    #[test]
+    fn region_measure_matches_region_shape() {
+        use crate::circuit::layouter::{RegionColumn, RegionLayouter, RegionShape};
+
+        let mut cs = crate::plonk::ConstraintSystem::<Fq>::default();
+        let advice: Vec<Column<Advice>> = (0..70).map(|_| cs.advice_column()).collect();
+        let fixed: Vec<Column<Fixed>> = (0..66).map(|_| cs.fixed_column()).collect();
+        let instance = cs.instance_column();
+        let simple = cs.selector();
+        let complex = cs.complex_selector();
+        let far = Column::new(1 << 17, Fixed);
+
+        let calls = |region: &mut dyn RegionLayouter<Fq>| -> Result<(), Error> {
+            let name = &|| String::new();
+            region.enable_selector(name, &simple, 3)?;
+            region.enable_selector(name, &complex, 1)?;
+            for (row, column) in [(0, 0), (5, 69), (2, 64), (9, 0), (4, 63)] {
+                region.assign_advice(name, advice[column], row, &mut || {
+                    Value::known(Fq::ONE.into())
+                })?;
+            }
+            region.assign_advice_from_constant(name, advice[7], 11, Fq::ONE.into())?;
+            region.assign_advice_from_instance(name, instance, 0, advice[8], 6)?;
+            region.assign_fixed(name, fixed[65], 2, &mut || Value::known(Fq::ONE.into()))?;
+            region.assign_fixed(name, far, 12, &mut || Value::known(Fq::ONE.into()))?;
+            region.assign_fixed(name, far, 1, &mut || Value::known(Fq::ONE.into()))?;
+            region.name_column(name, advice[30].into());
+            let cell =
+                region.assign_advice(name, advice[0], 1, &mut || Value::known(Fq::ONE.into()))?;
+            region.constrain_equal(cell, cell)?;
+            Ok(())
+        };
+
+        let mut shape = RegionShape::new(0.into());
+        calls(&mut shape).unwrap();
+        let mut inner = RegionShape::new(0.into());
+        let mut measuring = super::Measuring {
+            inner: &mut inner,
+            measure: super::RegionMeasure::default(),
+        };
+        calls(&mut measuring).unwrap();
+        let measure = measuring.measure;
+
+        assert_eq!(shape.row_count(), 13);
+        assert_eq!(measure.row_count, shape.row_count());
+        assert_eq!(measure.columns.len(), shape.columns().len());
+        assert!(measure.has_columns(shape.columns()));
+        let mut fewer: Vec<RegionColumn> = shape.columns().iter().copied().collect();
+        let dropped = fewer.pop().unwrap();
+        assert!(!measure.has_columns(&fewer));
+        fewer.push(Column::<Any>::from(advice[30]).into());
+        assert!(!measure.has_columns(&fewer));
+        fewer.pop();
+        fewer.push(dropped);
+        assert!(measure.has_columns(&fewer));
     }
 }
