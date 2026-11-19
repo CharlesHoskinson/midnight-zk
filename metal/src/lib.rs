@@ -289,8 +289,10 @@ mod ntt;
 #[cfg(target_os = "macos")]
 mod quotient;
 
-/// The MSM's measurement entry (feature `test-support`; not a stable
-/// interface, not for secret scalars).
+/// The MSM's test entry, which reports the path and the plan an MSM took
+/// (public facts only), and the count of the one-shot path's per-call G1
+/// checks (feature `test-support`; not a stable interface, not for secret
+/// scalars).
 #[cfg(all(target_os = "macos", any(test, feature = "test-support")))]
 #[doc(hidden)]
 pub use msm::{MsmStages, msm_g1_stages, one_shot_g1_checks};
@@ -703,18 +705,35 @@ fn one_shot_admission(len: usize, t: &Thresholds) -> Result<u32, Reason> {
 /// this does not run. A figure that does not depend on the scalar values,
 /// for a caller that must not report one that does. It does not look at the
 /// device ([`device`]).
+///
+/// A caller that also runs the MSM calls [`msm_g1_sized`] instead, which
+/// gives this figure from the lookup and comparison of the MSM itself.
 pub fn msm_sized(len: usize, bases: &[G1AffineLimbs]) -> bool {
-    if length_admission(len, bases.len(), MAX_MSM_LOG).is_err() {
-        return false;
-    }
+    length_admission(len, bases.len(), MAX_MSM_LOG).is_ok() && sized_by_bases(len, bases)
+}
+
+/// [`msm_sized`] of a length that passed [`length_admission`].
+fn sized_by_bases(len: usize, bases: &[G1AffineLimbs]) -> bool {
     #[cfg(target_os = "macos")]
-    match msm::lookup(bases, len) {
-        msm::Lookup::Table(_) => true,
-        msm::Lookup::NotInG1 => false,
-        msm::Lookup::Unregistered => one_shot_admission(len, &thresholds()).is_ok(),
+    {
+        sized_by_lookup(&msm::lookup(bases, len), len, &thresholds())
     }
     #[cfg(not(target_os = "macos"))]
-    one_shot_admission(len, &thresholds()).is_ok()
+    {
+        let _ = bases;
+        one_shot_admission(len, &thresholds()).is_ok()
+    }
+}
+
+/// [`msm_sized`] of a length that passed [`length_admission`], from the
+/// lookup of its bases.
+#[cfg(target_os = "macos")]
+fn sized_by_lookup(lookup: &msm::Lookup, len: usize, t: &Thresholds) -> bool {
+    match lookup {
+        msm::Lookup::Table(_) => true,
+        msm::Lookup::NotInG1 => false,
+        msm::Lookup::Unregistered => one_shot_admission(len, t).is_ok(),
+    }
 }
 
 /// G1 MSM `sum scalars[i] * bases[i]` (equal lengths): the hook
@@ -736,15 +755,43 @@ pub fn msm_sized(len: usize, bases: &[G1AffineLimbs]) -> bool {
 /// the effective size and the reduction of the scalars; then, on the
 /// one-shot path only, the G1 check of every base.
 pub fn msm_g1(scalars: &[Scalar], bases: &[G1AffineLimbs]) -> Option<G1JacobianLimbs> {
-    guarded(Class::Msm, None, || msm_g1_body(scalars, bases))
+    guarded(Class::Msm, None, || msm_g1_body(scalars, bases, None))
 }
 
-fn msm_g1_body(scalars: &[Scalar], bases: &[G1AffineLimbs]) -> Option<G1JacobianLimbs> {
+/// [`msm_g1`], together with [`msm_sized`] of the same call: `(sized,
+/// result)`. Both come from one registry lookup and one identity comparison
+/// of every point, made within this call, so the bases are compared once
+/// per MSM instead of once for each entry. `sized` is decided from the
+/// length and the bases before any scalar is read, as [`msm_sized`] decides
+/// it, whether the MSM is then served or declined (a panic in the MSM
+/// leaves it as decided).
+pub fn msm_g1_sized(
+    scalars: &[Scalar],
+    bases: &[G1AffineLimbs],
+) -> (bool, Option<G1JacobianLimbs>) {
+    let mut sized = false;
+    let r = guarded(Class::Msm, None, || {
+        msm_g1_body(scalars, bases, Some(&mut sized))
+    });
+    (sized, r)
+}
+
+/// The body of [`msm_g1`]; with `sized`, also stores there [`msm_sized`] of
+/// the call ([`msm_g1_sized`]).
+fn msm_g1_body(
+    scalars: &[Scalar],
+    bases: &[G1AffineLimbs],
+    sized: Option<&mut bool>,
+) -> Option<G1JacobianLimbs> {
     if let Err(r) = length_admission(scalars.len(), bases.len(), MAX_MSM_LOG) {
         account::decline(Class::Msm, r);
         return None;
     }
     if !device() {
+        // `msm_sized` does not look at the device
+        if let Some(s) = sized {
+            *s = sized_by_bases(scalars.len(), bases);
+        }
         account::decline(Class::Msm, Reason::NoDevice);
         return None;
     }
@@ -755,7 +802,11 @@ fn msm_g1_body(scalars: &[Scalar], bases: &[G1AffineLimbs]) -> Option<G1Jacobian
         // the path, from public facts only (the registry and the points),
         // before any scalar is read: a table that serves the bases, or the
         // one-shot path when an explicit threshold opens it
-        let (table, need) = match msm::lookup(bases, n) {
+        let lookup = msm::lookup(bases, n);
+        if let Some(s) = sized {
+            *s = sized_by_lookup(&lookup, n, &t);
+        }
+        let (table, need) = match lookup {
             msm::Lookup::Table(tb) => (
                 Some(tb),
                 msm::effective_need(n, t.msm_table, true, t.explicit),

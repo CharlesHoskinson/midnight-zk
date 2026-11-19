@@ -976,6 +976,49 @@ fn stale_table_declines_by_default_and_one_shot_when_explicit() {
     drop(h);
 }
 
+/// `msm_g1_sized` gives `msm_sized` of the call with the result of `msm_g1`,
+/// from one lookup: on bases never registered (not sized, declined), on a
+/// registered table (sized, the stock value), on a table changed at one
+/// point (not sized, declined, the table dropped once) and with unequal
+/// lengths (not sized, `shape`).
+#[test]
+fn msm_g1_sized_reports_both_entries() {
+    let _g = setup(None, true);
+    if defaults_overridden() {
+        return;
+    }
+    let n = 1usize << 15;
+    let s = random_scalars(n, 4721);
+    let call = |s: &[Fq], b: &[G1Affine]| {
+        midnight_metal::reset_stats();
+        midnight_metal::msm_g1_sized(adapter::scalars(s), adapter::affine(b))
+    };
+    let mut bases = points_cache()[..n].to_vec();
+
+    let (sized_call, r) = call(&s, &bases);
+    assert!(!sized_call && !sized(&bases) && r.is_none());
+    assert_eq!(midnight_metal::declines(), vec![("msm", UNREGISTERED, 1)]);
+
+    let h = midnight_metal::register_srs(adapter::affine(&bases));
+    let (sized_call, r) = call(&s, &bases);
+    assert!(sized_call && sized(&bases));
+    assert!(r.map(adapter::from_jacobian) == Some(msm_pippenger(&s, &bases)));
+    assert_eq!(midnight_metal::stats().msm.served, 1);
+
+    bases[3 * n / 7 + 5] = random_points(1, 4722)[0];
+    let stale = midnight_metal::srs_stale();
+    let (sized_call, r) = call(&s, &bases);
+    assert!(!sized_call && r.is_none());
+    assert_eq!(midnight_metal::srs_stale(), stale + 1);
+    assert_eq!(midnight_metal::declines(), vec![("msm", UNREGISTERED, 1)]);
+    assert!(!sized(&bases));
+    drop(h);
+
+    let (sized_call, r) = call(&s[..n - 1], &bases);
+    assert!(!sized_call && r.is_none());
+    assert_eq!(midnight_metal::declines(), vec![("msm", "shape", 1)]);
+}
+
 /// A point on the curve `y^2 = x^3 + 4` outside the prime-order subgroup (no
 /// cofactor clearing), as limbs.
 fn non_subgroup_point() -> G1AffineLimbs {

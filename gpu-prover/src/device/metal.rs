@@ -41,7 +41,8 @@
 //! - `begin_request` / `end_request`: `begin_request` and `end_request_report`.
 //! - `evict`: `evict_key_copies`, `release_pool`, and with `tables` dropping
 //!   the SRS handles.
-//! - `counters`: `stats`, `declines`, `msm_sized` and `request_peak_bytes`.
+//! - `counters`: `stats`, `declines`, the `msm_sized` figure of `msm_g1_sized`
+//!   and `request_peak_bytes`.
 //!
 //! # Lifetimes
 //!
@@ -67,9 +68,9 @@
 //!   debugging.
 //! - the label input `msm_sized`: the MSM invocations of an admitted phase that
 //!   the device takes by their length and bases, before any scalar is read
-//!   (`midnight_metal::msm_sized`). `DeviceCounters::device_ran` reads it
-//!   together with the served `fft`, `ifft` and `quotient` calls, which depend
-//!   on sizes only.
+//!   (`midnight_metal::msm_sized`, given by `msm_g1_sized` with the MSM).
+//!   `DeviceCounters::device_ran` reads it together with the served `fft`,
+//!   `ifft` and `quotient` calls, which depend on sizes only.
 //!
 //! With the default thresholds the device takes an MSM only when a registered
 //! table serves its bases. Any other MSM declines `unregistered-bases` before
@@ -168,8 +169,8 @@ static NOT_ADMITTED: [AtomicU64; 4] = [const { AtomicU64::new(0) }; 4];
 /// reason.
 static MSM_CALLS: AtomicU64 = AtomicU64::new(0);
 /// MSM hook invocations of an admitted MSM phase that the device takes by
-/// their length and bases (`midnight_metal::msm_sized`), served or then
-/// declined, since the last reset.
+/// their length and bases (`midnight_metal::msm_sized`, as given by
+/// `msm_g1_sized`), served or then declined, since the last reset.
 static MSM_SIZED: AtomicU64 = AtomicU64::new(0);
 
 /// The erasure report of a request from `midnight_metal::end_request_report`;
@@ -243,10 +244,12 @@ fn msm(scalars: &[Scalar], bases: &[G1AffineLimbs]) -> Option<G1JacobianLimbs> {
         return None;
     }
     let t = Instant::now();
-    if metal::msm_sized(scalars.len(), bases) {
+    // one lookup and comparison of the bases serves both the label input and
+    // the MSM
+    let (sized, r) = metal::msm_g1_sized(scalars, bases);
+    if sized {
         MSM_SIZED.fetch_add(1, Relaxed);
     }
-    let r = metal::msm_g1(scalars, bases);
     // every invocation is timed, so that the figure does not tell a served MSM
     // from a declined one
     timed(0, t, true);
