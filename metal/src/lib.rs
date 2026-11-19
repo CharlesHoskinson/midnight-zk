@@ -129,7 +129,16 @@ pub mod ctx;
 #[cfg(target_os = "macos")]
 mod msm;
 #[cfg(target_os = "macos")]
+pub use msm::{
+    MsmStages, SrsHandle, msm_counts, msm_g1_stages, register_srs, srs_handles, srs_stale,
+};
+#[cfg(target_os = "macos")]
 mod ntt;
+/// Host-to-host wrappers of the NTT device building blocks, for this crate's
+/// integration tests (not a stable interface).
+#[cfg(target_os = "macos")]
+#[doc(hidden)]
+pub use ntt::test_support as ntt_test_support;
 #[cfg(target_os = "macos")]
 mod quotient;
 
