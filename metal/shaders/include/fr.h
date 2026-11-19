@@ -28,7 +28,6 @@
 struct FrParams {
     enum : int { N = 8 };
     enum : uint { INV = 0xffffffffu };
-    static MONT_INLINE ulong inv64() { return 0xfffffffeffffffffull; }
     static MONT_INLINE uint mod(int i) {
         switch (i) {
         case 0: return 0x00000001u;

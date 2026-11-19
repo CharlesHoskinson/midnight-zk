@@ -11,90 +11,100 @@
 // See the License for the specific language governing permissions and
 // limitations under the License.
 
-//! The quotient on the device, and the resident proving-key copies: a port of
-//! the CUDA crate's `gpu/src/quotient.rs` and `gpu/cuda/quotient.cuh`.
+//! The quotient on the device, and the resident proving-key copies: the
+//! counterpart of the CUDA crate's `gpu/src/quotient.rs` and
+//! `gpu/cuda/quotient.cuh`.
 //!
-//! [`crate::quotient`] has checked that `job` is not null and that a device
-//! is usable before it calls [`quotient`]. Everything else is this module's:
-//! the ABI version and layout of `midnight_proofs::gpu::abi::QuotientJobAbi`
-//! (a copy in [`abi`]), the extended size against the quotient threshold
-//! (`quotient` of [`crate::thresholds`]), the job's shape, the
-//! reduction of its scalars and the memory need. It ends with exactly one of
-//! `account::served` or `account::decline`, and writes `out` only with the
-//! complete result.
+//! [`quotient`] takes the job of the `midnight_proofs::gpu` quotient hook
+//! (`QuotientJobAbi`, a copy of its layout in [`abi`]), moves the proof's
+//! polynomials to the extended coset on the device, runs the numerator
+//! kernel over the job's programs (gates, permutation, LogUp lookups,
+//! trash), divides by the vanishing polynomial, transforms back and writes
+//! the first `len` coefficients into the caller's buffer. It ends with
+//! exactly one of `account::served` or `account::decline`; a declined job
+//! leaves `out` unchanged and the prover computes the quotient on the CPU.
+//!
+//! # Trust boundary
+//!
+//! [`crate::quotient`] checks that `job` is not null and that a device is
+//! usable before it calls [`quotient`]. The caller guarantees that `job`
+//! points to a `QuotientJobAbi` whose pointers are valid for reads of their
+//! counts for the whole call (a proof polynomial `2^k` values, a proving-key
+//! polynomial `2^ext_k`, see [`abi`]) and are not written meanwhile. This
+//! module checks everything else before it reads a polynomial: the ABI
+//! version, the sizes (`k <= ext_k <= MAX_LOG_N`, so no slice is made from
+//! an unchecked length), the extended size against the quotient threshold
+//! (`quotient` of [`crate::thresholds`]), the roots and the coset shift, the
+//! output length, every table entry (null pointers, operand, slot and column
+//! ranges), the reduction of every scalar and polynomial, and the memory
+//! need.
 //!
 //! # Steps
 //!
-//! 1. Checks on the header and the tables ([`checked`], [`tables`]), in the
+//! 1. The checks on the header and the tables ([`checked`], [`tables`]), in the
 //!    order and with the reasons of the CUDA crate.
-//! 2. The proving-key polynomials: served from the resident copy of a
-//!    registered handle ([`keys`]) or uploaded for the call. They are placed
-//!    before their digests are checked ([`keys::plan`]); CPU threads copy
-//!    the uploads, refill the empty slots of the resident copy and hash the
-//!    registered polynomials to check (every one outside a request, the ones
-//!    not yet checked in the request inside one, and the bytes copied into
-//!    every slot refilled) while the device runs step 3, and
-//!    [`keys::settle`] marks a refilled slot present only when its digest
-//!    matched and drops a stale polynomial (uploaded instead) before step 4,
-//!    the first kernel that reads a slot.
+//! 2. The proving-key polynomials: read from the resident copy of a registered
+//!    handle ([`keys`]) or uploaded for the call. [`keys::plan`] places them
+//!    before their digests are checked; CPU threads copy the uploads, fill the
+//!    empty slots of the resident copy and hash the registered polynomials to
+//!    check while the device runs step 3, and [`keys::settle`] settles the
+//!    placement before step 4, the first kernel that reads a slot.
 //! 3. The proof's polynomials (advice, instance, permutation accumulators,
 //!    lookup aggregators, multiplicities and helpers, trash) to the extended
 //!    coset: each one is copied into a buffer of `2^k` coefficients (checked
 //!    reduced on the way; the copy of the next one runs on the CPU while the
-//!    device transforms this one) and moved to the coset by
-//!    `ntt::coeff_to_extended_dev_at`, which writes it straight into its
-//!    place in the flat buffer of the proof's cosets: one command buffer per
-//!    polynomial.
+//!    device transforms this one) and transformed by
+//!    `ntt::coeff_to_extended_dev_at` straight into its place in the flat
+//!    buffer of the proof's cosets, one command buffer per polynomial.
 //! 4. The numerator kernel (`shaders/quotient.metal`) over row ranges, one
-//!    command buffer per range, each about [`TARGET_NANOS`] of GPU time.
-//! 5. The division by the vanishing polynomial (`ntt::encode_mul_periodic`
-//!    with the job's `t_inv`), the inverse transform and the removal of the
-//!    coset factors, in the command buffers of the inverse transform
+//!    command buffer per range of about [`TARGET_NANOS`] of GPU time.
+//! 5. The division by the vanishing polynomial (`ntt::encode_mul_periodic` with
+//!    the job's `t_inv`), the inverse transform and the removal of the coset
+//!    factors, in the command buffers of the inverse transform
 //!    (`ntt::divide_extended_to_coeff_dev`). Meanwhile CPU threads zero the
-//!    cosets, the uploads and the scratch slots and put them back into the
-//!    pool (`ctx::release_later`; `end_request` waits for them).
-//! 6. The first `len` coefficients are copied into `out`, after every step
-//!    that can fail or panic (`out` is written last, by a copy that cannot
-//!    fail). No extended-domain vector goes back.
+//!    buffers of steps 3 and 4 and put them back into the pool
+//!    (`ctx::release_later`; `end_request` waits for them).
+//! 6. The first `len` coefficients are copied into `out`, after every step that
+//!    can fail or panic, by a copy that cannot fail. No extended-domain vector
+//!    goes back.
 //!
 //! Every buffer that holds a witness-dependent value is zeroed before it is
 //! used again or reported erased: the transform scratch is per-request
-//! scratch (`quotient-tmp`, zeroed by [`crate::end_request`]), every other
+//! scratch (`quotient-tmp`, zeroed by [`crate::end_request`]); every other
 //! buffer is owned by the call, comes from the pool of zeroed buffers and is
-//! zeroed before it goes back to it (in the background, ended by
+//! zeroed before it goes back to it (in the background, finished by
 //! [`crate::end_request`] at the latest).
 //!
 //! # Departures from the CUDA backend
 //!
-//! - A Metal kernel takes at most 31 buffer arguments (Metal feature set
-//!   tables, every Apple family) and the device context binds buffers, not GPU
-//!   addresses, so the CUDA job's tables of device pointers are flat buffers
-//!   with index tables: the proof's cosets one buffer, the proving-key
-//!   polynomials two (the lent resident copy, the uploads of the call), the
-//!   programs and descriptors a buffer of words, the uniforms a buffer of
-//!   field elements (see `shaders/include/quotient.h`). A job whose flat
-//!   buffer would exceed `maxBufferLength` declines `memory`.
+//! - A Metal kernel takes at most 31 buffer arguments and the device context
+//!   binds buffers, not GPU addresses, so the CUDA job's tables of device
+//!   pointers are flat buffers with index tables: the proof's cosets one
+//!   buffer, the proving-key polynomials two (the lent resident copy, the
+//!   uploads of the call), the programs and descriptors a buffer of words, the
+//!   uniforms a buffer of field elements (see `shaders/include/quotient.h`). A
+//!   job whose flat buffer would exceed `maxBufferLength` declines `memory`.
 //! - The CUDA kernel runs one grid-stride launch over the whole domain; here
 //!   the domain is split into row ranges of about [`TARGET_NANOS`] of GPU time
 //!   each (the first range sized from an estimate, the next ones from the
-//!   measured time per row), so no command buffer runs long.
-//! - The scratch of the programs' intermediates is the CUDA layout
-//!   (`scratch[slot * threads + thread]`) with [`threads`] threads per
-//!   dispatch (`MIDNIGHT_METAL_QUOTIENT_THREADS`, the counterpart of
+//!   measured time per row), so that no command buffer runs long.
+//! - The scratch of the programs' intermediates has the CUDA layout
+//!   (`scratch[slot * threads + thread]`) with [`threads`] threads per dispatch
+//!   (`MIDNIGHT_METAL_QUOTIENT_THREADS`, the counterpart of
 //!   `MIDNIGHT_GPU_QUOTIENT_THREADS`).
 //! - The proving-key polynomials are checked reduced when they are copied (the
-//!   CUDA crate checks only the proof's polynomials); an unreduced one
-//!   declines `unreduced`.
-//! - A resident copy is one buffer per [`KeyHandle`] and polynomial length;
-//!   a job whose key polynomials are registered under several handles reads
-//!   the handle with the most of them from its copy for the job's extended
-//!   length and uploads the others for the call.
+//!   CUDA crate checks only the proof's polynomials); an unreduced one declines
+//!   `unreduced`.
+//! - A resident copy is one buffer per [`KeyHandle`] and polynomial length; a
+//!   job whose key polynomials are registered under several handles reads the
+//!   handle with the most of them from its copy for the job's extended length
+//!   and uploads the others for the call.
 //! - Outside a request (no [`crate::begin_request`] open) every serve checks
-//!   the digests of the registered polynomials it reads; the CUDA crate
-//!   checks once per request only.
+//!   the digests of the registered polynomials it reads; the CUDA crate checks
+//!   once per request only.
 //! - The memory limit is the device's free working set
 //!   (`recommendedMaxWorkingSetSize - currentAllocatedSize`) and
-//!   `maxBufferLength` for each buffer, or a test limit.
+//!   `maxBufferLength` for each buffer.
 
 pub mod abi;
 mod keys;
@@ -102,11 +112,7 @@ mod tables;
 
 use std::{
     ffi::c_void,
-    sync::{
-        Mutex,
-        atomic::{AtomicU32, AtomicU64, Ordering::Relaxed},
-    },
-    time::Instant,
+    sync::atomic::{AtomicU32, AtomicU64, Ordering::Relaxed},
 };
 
 use blst::{blst_fr, blst_fr_mul, blst_fr_sqr};
@@ -116,9 +122,13 @@ pub use keys::{
 };
 pub(crate) use keys::{begin_request, end_request};
 
-use self::{abi::QuotientJobAbi, keys::Place, tables::Tables};
+use self::{
+    abi::QuotientJobAbi,
+    keys::{Lent, Place, Plan},
+    tables::Tables,
+};
 use crate::{
-    MAX_LOG_N, Scalar,
+    MAX_LOG_N, MetalInfo, Scalar,
     account::{self, Class, Reason},
     ctx::{self, Arg, Buffer, Ctx, Error, Pod},
     field,
@@ -128,7 +138,7 @@ use crate::{
 const SCALAR_BYTES: usize = 32;
 
 /// The GPU time one command buffer of the numerator aims at.
-pub const TARGET_NANOS: u64 = 250_000_000;
+const TARGET_NANOS: u64 = 250_000_000;
 
 /// The Montgomery form of one (`2^256 mod r`).
 const ONE: Scalar = [
@@ -147,7 +157,7 @@ fn mul(a: &Scalar, b: &Scalar) -> Scalar {
 
 fn square(a: &Scalar) -> Scalar {
     let mut r = blst_fr::default();
-    // SAFETY: as `mul`.
+    // SAFETY: valid pointers to blst_fr values.
     unsafe { blst_fr_sqr(&mut r, &blst_fr { l: *a }) };
     r.l
 }
@@ -169,8 +179,11 @@ fn pow(b: &Scalar, mut e: u64) -> Scalar {
 
 static RUNS: AtomicU64 = AtomicU64::new(0);
 static DECLINES: AtomicU64 = AtomicU64::new(0);
+/// [`threads`] once read (0: not yet).
 static THREADS: AtomicU32 = AtomicU32::new(0);
+/// The admission's memory limit in bytes besides the device's (tests).
 static MEMORY_LIMIT: AtomicU64 = AtomicU64::new(u64::MAX);
+/// The GPU time a numerator command buffer aims at (tests lower it).
 static TARGET: AtomicU64 = AtomicU64::new(TARGET_NANOS);
 
 /// (quotients computed on the device, quotient jobs declined) since process
@@ -180,10 +193,15 @@ pub fn quotient_counts() -> (u64, u64) {
 }
 
 /// The default of [`threads`]. Numerator GPU time at `2^21` rows on an M4
-/// Max (40 GPU cores, rc1 chain circuit): 53 ms with 2^12 threads, 18.8 ms
-/// with 2^14, 15.5 ms with 2^16, 14.4 ms with 2^18, 17.4 ms with 2^20; 2^16
-/// is within 8% of the best and keeps the scratch at `nslots * 2 MiB`.
+/// Max (40 GPU cores): 53 ms with 2^12 threads, 18.8 ms with 2^14, 15.5 ms
+/// with 2^16, 14.4 ms with 2^18, 17.4 ms with 2^20; 2^16 is within 8% of the
+/// best and keeps the scratch at `nslots * 2 MiB`.
 const DEFAULT_THREADS: u32 = 1 << 16;
+
+/// A thread count rounded down to a multiple of 256 in `[256, 2^24]`.
+fn normalize_threads(t: u64) -> u32 {
+    (t / 256 * 256).clamp(256, 1 << 24) as u32
+}
 
 /// The threads of one numerator dispatch, the stride of the scratch slots:
 /// `MIDNIGHT_METAL_QUOTIENT_THREADS`, else 2^16; a multiple of 256 in
@@ -196,9 +214,7 @@ pub fn threads() -> u32 {
     let t = std::env::var("MIDNIGHT_METAL_QUOTIENT_THREADS")
         .ok()
         .and_then(|e| e.trim().parse::<u64>().ok())
-        .map_or(DEFAULT_THREADS, |t| {
-            (t / 256 * 256).clamp(256, 1 << 24) as u32
-        });
+        .map_or(DEFAULT_THREADS, normalize_threads);
     let _ = THREADS.compare_exchange(0, t, Relaxed, Relaxed);
     THREADS.load(Relaxed)
 }
@@ -209,11 +225,14 @@ fn stride(ext_k: u32) -> usize {
     (threads() as usize).min(1usize << ext_k)
 }
 
+// ---------------------------------------------------------------------------
+// Memory need
+
 /// Every device allocation one quotient call can make, in bytes ([`run`]
 /// allocates exactly these buffers, each at most once; Metal makes a buffer
 /// of at least 16 bytes). Their sum is an upper bound of the device bytes
 /// the call adds, whatever the pool of zeroed buffers gives back meanwhile.
-/// Used by [`run`]'s admission and by [`need_bytes`], so the two cannot
+/// [`run`]'s admission and [`need_bytes`] both sum it, so the two cannot
 /// drift.
 #[derive(Clone, Copy, Debug)]
 struct Need {
@@ -266,7 +285,11 @@ impl Need {
             a(self.uniforms_bytes),
             if self.inverse { a(self.t_inv_bytes) } else { 0 },
             // the scaled twiddle table of the inverse transform
-            if self.inverse { ntt::SCALE_TABLE_BYTES } else { 0 },
+            if self.inverse {
+                ntt::SCALE_TABLE_BYTES
+            } else {
+                0
+            },
         ]
     }
 
@@ -278,6 +301,11 @@ impl Need {
     /// The largest single buffer (against `maxBufferLength`).
     fn biggest(&self) -> usize {
         self.buffers().into_iter().max().unwrap_or(0)
+    }
+
+    /// Whether the call fits the free device memory and `maxBufferLength`.
+    fn fits(&self, info: &MetalInfo) -> bool {
+        self.total() as u64 <= memory_limit() && self.biggest() as u64 <= info.max_buffer_length
     }
 }
 
@@ -324,42 +352,65 @@ pub fn need_bytes(ext_k: u32, proof_polys: usize, key_polys: usize, nslots: u32)
     worst
 }
 
-// ---------------------------------------------------------------------------
-// Measurement and test support
+/// The [`Need`] of a planned call: the proof's cosets, the uploads of the
+/// plan, the resident copy when the call makes it, the second upload when a
+/// polynomial placed in a slot is checked (it may be stale), the transform
+/// scratch unless the request has one long enough, the job's tables.
+fn need_of(
+    j: &QuotientJobAbi,
+    tab: &Tables<'_>,
+    t_inv: &[Scalar],
+    plan: &Plan,
+    s: &ctx::Session,
+    inverse: bool,
+) -> Need {
+    let ntemp = plan.places.iter().filter(|p| **p == Place::Temp).count();
+    let lent_new = plan.lent.as_ref().map_or(0, |l| if l.buf.is_none() { l.bytes() } else { 0 });
+    let resident_checked = plan.resident_checked();
+    let tmp_need = ntt::scratch_bytes(j.ext_k);
+    let tmp_have = s.get_scratch("quotient-tmp").map_or(0, |b| b.len_bytes());
+    Need {
+        ebytes: SCALAR_BYTES << j.ext_k,
+        coeff_bytes: SCALAR_BYTES << j.k,
+        nproof: tab.proof.len(),
+        ntemp,
+        lent_new,
+        restale: if resident_checked > 0 {
+            ntemp + resident_checked
+        } else {
+            0
+        },
+        slots_bytes: (j.nslots as usize).max(1) * stride(j.ext_k) * SCALAR_BYTES,
+        // a shorter one is replaced by a new one
+        tmp_new: if tmp_need > 0 && tmp_have < tmp_need {
+            tmp_need
+        } else {
+            0
+        },
+        words_bytes: tab.words.len() * 4,
+        uniforms_bytes: tab.uniforms.len() * SCALAR_BYTES,
+        t_inv_bytes: t_inv.len() * SCALAR_BYTES,
+        inverse,
+    }
+}
 
-/// Wall and GPU nanoseconds of the stages of the last quotient served.
+/// Bytes the device allows this call to allocate: the free working set (the
+/// idle buffers of the pool included, see [`ctx::mem_info`]) or the test
+/// limit, the smaller.
+fn memory_limit() -> u64 {
+    let free = ctx::mem_info().map_or(0, |(free, _)| free as u64);
+    free.min(MEMORY_LIMIT.load(Relaxed))
+}
+
+// ---------------------------------------------------------------------------
+// Test support
+
+/// The placement counts of the last quotient served (read through
+/// `test_support::last_stages`).
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
 pub struct QuotientStages {
-    /// Checks, tables, key placement and allocations (wall).
-    pub prepare: u64,
-    /// Proving-key uploads and resident copies (wall; on the CPU while the
-    /// coset transforms run).
-    pub keys: u64,
-    /// The proof's polynomials to the extended coset: copies, transforms and
-    /// placement (wall).
-    pub cosets: u64,
-    /// The numerator kernel (wall).
-    pub numerator: u64,
-    /// The division by the vanishing polynomial (wall): 0, it is encoded in
-    /// the first command buffer of the inverse transform.
-    pub divide: u64,
-    /// The division, the inverse transform and the coset factors (wall).
-    pub inverse: u64,
-    /// The read-back of `len` coefficients (wall; the buffers are zeroed in
-    /// the background, see `ctx::release_later`).
-    pub readback: u64,
-    /// GPU time of the coset transforms and placement.
-    pub gpu_cosets: u64,
-    /// GPU time of the numerator.
-    pub gpu_numerator: u64,
-    /// GPU time of the division: 0, in `gpu_inverse`.
-    pub gpu_divide: u64,
-    /// GPU time of the division, the inverse transform and the coset factors.
-    pub gpu_inverse: u64,
     /// Command buffers of the numerator.
     pub numerator_runs: u32,
-    /// Device bytes in use by this call at its peak (new or from the pool).
-    pub peak_bytes: u64,
     /// Proving-key polynomials read from a resident copy.
     pub resident_polys: u32,
     /// Proving-key polynomials uploaded for the call.
@@ -368,11 +419,11 @@ pub struct QuotientStages {
     pub key_copies_made: u32,
 }
 
-static LAST_STAGES: Mutex<Option<QuotientStages>> = Mutex::new(None);
+#[cfg(any(test, feature = "test-support"))]
+static LAST_STAGES: std::sync::Mutex<Option<QuotientStages>> = std::sync::Mutex::new(None);
 
-/// Test and measurement support (not a stable interface; only with the
-/// `test-support` feature: [`test_support::numerator`] returns
-/// witness-dependent values).
+/// Test entry points (not a stable interface; only with the `test-support`
+/// feature: [`test_support::numerator`] returns witness-dependent values).
 #[cfg(any(test, feature = "test-support"))]
 pub mod test_support {
     use super::*;
@@ -391,9 +442,9 @@ pub mod test_support {
         // SAFETY: the caller's contract.
         let j = unsafe { &*(job as *const QuotientJobAbi) };
         checked(j, None).map_err(|r| r.name())?;
-        // SAFETY: as above.
+        // SAFETY: the caller's contract; `checked` has passed.
         let tab = unsafe { Tables::new(j) }.map_err(|r| r.name())?;
-        // SAFETY: as above.
+        // SAFETY: the caller's contract.
         let t_inv = unsafe { abi::slice(j.t_inv, j.nt_inv) };
         let s = ctx::lock().map_err(|e| err(e).name())?;
         let mut plan = keys::plan(&tab.keys, 1usize << j.ext_k);
@@ -405,7 +456,7 @@ pub mod test_support {
         Ok(need.total())
     }
 
-    /// The stages of the last quotient served.
+    /// The placement counts of the last quotient served.
     pub fn last_stages() -> Option<QuotientStages> {
         *LAST_STAGES.lock().unwrap_or_else(|e| e.into_inner())
     }
@@ -424,10 +475,7 @@ pub mod test_support {
 
     /// Sets the dispatch threads ([`threads`]); `None` restores the default.
     pub fn set_threads(t: Option<u32>) {
-        THREADS.store(
-            t.map_or(0, |t| (t / 256 * 256).clamp(256, 1 << 24)),
-            Relaxed,
-        );
+        THREADS.store(t.map_or(0, |t| normalize_threads(t.into())), Relaxed);
     }
 
     /// The numerator of a job on the device, all `2^ext_k` values read back
@@ -443,7 +491,7 @@ pub mod test_support {
         // SAFETY: the caller's contract.
         let j = unsafe { &*(job as *const QuotientJobAbi) };
         let mut nu = Vec::new();
-        // SAFETY: as above.
+        // SAFETY: the caller's contract.
         unsafe { run(j, &mut [], Some(&mut nu)) }.map(|_| nu).map_err(|r| r.name())
     }
 }
@@ -455,13 +503,19 @@ pub mod test_support {
 /// declined, `out` unchanged.
 ///
 /// # Safety
-/// `job` points to a valid `QuotientJobAbi` whose pointers live for the call.
+/// `job` is not null and points to a valid `QuotientJobAbi` whose pointers
+/// are valid for reads of their counts and not written for the whole call
+/// (see the module's trust boundary).
 pub(crate) unsafe fn quotient(job: *const c_void, out: &mut [Scalar]) -> bool {
     // SAFETY: the caller's contract.
     let j = unsafe { &*(job as *const QuotientJobAbi) };
-    // SAFETY: as above.
+    // SAFETY: the caller's contract.
     match unsafe { run(j, out, None) } {
-        Ok(ns) => {
+        Ok((ns, _stages)) => {
+            #[cfg(any(test, feature = "test-support"))]
+            {
+                *LAST_STAGES.lock().unwrap_or_else(|e| e.into_inner()) = Some(_stages);
+            }
             RUNS.fetch_add(1, Relaxed);
             account::served(Class::Quotient, ns);
             true
@@ -485,7 +539,8 @@ fn cube_root_shift(zeta: [Scalar; 2], zeta_out: [Scalar; 2]) -> bool {
 /// The header checks of the CUDA crate, in its order: the ABI version and
 /// sizes (`shape`), the coset shift (`shape`), the minimum size
 /// (`below-min-k`), then the roots, lengths and counts (`shape`) and the
-/// reduction of the job's scalars (`unreduced`).
+/// reduction of the job's scalars (`unreduced`). `out_len`: the length of
+/// `out`, which must be the job's `len` (`None`: the numerator test path).
 fn checked(j: &QuotientJobAbi, out_len: Option<usize>) -> Result<(), Reason> {
     if j.abi != abi::QUOTIENT_ABI || j.k < 1 || j.k > j.ext_k || j.ext_k > MAX_LOG_N {
         return Err(Reason::Shape);
@@ -533,11 +588,41 @@ fn checked(j: &QuotientJobAbi, out_len: Option<usize>) -> Result<(), Reason> {
     Ok(())
 }
 
+/// `t_inv` and the scalars passed by value to the transform helpers, whose
+/// shader arithmetic needs reduced inputs, are reduced (`unreduced`).
+/// [`checked`] has checked the scalars already (the shift and its inverse,
+/// `zeta_out` and the divisor directly, the roots by equality with the
+/// standard roots); they are checked again here, next to their use, so that
+/// a change to [`checked`] cannot let an unreduced one reach the device.
+fn check_transform_inputs(j: &QuotientJobAbi, t_inv: &[Scalar]) -> Result<(), Reason> {
+    if !field::all_reduced(t_inv) {
+        return Err(Reason::Unreduced);
+    }
+    let by_value = [
+        j.zeta[0],
+        j.zeta[1],
+        j.zeta_out[0],
+        j.zeta_out[1],
+        j.divisor,
+        j.extended_omega,
+        j.omega_inv,
+    ];
+    if !field::all_reduced(&by_value) {
+        return Err(Reason::Unreduced);
+    }
+    Ok(())
+}
+
+fn err(e: Error) -> Reason {
+    Reason::of(&e)
+}
+
 // ---------------------------------------------------------------------------
 // Host copies
 
-/// Copies `src` into the start of `dst` on several threads; `false` when an
-/// element is not reduced (the copy may then be partial).
+/// Copies `src` into the start of `dst` on several threads, checking every
+/// element reduced in the same pass; `false` when one is not (the copy may
+/// then be partial).
 fn copy_checked(dst: &mut [Scalar], src: &[Scalar]) -> bool {
     const PART: usize = 1 << 16;
     let dst = &mut dst[..src.len()];
@@ -601,59 +686,363 @@ struct Params {
 unsafe impl Pod for Params {}
 const _: () = assert!(size_of::<Params>() == 96 + 7 * 32);
 
-/// Bytes the device allows this call to allocate: the free working set (the
-/// idle buffers of the pool included, see [`ctx::mem_info`]) or the test
-/// limit.
-fn memory_limit() -> u64 {
-    let free = ctx::mem_info().map_or(0, |(free, _)| free as u64);
-    free.min(MEMORY_LIMIT.load(Relaxed))
-}
-
-fn err(e: Error) -> Reason {
-    Reason::of(&e)
-}
-
-/// The [`Need`] of a planned call: the proof's cosets, the uploads of the
-/// plan, the resident copy when the call makes it, the second upload when a
-/// polynomial placed in a slot is checked (it may be stale), the transform
-/// scratch unless the request has one long enough, the job's tables.
-fn need_of(
+/// The quotient of `j` into `out`, or with `numerator` the whole numerator
+/// read back into it (and `out` untouched). Returns the GPU time and the
+/// placement counts.
+///
+/// # Safety
+/// As [`quotient`].
+unsafe fn run(
     j: &QuotientJobAbi,
-    tab: &Tables<'_>,
-    t_inv: &[Scalar],
-    plan: &keys::Plan,
-    s: &ctx::Session,
-    inverse: bool,
-) -> Need {
-    let ebytes = SCALAR_BYTES << j.ext_k;
-    let ntemp = plan.places.iter().filter(|p| **p == Place::Temp).count();
-    let lent_new = plan.lent.as_ref().map_or(0, |l| if l.buf.is_none() { l.bytes() } else { 0 });
-    let resident_checked = plan.resident_checked();
-    let tmp_need = ntt::scratch_bytes(j.ext_k);
-    let tmp_have = s.get_scratch("quotient-tmp").map_or(0, |b| b.len_bytes());
-    Need {
-        ebytes,
-        coeff_bytes: SCALAR_BYTES << j.k,
-        nproof: tab.proof.len(),
-        ntemp,
-        lent_new,
-        restale: if resident_checked > 0 {
-            ntemp + resident_checked
-        } else {
-            0
-        },
-        slots_bytes: (j.nslots as usize).max(1) * stride(j.ext_k) * SCALAR_BYTES,
-        // a shorter one is replaced by a new one
-        tmp_new: if tmp_need > 0 && tmp_have < tmp_need {
-            tmp_need
-        } else {
-            0
-        },
-        words_bytes: tab.words.len() * 4,
-        uniforms_bytes: tab.uniforms.len() * SCALAR_BYTES,
-        t_inv_bytes: t_inv.len() * SCALAR_BYTES,
-        inverse,
+    out: &mut [Scalar],
+    numerator: Option<&mut Vec<Scalar>>,
+) -> Result<(u64, QuotientStages), Reason> {
+    checked(j, numerator.is_none().then_some(out.len()))?;
+    // SAFETY: the caller's contract; `checked` has passed.
+    let mut tab = unsafe { Tables::new(j)? };
+    // SAFETY: the caller's contract.
+    let t_inv = unsafe { abi::slice(j.t_inv, j.nt_inv) };
+    check_transform_inputs(j, t_inv)?;
+
+    let mut s = ctx::lock().map_err(err)?;
+    let info = crate::present().ok_or(Reason::NoDevice)?;
+    let mut plan = keys::plan(&tab.keys, 1usize << j.ext_k);
+    // every buffer this call can allocate (the sum of `need_bytes`)
+    let need = need_of(j, &tab, t_inv, &plan, &s, numerator.is_none());
+    let r = if need.fits(info) {
+        device_run(j, &mut tab, t_inv, &mut plan, &mut s, info, out, numerator)
+    } else {
+        Err(Reason::Memory)
+    };
+    // on every path, before the session ends
+    if let Some(l) = plan.lent.take() {
+        l.give_back();
     }
+    drop(s);
+    r
+}
+
+/// Steps 2 to 6 of an admitted job (see the module text).
+#[allow(clippy::too_many_arguments)]
+fn device_run(
+    j: &QuotientJobAbi,
+    tab: &mut Tables<'_>,
+    t_inv: &[Scalar],
+    plan: &mut Plan,
+    s: &mut ctx::Session,
+    info: &MetalInfo,
+    out: &mut [Scalar],
+    numerator: Option<&mut Vec<Scalar>>,
+) -> Result<(u64, QuotientStages), Reason> {
+    let (k, ext_k) = (j.k, j.ext_k);
+    let (n, en) = (1usize << k, 1usize << ext_k);
+    let ebytes = SCALAR_BYTES << ext_k;
+    let threads = stride(ext_k);
+    let c: &'static Ctx = s.ctx();
+    let mut stages = QuotientStages::default();
+    let mut gpu = 0u64;
+
+    // the call's buffers. The transform scratch is per-request scratch (it
+    // holds witness values; zeroed at the end of the request)
+    let tmp_need = ntt::scratch_bytes(ext_k);
+    if tmp_need > 0 {
+        s.scratch("quotient-tmp", tmp_need).map_err(err)?;
+    }
+    let ntemp = plan.places.iter().filter(|p| **p == Place::Temp).count();
+    let proof_buf = c.alloc_pooled(tab.proof.len().max(1) * ebytes).map_err(err)?;
+    let mut src_a = c.alloc_pooled(n * SCALAR_BYTES).map_err(err)?;
+    let mut src_b = c.alloc_pooled(n * SCALAR_BYTES).map_err(err)?;
+    let mut key_tmp = c.alloc_pooled(ntemp * ebytes).map_err(err)?;
+    if let Some(l) = plan.lent.as_mut()
+        && l.buf.is_none()
+    {
+        l.buf = Some(c.alloc_pooled(l.npolys * ebytes).map_err(err)?);
+    }
+    let tmp_ref: Option<&Buffer> = if tmp_need > 0 {
+        s.get_scratch("quotient-tmp")
+    } else {
+        None
+    };
+    // bound for an argument that is not read: the transform scratch of a
+    // one-pass size, an empty key bank
+    let dummy = c.alloc(0).map_err(err)?;
+    let tmp = tmp_ref.unwrap_or(&dummy);
+
+    // steps 2 and 3: the keys on CPU threads, the proof's cosets on the
+    // device. The copy of the first proof polynomial comes first, alone on
+    // the CPU, as the device waits for it
+    if let Some(first) = tab.proof.first()
+        && !copy_checked(src_a.as_mut_slice::<Scalar>(), first)
+    {
+        return Err(Reason::Unreduced);
+    }
+    // the polynomials whose slot this call fills: their digests are computed
+    // over the bytes copied into the slot
+    let fills: Vec<bool> = (0..tab.keys.len()).map(|i| plan.fills(i)).collect();
+    let (key_work, cosets) = std::thread::scope(|sc| {
+        let kh = sc.spawn(|| {
+            copy_and_hash_keys(
+                &tab.keys,
+                &plan.places,
+                &plan.check,
+                &fills,
+                &mut plan.lent,
+                &mut key_tmp,
+                en,
+            )
+        });
+        let cosets = proof_cosets(c, j, &tab.proof, [&mut src_a, &mut src_b], &proof_buf, tmp);
+        // a panicked key thread reads as unreduced copies
+        (kh.join().unwrap_or_default(), cosets)
+    });
+    gpu += cosets?;
+    if !key_work.reduced {
+        return Err(Reason::Unreduced);
+    }
+    // a digest missing (a digest thread or a slot that failed): not settled
+    if key_work.digests.len() != plan.check.len() {
+        return Err(Reason::DeviceError);
+    }
+    ctx::release_later(vec![src_a, src_b]);
+
+    // the digests settle the placement: a stale polynomial is uploaded
+    if keys::settle(plan, &tab.keys, &key_work.digests) {
+        key_tmp = upload_again(c, info, &tab.keys, &plan.places, en)?;
+    }
+    let (bank_of, ntemp) = banks(&plan.places);
+    let lagrange = tab.place_keys(&bank_of);
+    stages.uploaded_polys = ntemp as u32;
+    stages.resident_polys = (plan.places.len() - ntemp) as u32;
+    stages.key_copies_made = key_work
+        .filled
+        .iter()
+        .filter(|s| plan.lent.as_ref().is_some_and(|l| l.present[**s]))
+        .count() as u32;
+
+    // step 4: the numerator, into `nu`
+    let nu = c.alloc_pooled(ebytes).map_err(err)?;
+    let scratch = c
+        .alloc_pooled((j.nslots as usize).max(1) * threads * SCALAR_BYTES)
+        .map_err(err)?;
+    let words = c.upload(&tab.words).map_err(err)?;
+    let unis = if tab.uniforms.is_empty() {
+        c.alloc(0)
+    } else {
+        c.upload(&tab.uniforms)
+    }
+    .map_err(err)?;
+    let key_res: &Buffer = plan.lent.as_ref().and_then(|l| l.buf.as_ref()).unwrap_or(&dummy);
+    let key_tmp_b: &Buffer = if ntemp > 0 { &key_tmp } else { &dummy };
+    let params = numerator_params(j, tab, lagrange, threads);
+    let (ns, runs) = numerator_ranges(
+        c,
+        [&proof_buf, key_res, key_tmp_b, &words, &unis, &nu, &scratch],
+        params,
+        tab.cost_per_row,
+        en,
+        threads,
+    )?;
+    gpu += ns;
+    stages.numerator_runs = runs;
+    if let Some(l) = plan.lent.take() {
+        l.give_back();
+    }
+    // zeroed on the CPU in the background while the device divides and
+    // transforms; the zeroing ends before the request ends (`end_request`
+    // waits for it)
+    ctx::release_later(vec![scratch, proof_buf, key_tmp, words, unis]);
+
+    if let Some(v) = numerator {
+        v.clear();
+        v.extend_from_slice(&nu.as_slice::<Scalar>()[..en]);
+        ctx::release_later(vec![nu]);
+        return Ok((gpu, stages));
+    }
+
+    // step 5: h = nu / t on the coset, then extended_to_coeff, in the
+    // command buffers of the inverse transform
+    let tinv = c.upload(t_inv).map_err(err)?;
+    gpu += ntt::divide_extended_to_coeff_dev(
+        c,
+        &nu,
+        tmp,
+        ext_k,
+        &j.divisor,
+        &j.zeta_out,
+        &tinv,
+        t_inv.len().ilog2(),
+    )
+    .map_err(err)?;
+
+    // step 6: the first `len` coefficients. Everything that can fail or
+    // panic is done before the first byte of `out` is written (a panic
+    // becomes a decline, which must leave `out` unchanged): `tinv` is
+    // released, the source is sliced (`checked` has held `out.len()` to
+    // `j.len <= en`) and the resident copy was given back after the
+    // numerator. What follows the copy cannot fail: `ctx::par_copy` and
+    // `ctx::release_later` never panic, and the rest of `run` and of
+    // `quotient` stores counters and takes poison-tolerant locks.
+    drop(tinv);
+    debug_assert!(plan.lent.is_none());
+    let src = &nu.as_slice::<Scalar>()[..out.len()];
+    ctx::par_copy(out, src);
+    ctx::release_later(vec![nu]);
+    Ok((gpu, stages))
+}
+
+/// What the key thread of [`device_run`] reports. The default (a panicked
+/// thread) reads as unreduced copies.
+#[derive(Default)]
+struct KeyWork {
+    /// The digests of `Plan::check`, in its order; shorter when a digest is
+    /// missing.
+    digests: Vec<[u8; 32]>,
+    /// Whether every polynomial copied was reduced.
+    reduced: bool,
+    /// The slots of the lent copy filled.
+    filled: Vec<usize>,
+}
+
+/// The CPU side of the key placement, run while the device moves the proof's
+/// polynomials to the coset: copies each `Temp` polynomial into its coset of
+/// `key_tmp` and each polynomial placed in a slot this call fills
+/// (`fills`) into the slot of the lent copy, checking them reduced, and
+/// hashes the polynomials of `check`: a registered polynomial read from host
+/// memory on a thread of its own during the copies, a filled slot over the
+/// bytes copied into it, so that a slot is only ever marked present (at
+/// [`keys::settle`]) with verified content.
+fn copy_and_hash_keys(
+    keys: &[&[Scalar]],
+    places: &[Place],
+    check: &[usize],
+    fills: &[bool],
+    lent: &mut Option<Lent>,
+    key_tmp: &mut Buffer,
+    en: usize,
+) -> KeyWork {
+    let host: Vec<&[Scalar]> = check.iter().filter(|&&i| !fills[i]).map(|&i| keys[i]).collect();
+    let (host_digests, reduced, filled) = std::thread::scope(|sc| {
+        let dh = sc.spawn(|| keys::digest_many(&host));
+        // `key_tmp` holds one coset per `Temp` place, the lent copy one per
+        // slot (`keys::plan` places only slots below its `npolys`, and the
+        // copy is `npolys` cosets long)
+        let tmp = key_tmp.as_mut_slice::<Scalar>();
+        // `fills` implies a lent copy, allocated by `device_run`; without one
+        // the slot's digest is missing and the call declines
+        let mut slots =
+            lent.as_mut().and_then(|l| l.buf.as_mut()).map(|b| b.as_mut_slice::<Scalar>());
+        let (mut ti, mut reduced, mut filled) = (0, true, Vec::new());
+        for (i, (p, pl)) in keys.iter().zip(places).enumerate() {
+            match pl {
+                Place::Temp => {
+                    reduced &= copy_checked(&mut tmp[ti * en..(ti + 1) * en], p);
+                    ti += 1;
+                }
+                Place::Resident(slot) => {
+                    if fills[i]
+                        && let Some(b) = slots.as_deref_mut()
+                    {
+                        reduced &= copy_checked(&mut b[slot * en..(slot + 1) * en], p);
+                        filled.push(*slot);
+                    }
+                }
+            }
+            if !reduced {
+                break;
+            }
+        }
+        (dh.join().unwrap_or_default(), reduced, filled)
+    });
+    if !reduced {
+        return KeyWork {
+            digests: Vec::new(),
+            reduced,
+            filled,
+        };
+    }
+    let slot_digests = match lent.as_ref().and_then(|l| l.buf.as_ref()) {
+        Some(b) => {
+            let b = b.as_slice::<Scalar>();
+            let in_slots: Vec<&[Scalar]> =
+                filled.iter().map(|s| &b[s * en..(s + 1) * en]).collect();
+            keys::digest_many(&in_slots)
+        }
+        None => Vec::new(),
+    };
+    // in the order of `check` (both lists follow it)
+    let (mut h, mut f) = (host_digests.into_iter(), slot_digests.into_iter());
+    let digests: Option<Vec<[u8; 32]>> =
+        check.iter().map(|&i| if fills[i] { f.next() } else { h.next() }).collect();
+    KeyWork {
+        digests: digests.unwrap_or_default(),
+        reduced,
+        filled,
+    }
+}
+
+/// Step 3: moves the proof's polynomials of `j` to the extended coset,
+/// polynomial `i` into its place `i` of `cosets`. `src[0]` holds the first
+/// polynomial already; the copy of polynomial `i + 1` into one coefficient
+/// buffer (checked reduced) runs on a CPU thread while the device transforms
+/// polynomial `i` from the other. Returns the GPU time.
+fn proof_cosets(
+    c: &Ctx,
+    j: &QuotientJobAbi,
+    proof: &[&[Scalar]],
+    src: [&mut Buffer; 2],
+    cosets: &Buffer,
+    tmp: &Buffer,
+) -> Result<u64, Reason> {
+    let [src_a, src_b] = src;
+    let (k, ext_k) = (j.k, j.ext_k);
+    let ebytes = SCALAR_BYTES << ext_k;
+    let mut ns = 0;
+    for i in 0..proof.len() {
+        let (cur, next) = if i % 2 == 0 {
+            (&*src_a, &mut *src_b)
+        } else {
+            (&*src_b, &mut *src_a)
+        };
+        let following = proof.get(i + 1).copied();
+        let (r, copied) = std::thread::scope(|sc| {
+            let h = following.map(|f| sc.spawn(move || copy_checked(next.as_mut_slice(), f)));
+            let r =
+                ntt::coeff_to_extended_dev_at(c, cur, cosets, i * ebytes, tmp, k, ext_k, &j.zeta);
+            (r, h.is_none_or(|h| h.join().unwrap_or(false)))
+        });
+        ns += r.map_err(err)?;
+        if !copied {
+            return Err(Reason::Unreduced);
+        }
+    }
+    Ok(ns)
+}
+
+/// The uploads again after [`keys::settle`] moved a stale polynomial out of
+/// its slot: a new buffer with every `Temp` polynomial. The call's other
+/// buffers are allocated already, so this one is held to the limits alone.
+fn upload_again(
+    c: &Ctx,
+    info: &MetalInfo,
+    keys: &[&[Scalar]],
+    places: &[Place],
+    en: usize,
+) -> Result<Buffer, Reason> {
+    let (_, nt) = banks(places);
+    let bytes = nt * en * SCALAR_BYTES;
+    if bytes as u64 > memory_limit() || bytes as u64 > info.max_buffer_length {
+        return Err(Reason::Memory);
+    }
+    let mut kt = c.alloc_pooled(bytes).map_err(err)?;
+    let ks = kt.as_mut_slice::<Scalar>();
+    let temps = keys.iter().zip(places).filter(|(_, pl)| **pl == Place::Temp);
+    // `kt` holds one coset per `Temp` place
+    for (ti, (p, _)) in temps.enumerate() {
+        if !copy_checked(&mut ks[ti * en..(ti + 1) * en], p) {
+            return Err(Reason::Unreduced);
+        }
+    }
+    Ok(kt)
 }
 
 /// The bank and index of each proving-key polynomial, and the number of
@@ -673,407 +1062,92 @@ fn banks(places: &[Place]) -> (Vec<(u32, usize)>, usize) {
     (bank_of, ti)
 }
 
-/// The quotient of `j` into `out`, or with `numerator` the whole numerator
-/// read back into it (and `out` untouched). Returns the GPU time.
-///
-/// # Safety
-/// The job's contract.
-unsafe fn run(
+/// The dispatch parameters of the numerator, but for the row range.
+fn numerator_params(
     j: &QuotientJobAbi,
-    out: &mut [Scalar],
-    mut numerator: Option<&mut Vec<Scalar>>,
-) -> Result<u64, Reason> {
-    let t_start = Instant::now();
-    let mut st = QuotientStages::default();
-    checked(j, numerator.is_none().then_some(out.len()))?;
-    // SAFETY: the job's contract.
-    let mut tab = unsafe { Tables::new(j)? };
-    // SAFETY: the job's contract.
-    let t_inv = unsafe { abi::slice(j.t_inv, j.nt_inv) };
-    if !field::all_reduced(t_inv) {
-        return Err(Reason::Unreduced);
+    tab: &Tables<'_>,
+    lagrange: [u32; 3],
+    threads: usize,
+) -> Params {
+    let omega = j.extended_omega;
+    Params {
+        ext_k: j.ext_k,
+        log_scale: j.ext_k - j.k,
+        mask: ((1usize << j.ext_k) - 1) as u32,
+        threads: threads as u32,
+        gates: tab.gates,
+        perm_nsets: j.perm_nsets as u32,
+        perm_ncolumns: j.perm_ncolumns as u32,
+        perm_chunk_len: j.perm_chunk_len,
+        perm_last_rotation: j.perm_last_rotation,
+        perm: tab.perm,
+        nlookups: j.nlookups as u32,
+        lookups: tab.lookups,
+        ntrash: j.ntrash as u32,
+        trash: tab.trash,
+        l0: lagrange[0],
+        l_last: lagrange[1],
+        l_active: lagrange[2],
+        y: j.y,
+        beta: j.beta,
+        gamma: j.gamma,
+        delta_start: j.delta_start,
+        delta: j.delta,
+        omega,
+        omega_step: pow(&omega, threads as u64),
+        ..Default::default()
     }
-    // the scalars passed by value to the transform helpers, whose shader
-    // arithmetic needs reduced inputs: `checked` has checked them already
-    // (the shift and its inverse, `zeta_out`, the divisor, the roots by
-    // equality with the standard roots); checked again here, next to their
-    // use, so that a change to `checked` cannot let one through
-    let by_value = [
-        j.zeta[0],
-        j.zeta[1],
-        j.zeta_out[0],
-        j.zeta_out[1],
-        j.divisor,
-        j.extended_omega,
-        j.omega_inv,
-    ];
-    if !field::all_reduced(&by_value) {
-        return Err(Reason::Unreduced);
+}
+
+/// Step 4: the numerator over the `en` rows, one command buffer per row
+/// range. `bufs` are the kernel's buffers 0 to 6 (`quotient_numerator` of
+/// `shaders/quotient.metal`). The first range is sized from an estimate of
+/// about 0.5 ns per field multiplication of a row, the next ones from the
+/// measured time per row, each aiming at the target GPU time. Returns the
+/// GPU time and the command buffers.
+fn numerator_ranges(
+    c: &Ctx,
+    bufs: [&Buffer; 7],
+    mut p: Params,
+    cost_per_row: u64,
+    en: usize,
+    threads: usize,
+) -> Result<(u64, u32), Reason> {
+    let cost = cost_per_row.max(1) + 8;
+    let target = TARGET.load(Relaxed);
+    let mut rows = ((target / 2) / cost).max(threads as u64) as usize;
+    let (mut row0, mut total, mut runs) = (0usize, 0u64, 0u32);
+    while row0 < en {
+        let rows_now = rows.min(en - row0).div_ceil(threads) * threads;
+        let end = (row0 + rows_now).min(en);
+        p.row0 = row0 as u32;
+        p.row_end = end as u32;
+        let disp = threads.min(end - row0);
+        let ns = c
+            .run(|cmd| {
+                cmd.dispatch(
+                    "quotient_numerator",
+                    disp,
+                    &[
+                        Arg::Buffer(bufs[0]),
+                        Arg::Buffer(bufs[1]),
+                        Arg::Buffer(bufs[2]),
+                        Arg::Buffer(bufs[3]),
+                        Arg::Buffer(bufs[4]),
+                        Arg::Buffer(bufs[5]),
+                        Arg::Buffer(bufs[6]),
+                        Arg::value(&p),
+                    ],
+                )
+            })
+            .map_err(err)?
+            .1;
+        total += ns;
+        runs += 1;
+        let per_row = (ns as f64 / (end - row0) as f64).max(0.01);
+        let want = (target as f64 / per_row) as usize;
+        rows = want.clamp(threads, rows.saturating_mul(8).max(threads));
+        row0 = end;
     }
-    let (k, ext_k) = (j.k, j.ext_k);
-    let (n, en) = (1usize << k, 1usize << ext_k);
-    let ebytes = SCALAR_BYTES << ext_k;
-    let nproof = tab.proof.len();
-    let nslots = j.nslots as usize;
-    let threads = stride(ext_k);
-
-    let mut s = ctx::lock().map_err(err)?;
-    let c: &'static Ctx = s.ctx();
-    let info = crate::present().ok_or(Reason::NoDevice)?;
-
-    // the proving-key polynomials: resident or uploaded, placed before their
-    // digests are checked (they are checked while the device works on the
-    // proof's polynomials, and settled before the numerator reads a slot)
-    let mut plan = keys::plan(&tab.keys, en);
-    let ntemp = plan.places.iter().filter(|p| **p == Place::Temp).count();
-
-    // memory: every buffer this call can allocate (the same sum as
-    // `need_bytes`)
-    let need = need_of(j, &tab, t_inv, &plan, &s, numerator.is_none());
-    let tmp_need = ntt::scratch_bytes(ext_k);
-    let fits = need.total() as u64 <= memory_limit()
-        && need.biggest() as u64 <= info.max_buffer_length;
-    if !fits {
-        if let Some(l) = plan.lent.take() {
-            l.give_back();
-        }
-        return Err(Reason::Memory);
-    }
-    let bytes0 = ctx::in_use_bytes();
-    st.prepare = t_start.elapsed().as_nanos() as u64;
-
-    let r = (|| -> Result<u64, Reason> {
-        let mut gpu = 0u64;
-        // transform scratch (per request: it holds witness values)
-        if tmp_need > 0 {
-            s.scratch("quotient-tmp", tmp_need).map_err(err)?;
-        }
-        let proof_buf = c.alloc_pooled(nproof.max(1) * ebytes).map_err(err)?;
-        let mut src_a = c.alloc_pooled(n * SCALAR_BYTES).map_err(err)?;
-        let mut src_b = c.alloc_pooled(n * SCALAR_BYTES).map_err(err)?;
-        let mut key_tmp = c.alloc_pooled(ntemp * ebytes).map_err(err)?;
-        if let Some(l) = plan.lent.as_mut()
-            && l.buf.is_none()
-        {
-            l.buf = Some(c.alloc_pooled(l.npolys * ebytes).map_err(err)?);
-        }
-        let tmp_ref: Option<&Buffer> = if tmp_need > 0 {
-            s.get_scratch("quotient-tmp")
-        } else {
-            None
-        };
-        // without transform scratch (one-pass sizes) the scratch argument is
-        // not read
-        let dummy = c.alloc(0).map_err(err)?;
-        let tmp = tmp_ref.unwrap_or(&dummy);
-
-        // keys on CPU threads (digests, uploads, slot refills), cosets on the
-        // device; the copy of the first proof polynomial comes first, alone
-        // on the CPU, as the device waits for it
-        let t_cos = Instant::now();
-        if let Some(first) = tab.proof.first()
-            && !copy_checked(src_a.as_mut_slice::<Scalar>(), first)
-        {
-            return Err(Reason::Unreduced);
-        }
-        let keys_list = &tab.keys;
-        let places_ref = &plan.places;
-        let check_ref = &plan.check;
-        // the polynomials whose slot this call fills: their digests are
-        // computed over the bytes copied into the slot, so that a slot is
-        // only ever marked present (at `keys::settle`) with verified content
-        let fills: Vec<bool> = (0..tab.keys.len()).map(|i| plan.fills(i)).collect();
-        let fills_ref = &fills;
-        let lent_ref = &mut plan.lent;
-        let key_tmp_ref = &mut key_tmp;
-        let proof_list = &tab.proof;
-        let zeta = j.zeta;
-        // (digests in the order of `check`, copies good, slots filled, wall)
-        type KeyWork = (Vec<[u8; 32]>, bool, Vec<usize>, u64);
-        let (key_work, cos): (KeyWork, Result<u64, Reason>) = std::thread::scope(|sc| {
-            let kh = sc.spawn(move || -> KeyWork {
-                let t = Instant::now();
-                // the registered polynomials read from host memory
-                let host_hash: Vec<&[Scalar]> = check_ref
-                    .iter()
-                    .filter(|&&i| !fills_ref[i])
-                    .map(|&i| keys_list[i])
-                    .collect();
-                let (host_digests, (ok, filled)) = std::thread::scope(|sc2| {
-                    let dh = sc2.spawn(|| keys::digest_many(&host_hash));
-                    let tmp_slice = key_tmp_ref.as_mut_slice::<Scalar>();
-                    let mut ti = 0;
-                    let mut ok = true;
-                    let mut filled = Vec::new();
-                    for (i, (p, pl)) in keys_list.iter().zip(places_ref).enumerate() {
-                        match pl {
-                            Place::Temp => {
-                                ok &= copy_checked(&mut tmp_slice[ti * en..(ti + 1) * en], p);
-                                ti += 1;
-                            }
-                            Place::Resident(slot) => {
-                                if fills_ref[i] {
-                                    let l = lent_ref.as_mut().expect("a lent copy");
-                                    let b =
-                                        l.buf.as_mut().expect("allocated").as_mut_slice::<Scalar>();
-                                    ok &= copy_checked(&mut b[slot * en..(slot + 1) * en], p);
-                                    filled.push(*slot);
-                                }
-                            }
-                        }
-                        if !ok {
-                            break;
-                        }
-                    }
-                    (dh.join().unwrap_or_default(), (ok, filled))
-                });
-                if !ok {
-                    return (Vec::new(), false, filled, t.elapsed().as_nanos() as u64);
-                }
-                // the bytes now in the filled slots
-                let slot_digests = match lent_ref.as_ref().and_then(|l| l.buf.as_ref()) {
-                    Some(b) => {
-                        let b = b.as_slice::<Scalar>();
-                        let in_slots: Vec<&[Scalar]> =
-                            filled.iter().map(|s| &b[s * en..(s + 1) * en]).collect();
-                        keys::digest_many(&in_slots)
-                    }
-                    None => Vec::new(),
-                };
-                // in the order of `check` (both lists follow it)
-                let (mut h, mut f) = (host_digests.into_iter(), slot_digests.into_iter());
-                let digests: Option<Vec<[u8; 32]>> = check_ref
-                    .iter()
-                    .map(|&i| if fills_ref[i] { f.next() } else { h.next() })
-                    .collect();
-                (digests.unwrap_or_default(), ok, filled, t.elapsed().as_nanos() as u64)
-            });
-            let cos = (|| -> Result<u64, Reason> {
-                let mut ns = 0;
-                for i in 0..proof_list.len() {
-                    let (cur, next) = if i % 2 == 0 {
-                        (&src_a, &mut src_b)
-                    } else {
-                        (&src_b, &mut src_a)
-                    };
-                    // the copy of the next polynomial runs on the CPU while
-                    // the device transforms this one straight into its place
-                    let following = proof_list.get(i + 1).copied();
-                    let (r, copied) = std::thread::scope(|sc2| {
-                        let h = following.map(|f| {
-                            sc2.spawn(move || copy_checked(next.as_mut_slice::<Scalar>(), f))
-                        });
-                        let r = ntt::coeff_to_extended_dev_at(
-                            c,
-                            cur,
-                            &proof_buf,
-                            i * ebytes,
-                            tmp,
-                            k,
-                            ext_k,
-                            &zeta,
-                        );
-                        (r, h.is_none_or(|h| h.join().unwrap_or(false)))
-                    });
-                    ns += r.map_err(err)?;
-                    if !copied {
-                        return Err(Reason::Unreduced);
-                    }
-                }
-                Ok(ns)
-            })();
-            let kw = kh.join().unwrap_or_default();
-            (kw, cos)
-        });
-        let (digests, keys_ok, filled, keys_ns) = key_work;
-        st.keys = keys_ns;
-        gpu += cos?;
-        st.gpu_cosets = gpu;
-        if !keys_ok {
-            return Err(Reason::Unreduced);
-        }
-        if digests.len() != plan.check.len() {
-            return Err(Reason::DeviceError);
-        }
-        st.peak_bytes = ctx::in_use_bytes().saturating_sub(bytes0);
-        ctx::release_later(vec![src_a, src_b]);
-        st.cosets = t_cos.elapsed().as_nanos() as u64;
-
-        // the digests settle the placement: a stale polynomial is uploaded
-        let t_num = Instant::now();
-        if keys::settle(&mut plan, &tab.keys, &digests) {
-            // the uploads again, now with the stale ones (the buffers of the
-            // call are allocated already: only this one is new)
-            let (_, nt) = banks(&plan.places);
-            let more = (nt * ebytes) as u64;
-            if more > memory_limit() || more > info.max_buffer_length {
-                return Err(Reason::Memory);
-            }
-            let mut kt = c.alloc_pooled(nt * ebytes).map_err(err)?;
-            let ks = kt.as_mut_slice::<Scalar>();
-            let mut ti = 0;
-            for (p, pl) in tab.keys.iter().zip(&plan.places) {
-                if *pl == Place::Temp {
-                    if !copy_checked(&mut ks[ti * en..(ti + 1) * en], p) {
-                        return Err(Reason::Unreduced);
-                    }
-                    ti += 1;
-                }
-            }
-            key_tmp = kt;
-        }
-        let (bank_of, ntemp) = banks(&plan.places);
-        let lagrange = tab.place_keys(&bank_of);
-        st.uploaded_polys = ntemp as u32;
-        st.resident_polys = (plan.places.len() - ntemp) as u32;
-        st.key_copies_made = filled
-            .iter()
-            .filter(|s| plan.lent.as_ref().is_some_and(|l| l.present[**s]))
-            .count() as u32;
-
-        // the numerator, into `nu`
-        let nu = c.alloc_pooled(ebytes).map_err(err)?;
-        let scratch = c.alloc_pooled(nslots.max(1) * threads * SCALAR_BYTES).map_err(err)?;
-        let words = c.upload(&tab.words).map_err(err)?;
-        let unis = if tab.uniforms.is_empty() {
-            c.alloc(0)
-        } else {
-            c.upload(&tab.uniforms)
-        }
-        .map_err(err)?;
-        let key_res: &Buffer = plan.lent.as_ref().and_then(|l| l.buf.as_ref()).unwrap_or(&dummy);
-        let key_tmp_b: &Buffer = if ntemp > 0 { &key_tmp } else { &dummy };
-        let omega = j.extended_omega;
-        let mut p = Params {
-            ext_k,
-            log_scale: ext_k - k,
-            mask: (en - 1) as u32,
-            threads: threads as u32,
-            gates: tab.gates,
-            perm_nsets: j.perm_nsets as u32,
-            perm_ncolumns: j.perm_ncolumns as u32,
-            perm_chunk_len: j.perm_chunk_len,
-            perm_last_rotation: j.perm_last_rotation,
-            perm: tab.perm,
-            nlookups: j.nlookups as u32,
-            lookups: tab.lookups,
-            ntrash: j.ntrash as u32,
-            trash: tab.trash,
-            l0: lagrange[0],
-            l_last: lagrange[1],
-            l_active: lagrange[2],
-            y: j.y,
-            beta: j.beta,
-            gamma: j.gamma,
-            delta_start: j.delta_start,
-            delta: j.delta,
-            omega,
-            omega_step: pow(&omega, threads as u64),
-            ..Default::default()
-        };
-        // rows per command buffer: a first estimate at about 0.5 ns per
-        // field multiplication of a row, then from the measured time per row
-        let cost = tab.cost_per_row.max(1) + 8;
-        let target = TARGET.load(Relaxed);
-        let mut rows = ((target / 2) / cost).max(threads as u64) as usize;
-        let mut row0 = 0usize;
-        let mut ns_num = 0u64;
-        while row0 < en {
-            let rows_now = rows.min(en - row0).div_ceil(threads) * threads;
-            let end = (row0 + rows_now).min(en);
-            p.row0 = row0 as u32;
-            p.row_end = end as u32;
-            let disp = threads.min(end - row0);
-            let pp = p;
-            let ns = c
-                .run(|cmd| {
-                    cmd.dispatch(
-                        "quotient_numerator",
-                        disp,
-                        &[
-                            Arg::Buffer(&proof_buf),
-                            Arg::Buffer(key_res),
-                            Arg::Buffer(key_tmp_b),
-                            Arg::Buffer(&words),
-                            Arg::Buffer(&unis),
-                            Arg::Buffer(&nu),
-                            Arg::Buffer(&scratch),
-                            Arg::value(&pp),
-                        ],
-                    )
-                })
-                .map_err(err)?
-                .1;
-            ns_num += ns;
-            st.numerator_runs += 1;
-            let per_row = (ns as f64 / (end - row0) as f64).max(0.01);
-            let want = (target as f64 / per_row) as usize;
-            rows = want.clamp(threads, rows.saturating_mul(8).max(threads));
-            row0 = end;
-        }
-        gpu += ns_num;
-        st.gpu_numerator = ns_num;
-        st.peak_bytes = st.peak_bytes.max(ctx::in_use_bytes().saturating_sub(bytes0));
-        if let Some(l) = plan.lent.take() {
-            l.give_back();
-        }
-        // the buffers of the cosets are zeroed (on the CPU, in the
-        // background) while the device divides and transforms; the zeroing
-        // ends before the request ends (`end_request` waits for it)
-        ctx::release_later(vec![scratch, proof_buf, key_tmp, words, unis]);
-        st.numerator = t_num.elapsed().as_nanos() as u64;
-
-        if let Some(v) = numerator.as_mut() {
-            v.clear();
-            v.extend_from_slice(&nu.as_slice::<Scalar>()[..en]);
-            ctx::release_later(vec![nu]);
-            return Ok(gpu);
-        }
-
-        // h = nu / t on the coset, then extended_to_coeff, in the command
-        // buffers of the inverse transform
-        let t_inv_ntt = Instant::now();
-        let tinv = c.upload(t_inv).map_err(err)?;
-        let log_tn = t_inv.len().ilog2();
-        let tmp2 = tmp_ref.unwrap_or(&dummy);
-        let ns = ntt::divide_extended_to_coeff_dev(
-            c,
-            &nu,
-            tmp2,
-            ext_k,
-            &j.divisor,
-            &j.zeta_out,
-            &tinv,
-            log_tn,
-        )
-        .map_err(err)?;
-        gpu += ns;
-        st.gpu_inverse = ns;
-        st.inverse = t_inv_ntt.elapsed().as_nanos() as u64;
-
-        // the first `len` coefficients. Everything that can fail or panic is
-        // done before the first byte of `out` is written (a panic becomes a
-        // decline, which must leave `out` unchanged): `tinv` is released, the
-        // source is sliced (`checked` has held `out.len()` to `j.len <= en`)
-        // and the resident copy was given back after the numerator. What
-        // follows the copy cannot fail: `ctx::par_copy` and
-        // `ctx::release_later` never panic, and the rest of `run` and of
-        // `quotient` stores counters and takes poison-tolerant locks.
-        let t_rb = Instant::now();
-        drop(tinv);
-        debug_assert!(plan.lent.is_none());
-        let src = &nu.as_slice::<Scalar>()[..out.len()];
-        ctx::par_copy(out, src);
-        ctx::release_later(vec![nu]);
-        st.readback = t_rb.elapsed().as_nanos() as u64;
-        Ok(gpu)
-    })();
-    if let Some(l) = plan.lent.take() {
-        l.give_back();
-    }
-    drop(s);
-    if r.is_ok() && numerator.is_none() {
-        *LAST_STAGES.lock().unwrap_or_else(|e| e.into_inner()) = Some(st);
-    }
-    r
+    Ok((total, runs))
 }

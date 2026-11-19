@@ -11,8 +11,9 @@
 // See the License for the specific language governing permissions and
 // limitations under the License.
 
-// Test kernels of the G1 curve code (g1.h) and of the MSM mask; the tests in
-// tests/msm.rs compare them with blst.
+// Test kernels of the G1 curve code (g1.h) and of the MSM mask (msm.h); the
+// tests in tests/msm.rs compare them with blst and with the CUDA crate's
+// mask vector.
 
 #include "fp.h"
 #include "g1.h"
@@ -20,12 +21,11 @@
 
 namespace msm_test {
 
-// Operation codes of `msm_test_g1` (the tests use the same numbers).
+// Operation codes of `msm_test_g1` (tests/msm.rs uses the same numbers).
 enum : uint {
     OP_MADD = 0,       // a + b_affine, or a - b_affine with the flag
     OP_ADD = 1,        // a + b
-    OP_DBL = 2,        // 2 a
-    OP_FROM_AFFINE = 3 // b_affine as XYZZ, negated with the flag
+    OP_FROM_AFFINE = 2 // b_affine as XYZZ, negated with the flag
 };
 
 } // namespace msm_test
@@ -45,7 +45,6 @@ kernel void msm_test_g1(device const g1::Xyzz *a [[buffer(0)]],
     switch (op) {
     case OP_MADD: g1::add(r, b_affine[i], flag); break;
     case OP_ADD: g1::add(r, b[i]); break;
-    case OP_DBL: g1::dbl(r); break;
     default:
         r = g1::from_affine(b_affine[i]);
         g1::cneg(r, flag);

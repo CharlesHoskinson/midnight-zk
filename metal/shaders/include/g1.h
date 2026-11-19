@@ -16,10 +16,11 @@
 // The formulas are transcribed from sppark `ec/xyzz_t.hpp` (Copyright
 // Supranational LLC, Apache-2.0; https://github.com/supranational/sppark,
 // commit 08033103c14ff3c742e710b9463dde42acc0f058, vendored in
-// gpu/third_party/sppark): the addition `add-2008-s`, the mixed addition
+// gpu/third_party/sppark): the addition `add-2008-s` and the mixed addition
 // `madd-2008-s` (with sppark's twists for a subtraction and for either input
-// at infinity) and the doubling `dbl-2008-s-1` of the Explicit-Formulas
-// Database, short Weierstrass with a = 0.
+// at infinity), with the doublings `dbl-2008-s-1` and `mdbl-2008-s-1` for
+// equal inputs, of the Explicit-Formulas Database, short Weierstrass with
+// a = 0.
 //
 // - `g1::Affine`: `x`, `y` in `Fp`, the bytes of a host `blst_p1_affine`
 //   (`G1AffineLimbs`); the point at infinity is all zero.
@@ -139,29 +140,6 @@ MONT_INLINE void add(thread Xyzz &p31, Xyzz p2) {
     } else {                       // X1 == X2, Y1 == -Y2
         p31 = inf();
     }
-}
-
-// p31 = 2 * p31: the doubling branch of `add` (dbl-2008-s-1) on its own.
-MONT_INLINE void dbl(thread Xyzz &p31) {
-    if (is_inf(p31)) {
-        p31 = inf();
-        return;
-    }
-    Fp U = fp_dbl(p31.Y);          // U = 2*Y1
-    Fp V = mul(U, U);              // V = U^2
-    Fp W = mul(U, V);              // W = U*V
-    Fp S = mul(p31.X, V);          // S = X1*V
-    Fp M = mul(p31.X, p31.X);
-    M = fp_add(fp_dbl(M), M);      // M = 3*X1^2
-    p31.X = mul(M, M);
-    p31.X = fp_sub(p31.X, S);
-    p31.X = fp_sub(p31.X, S);      // X3 = M^2-2*S
-    p31.Y = mul(p31.Y, W);         // W*Y1
-    S = fp_sub(S, p31.X);
-    S = mul(S, M);                 // M*(S-X3)
-    p31.Y = fp_sub(S, p31.Y);      // Y3 = M*(S-X3)-W*Y1
-    p31.ZZ = mul(p31.ZZ, V);       // ZZ3 = V*ZZ1
-    p31.ZZZ = mul(p31.ZZZ, W);     // ZZZ3 = W*ZZZ1
 }
 
 // p31 += p2, or p31 -= p2 when `subtract` (sppark `xyzz_t::add(const

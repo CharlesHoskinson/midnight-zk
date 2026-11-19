@@ -44,11 +44,10 @@ using namespace metal;
 // ---------------------------------------------------------------------------
 // Scalars to digits (sppark `breakdown`), with the skew mask (msm.h).
 
-// Scalar modes of `msm_digits`.
+// Scalar modes of `msm_digits` (src/msm/pipeline.rs `MODE_*`).
 enum : uint {
-    MODE_SCALARS = 0,  // s
-    MODE_MASKED = 1,   // s + r
-    MODE_MASK = 2,     // r
+    MODE_MASKED = 1,  // s + r
+    MODE_MASK = 2,    // r
 };
 
 struct DigitsParams {
@@ -411,7 +410,6 @@ kernel void msm_ones(device g1::Xyzz *ones [[buffer(0)]],
                      uint nthreads [[threads_per_grid]],
                      uint lane [[thread_index_in_simdgroup]]) {
     using namespace msm;
-    // the reduction below combines lanes in runs of 32
     const uint ndigits = hist[0];
 
     g1::Xyzz acc = g1::inf();
@@ -420,6 +418,7 @@ kernel void msm_ones(device g1::Xyzz *ones [[buffer(0)]],
         g1::add(acc, points[digit & 0x7fffffff], (digit >> 31) != 0);
     }
 
+    // reduce each run of 32 lanes into its first lane
     for (uint off = 1; off < 32;) {
         g1::Xyzz down = shuffle_down(acc, (ushort)off);
         off <<= 1;
@@ -441,9 +440,9 @@ struct AccParams {
     uint nwins;
     uint bits;       // wbits - 1
     uint stride;     // digits row length
-    uint hot_limit;  // the most points of one bucket (src/msm.rs HOT_BUCKET_LIMIT)
+    uint hot_limit;  // the most points of one bucket (`HOT_BUCKET_LIMIT`)
 };
-// Threads of an `msm_accumulate` group (src/msm.rs `ACC_GROUP`).
+// Threads of an `msm_accumulate` group (src/msm/pipeline.rs `ACC_GROUP`).
 constant uint ACC_GROUP = 256;
 } // namespace msm
 
@@ -459,8 +458,8 @@ MONT_INLINE uint bucket_len(device const uint *hist, constant msm::AccParams &p,
     return (x == 0 && y == 0) ? 0 : h[x] - idx;
 }
 
-// The hot-bucket bound (src/msm.rs `HOT_BUCKET_LIMIT`): one thread per
-// bucket; `hot` is set when a bucket (the bucket of `msm_ones` excepted)
+// The hot-bucket bound (src/msm/pipeline.rs `HOT_BUCKET_LIMIT`): one thread
+// per bucket; `hot` is set when a bucket (the bucket of `msm_ones` excepted)
 // holds more than `hot_limit` points. Then `msm_accumulate` writes infinity
 // to every bucket without reading any point, and the host declines the call
 // (it reads `hot` after the command buffer).

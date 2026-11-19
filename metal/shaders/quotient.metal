@@ -20,7 +20,7 @@
 // `QuotientJob::numerator_reference` computes them. Field arithmetic is exact,
 // so every value equals the CPU value bit for bit.
 //
-// Where Metal forces a different structure than CUDA:
+// Where the structure differs from CUDA:
 // - No pointer tables. A polynomial is a "handle" `(bank << 30) | index`: the
 //   extended coset `index` (2^ext_k values) of one of three flat buffers,
 //   bank 0 the proof's cosets, bank 1 the resident proving-key copy, bank 2
@@ -244,9 +244,3 @@ kernel void quotient_numerator(device const Fr *proof [[buffer(0)]],
     }
 }
 
-// dst[i] = src[i] (dst bound at the offset of one coset in a flat buffer).
-kernel void quotient_copy(device const Fr *src [[buffer(0)]],
-                          device Fr *dst [[buffer(1)]],
-                          uint gid [[thread_position_in_grid]]) {
-    dst[gid] = src[gid];
-}

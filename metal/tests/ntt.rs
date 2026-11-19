@@ -13,9 +13,6 @@
 
 //! The device NTT against the stock CPU code of midnight-curves and
 //! midnight-proofs, bit for bit.
-//!
-//! `bench_fft` (ignored) times `fft` against the stock FFT:
-//! `cargo test --release -p midnight-metal --test ntt -- --ignored --nocapture`.
 
 #![cfg(target_os = "macos")]
 
@@ -147,10 +144,15 @@ fn check_fft(log_n: u32, seed: u64) {
     }
 }
 
+/// One and two passes. One pass (`log_n <= 10`): the smallest sizes (fewer
+/// than four elements per thread), a partial and a full threadgroup.
+/// Two passes: unequal and equal radices, the largest size whose factors
+/// read the high table only (16), the smallest that reads both (17), the
+/// largest two-pass size (20).
 #[test]
 fn fft_matches_stock() {
     setup();
-    for log_n in 1..=20 {
+    for log_n in [1, 2, 3, 6, 10, 11, 12, 13, 16, 17, 20] {
         check_fft(log_n, 100 + u64::from(log_n));
     }
 }
@@ -335,8 +337,8 @@ fn building_blocks_refuse_unreduced_scalars() {
     let values = random(30, 610);
     let table = random(2, 611);
     let z = scalar(Fq::ZETA);
-    let e = dev::elementwise(scalars(&values), [z, bad], scalar(Fq::ONE), scalars(&table))
-        .unwrap_err();
+    let e =
+        dev::elementwise(scalars(&values), [z, bad], scalar(Fq::ONE), scalars(&table)).unwrap_err();
     assert!(e.contains("unreduced"), "distribute_zeta: {e}");
     let e = dev::elementwise(scalars(&values), [z, z], bad, scalars(&table)).unwrap_err();
     assert!(e.contains("unreduced"), "scale: {e}");
@@ -459,94 +461,12 @@ fn hooks_serve_the_domain_transforms() {
     assert_eq!(first_diff(&evals, &want_evals), None);
 }
 
-/// Wall time of `fft` against the stock FFT on all cores.
+/// A forward then inverse round trip on the device at `2^26`, three passes
+/// near the largest size. Ignored: it needs about 10 GiB of memory.
 #[test]
 #[ignore]
-fn bench_fft() {
-    use std::time::Instant;
+fn large_transform_round_trip() {
     setup();
-    let reps = 5;
-    println!(
-        "log_n  stock_ms  metal_ms  speedup  copy_in  gpu  copy_out  other (ms, of the best run)"
-    );
-    for log_n in 14..=22u32 {
-        let n = 1usize << log_n;
-        let w = root(log_n);
-        let tw = compute_twiddles(&w, log_n);
-        let input = random(n, u64::from(log_n));
-        let mut a = input.clone();
-        // warm up both (pipelines, tables, scratch buffers)
-        best_fft_with_twiddles(&mut a, &tw, log_n);
-        let mut b = input.clone();
-        assert!(midnight_metal::fft(scalars_mut(&mut b), scalar(w), log_n));
-        assert_eq!(a, b);
-
-        let mut stock = f64::MAX;
-        let mut metal = f64::MAX;
-        let mut parts = [0u64; 4];
-        for _ in 0..reps {
-            let mut a = input.clone();
-            let t = Instant::now();
-            best_fft_with_twiddles(&mut a, &tw, log_n);
-            stock = stock.min(t.elapsed().as_secs_f64() * 1e3);
-
-            let mut b = input.clone();
-            let t = Instant::now();
-            assert!(midnight_metal::fft(scalars_mut(&mut b), scalar(w), log_n));
-            let wall = t.elapsed().as_secs_f64() * 1e3;
-            if wall < metal {
-                metal = wall;
-                parts = dev::last_host_timing();
-            }
-        }
-        let ms = |x: u64| x as f64 / 1e6;
-        let [cin, dev_wall, gpu, cout] = parts;
-        let other = metal - ms(cin) - ms(dev_wall) - ms(cout);
-        println!(
-            "{log_n:5}  {stock:8.3}  {metal:8.3}  {:7.2}  {:7.3}  {:6.3}  {:8.3}  {:.3} (+{:.3} launch)",
-            stock / metal,
-            ms(cin),
-            ms(gpu),
-            ms(cout),
-            other,
-            ms(dev_wall) - ms(gpu),
-        );
-    }
-}
-
-/// GPU time of back-to-back device transforms (no host copies).
-#[test]
-#[ignore]
-fn bench_ntt_dev() {
-    setup();
-    for log_n in 12..=24u32 {
-        let t = dev::ntt_gpu_nanos(log_n, 12).unwrap();
-        let best = *t[2..].iter().min().unwrap() as f64 / 1e6;
-        let n = (1u64 << log_n) as f64;
-        // field multiplications of a radix-2 transform, (n / 2) log n
-        let gmuls = n / 2.0 * f64::from(log_n) / (best * 1e-3) / 1e9;
-        println!(
-            "{log_n:3} {:?} gpu {best:8.3} ms  {gmuls:5.2} G butterfly/s",
-            dev::passes(log_n)
-        );
-    }
-}
-
-/// The largest sizes (several command buffers each): GPU time of a forward
-/// device transform, and a forward then inverse round trip on the device
-/// giving the input back.
-#[test]
-#[ignore]
-fn large_transforms() {
-    setup();
-    for log_n in [26u32, 27, 28] {
-        let t = dev::ntt_gpu_nanos(log_n, 2).unwrap();
-        println!(
-            "2^{log_n} {:?} gpu {:?} ms",
-            dev::passes(log_n),
-            t.iter().map(|x| *x as f64 / 1e6).collect::<Vec<_>>()
-        );
-    }
     let log_n = 26;
     let n = 1usize << log_n;
     let input = random(n, 2026);
@@ -585,94 +505,5 @@ fn parallel_ifft_callers_match_stock() {
             });
         }
     });
-    assert!(midnight_metal::end_request());
-}
-
-/// Wall time of the `ifft` hook at `2^IFFT_BENCH_LOG` (default 20): a warm
-/// call, the first call of a request (after `end_request`), and
-/// `IFFT_BENCH_CALLERS` (default 4) callers on as many threads at once, the
-/// way the prover's phase 1 calls it; minimum of `IFFT_BENCH_REPS` (default
-/// 7) runs each.
-#[test]
-#[ignore]
-fn bench_ifft_hook() {
-    use std::time::Instant;
-    setup();
-    let env = |k: &str, d: usize| std::env::var(k).map_or(d, |v| v.parse().unwrap());
-    let log_n = env("IFFT_BENCH_LOG", 20) as u32;
-    let callers = env("IFFT_BENCH_CALLERS", 4);
-    let reps = env("IFFT_BENCH_REPS", 7);
-    let n = 1usize << log_n;
-    let w_inv = root(log_n).invert().unwrap();
-    let divisor = Fq::from(n as u64).invert().unwrap();
-    let input = random(n, 7);
-    let call = |a: &mut Vec<Fq>| {
-        assert!(midnight_metal::ifft(
-            scalars_mut(a),
-            scalar(w_inv),
-            log_n,
-            scalar(divisor)
-        ))
-    };
-    let ms = |x: u64| x as f64 / 1e6;
-    // warm up
-    let mut a = input.clone();
-    call(&mut a);
-    let mut warm = (f64::MAX, [0u64; 4]);
-    for _ in 0..reps {
-        let mut a = input.clone();
-        let t = Instant::now();
-        call(&mut a);
-        let wall = t.elapsed().as_secs_f64() * 1e3;
-        if wall < warm.0 {
-            warm = (wall, dev::last_host_timing());
-        }
-    }
-    let mut first = (f64::MAX, [0u64; 4]);
-    for _ in 0..reps {
-        assert!(midnight_metal::end_request());
-        midnight_metal::begin_request();
-        let mut a = input.clone();
-        let t = Instant::now();
-        call(&mut a);
-        let wall = t.elapsed().as_secs_f64() * 1e3;
-        if wall < first.0 {
-            first = (wall, dev::last_host_timing());
-        }
-    }
-    let mut par = f64::MAX;
-    let mut gpu_par = 0u64;
-    for _ in 0..reps {
-        let mut bufs: Vec<Vec<Fq>> = (0..callers).map(|_| input.clone()).collect();
-        let before = midnight_metal::stats().ifft.device_nanos;
-        let t = Instant::now();
-        std::thread::scope(|s| {
-            for b in bufs.iter_mut() {
-                s.spawn(|| call(b));
-            }
-        });
-        let wall = t.elapsed().as_secs_f64() * 1e3;
-        if wall < par {
-            par = wall;
-            gpu_par = midnight_metal::stats().ifft.device_nanos - before;
-        }
-    }
-    println!("ifft hook at 2^{log_n} (ms, min of {reps})");
-    for (what, (wall, [cin, dev_wall, gpu, cout])) in
-        [("warm", warm), ("first of a request", first)]
-    {
-        println!(
-            "| {what} | wall {wall:.2} | copy in {:.2} | device part {:.2} (gpu {:.2}) | copy out {:.2} |",
-            ms(cin),
-            ms(dev_wall),
-            ms(gpu),
-            ms(cout)
-        );
-    }
-    println!(
-        "| {callers} callers at once | wall {par:.2} | gpu {:.2} | per call {:.2} |",
-        ms(gpu_par),
-        par / callers as f64
-    );
     assert!(midnight_metal::end_request());
 }

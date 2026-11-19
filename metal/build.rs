@@ -24,6 +24,9 @@
 //! metallib the running system refuses also falls back to it. A cargo warning
 //! says which path was taken. Other targets build the stub (no shaders).
 //!
+//! The test and diagnostic kernels ([`TEST_SHADERS`]) are part of the library
+//! only with the feature `test-support`.
+//!
 //! Environment:
 //! - `MIDNIGHT_METAL_SHADER_SOURCE=1`: skip the toolchain and embed the source.
 //! - `MIDNIGHT_METAL_REQUIRE_METALLIB=1`: a missing toolchain or a failed
@@ -40,6 +43,9 @@ use std::{
 const MSL_VERSION: &str = "3.2";
 /// The oldest macOS that runs MSL [`MSL_VERSION`].
 const MACOS_MIN: &str = "15.0";
+/// Shader files of test and diagnostic kernels, compiled only with the
+/// feature `test-support`.
+const TEST_SHADERS: [&str; 3] = ["diag.metal", "field_test.metal", "msm_test.metal"];
 
 fn main() {
     let manifest = PathBuf::from(env::var("CARGO_MANIFEST_DIR").unwrap());
@@ -60,10 +66,14 @@ fn main() {
     let out = PathBuf::from(env::var("OUT_DIR").unwrap());
     println!("cargo:rustc-env=MIDNIGHT_METAL_MSL_VERSION={MSL_VERSION}");
 
+    let test_support = env::var_os("CARGO_FEATURE_TEST_SUPPORT").is_some();
     let mut files: Vec<PathBuf> = std::fs::read_dir(&shaders)
         .expect("metal/shaders exists")
         .filter_map(|e| e.ok().map(|e| e.path()))
         .filter(|p| p.extension().is_some_and(|x| x == "metal"))
+        .filter(|p| {
+            test_support || !p.file_name().is_some_and(|n| TEST_SHADERS.iter().any(|t| n == *t))
+        })
         .collect();
     files.sort();
     let include = shaders.join("include");

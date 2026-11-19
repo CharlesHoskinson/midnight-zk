@@ -11,21 +11,10 @@
 // See the License for the specific language governing permissions and
 // limitations under the License.
 
-// Diagnostic kernels of the device context (ctx.rs).
+// A diagnostic kernel of the device context (src/ctx.rs), for the crate's
+// tests (feature `test-support`).
 
 #include <metal_stdlib>
-
-// A dependent integer chain of `iters` steps per thread, to hold the GPU busy
-// for a chosen time (the command-buffer duration experiment).
-kernel void diag_spin(device uint *out [[buffer(0)]],
-                      constant uint &iters [[buffer(1)]],
-                      constant uint &n [[buffer(2)]],
-                      uint gid [[thread_position_in_grid]]) {
-    if (gid >= n) return;
-    uint x = gid * 2654435761u + 1u;
-    for (uint i = 0; i < iters; i++) x = x * 1664525u + 1013904223u;
-    out[gid] = x;
-}
 
 // out[i] = i: a smoke test of dispatch and read-back.
 kernel void diag_iota(device uint *out [[buffer(0)]],

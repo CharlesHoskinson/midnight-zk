@@ -27,13 +27,18 @@ use std::{
 /// A hook class.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub(crate) enum Class {
+    /// [`crate::msm_g1`].
     Msm,
+    /// [`crate::fft`].
     Fft,
+    /// [`crate::ifft`].
     Ifft,
+    /// [`crate::quotient`].
     Quotient,
 }
 
 impl Class {
+    /// The class's name in [`crate::declines`] and the reports.
     pub(crate) const fn name(self) -> &'static str {
         match self {
             Class::Msm => "msm",
@@ -42,13 +47,13 @@ impl Class {
             Class::Quotient => "quotient",
         }
     }
+    /// The index of the class in the service counters.
     const fn index(self) -> usize {
         self as usize
     }
 }
 
 /// A decline reason.
-#[allow(dead_code)]
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub(crate) enum Reason {
     /// Stub build, no usable device, or `MIDNIGHT_METAL=off`.
@@ -76,6 +81,7 @@ pub(crate) enum Reason {
 }
 
 impl Reason {
+    /// The reason's name in [`crate::declines`].
     pub(crate) const fn name(self) -> &'static str {
         match self {
             Reason::NoDevice => "no-device",
@@ -90,9 +96,8 @@ impl Reason {
         }
     }
 
-    /// The reason of a device-context error.
+    /// The decline reason of a device-context error.
     #[cfg(target_os = "macos")]
-    #[allow(dead_code)]
     pub(crate) fn of(e: &crate::ctx::Error) -> Self {
         match e {
             crate::ctx::Error::NoDevice(_) => Reason::NoDevice,
@@ -103,7 +108,9 @@ impl Reason {
     }
 }
 
+/// Declines by `(class, reason)`.
 static DECLINES: Mutex<BTreeMap<(&'static str, &'static str), u64>> = Mutex::new(BTreeMap::new());
+/// Calls served, and their GPU nanoseconds, by [`Class::index`].
 static SERVED: [AtomicU64; 4] = [const { AtomicU64::new(0) }; 4];
 static NANOS: [AtomicU64; 4] = [const { AtomicU64::new(0) }; 4];
 
@@ -118,12 +125,12 @@ pub(crate) fn decline(class: Class, reason: Reason) -> bool {
 }
 
 /// Counts a call served by the device, with its GPU time.
-#[allow(dead_code)]
 pub(crate) fn served(class: Class, device_nanos: u64) {
     SERVED[class.index()].fetch_add(1, Relaxed);
     NANOS[class.index()].fetch_add(device_nanos, Relaxed);
 }
 
+/// Every decline: `(class, reason, count)`.
 pub(crate) fn declines() -> Vec<(&'static str, &'static str, u64)> {
     DECLINES
         .lock()
@@ -133,6 +140,7 @@ pub(crate) fn declines() -> Vec<(&'static str, &'static str, u64)> {
         .collect()
 }
 
+/// The service counters of `class`.
 pub(crate) fn class_stats(class: Class) -> crate::ClassStats {
     crate::ClassStats {
         served: SERVED[class.index()].load(Relaxed),
@@ -140,6 +148,7 @@ pub(crate) fn class_stats(class: Class) -> crate::ClassStats {
     }
 }
 
+/// Clears every counter.
 pub(crate) fn reset() {
     for c in SERVED.iter().chain(NANOS.iter()) {
         c.store(0, Relaxed);

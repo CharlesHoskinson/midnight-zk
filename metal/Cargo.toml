@@ -15,10 +15,12 @@ build = "build.rs"
 workspace = true
 
 [features]
-# Test switches (the erasure check's planted non-zero byte, injected panics,
-# the pool inspection helpers, the quotient's numerator entry point): for
-# this crate's tests and the tests of `midnight-gpu-prover`, never for a
-# production build.
+default = []
+# Test only, never a default: the test switches (the erasure check's planted
+# non-zero byte, injected panics, the pool inspection helpers, the quotient's
+# numerator entry point) and the test kernels (`shaders/field_test.metal`,
+# `msm_test.metal`, `diag.metal`), for this crate's tests and those of
+# `midnight-gpu-prover`.
 test-support = []
 
 [dependencies]

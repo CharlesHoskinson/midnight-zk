@@ -21,23 +21,16 @@
 // A parameter struct P provides:
 //   enum : int  { N = <32-bit limbs> };
 //   enum : uint { INV = -p^-1 mod 2^32 };
-//   static ulong inv64();          // -p^-1 mod 2^64
 //   static uint mod(int i);        // limb i of p
 //   static uint one(int i);        // limb i of 2^(32 N) mod p (Montgomery one)
 // The top limb of p must be below 2^31 - 1 (the "no-carry" condition of the
 // CIOS multiplication; both BLS12-381 fields meet it), so that `a + b < 2p`
 // fits in N limbs and the products below never carry out of the top limb.
 //
-// Multiplication strategies (all exact; the benchmark in the crate's tests
-// measures them, and MONT_MUL_DEFAULT names the fastest on Apple M4 Max):
-//   mul_cios32  : CIOS over 32-bit limbs, 32x32->64 products and 64-bit
-//                 (`ulong`) accumulators.
-//   mul_mulhi32 : CIOS over 32-bit limbs, products as `a * b` and
-//                 `mulhi(a, b)` with explicit 32-bit carries (no `ulong`).
-//   mul_fips32  : product scanning (FIPS): column sums of the product and of
-//                 the reduction in a 96-bit accumulator (`ulong` + `uint`).
-//   mul_cios64  : CIOS over 64-bit limbs, products as `a * b` and
-//                 `mulhi(a, b)` on `ulong` (MSL 2.3+ on macOS).
+// Multiplication is CIOS over 32-bit limbs with 32x32->64 products and 64-bit
+// (`ulong`) accumulators: on Apple M4 Max it is faster than CIOS with
+// `mulhi` and 32-bit carries, product scanning (FIPS) and CIOS over 64-bit
+// limbs, for both fields.
 
 #ifndef MIDNIGHT_METAL_MONT_H
 #define MIDNIGHT_METAL_MONT_H
@@ -47,8 +40,6 @@
 #define MONT_INLINE inline __attribute__((always_inline))
 
 namespace mont {
-
-using metal::mulhi;
 
 template <typename P>
 struct Elem {
@@ -72,14 +63,6 @@ MONT_INLINE Elem<P> one() {
     Elem<P> r;
 #pragma unroll
     for (int i = 0; i < P::N; i++) r.l[i] = P::one(i);
-    return r;
-}
-
-template <typename P>
-MONT_INLINE Elem<P> modulus() {
-    Elem<P> r;
-#pragma unroll
-    for (int i = 0; i < P::N; i++) r.l[i] = P::mod(i);
     return r;
 }
 
@@ -191,11 +174,11 @@ MONT_INLINE Elem<P> neg(Elem<P> a) {
 }
 
 // ---------------------------------------------------------------------------
-// Multiplication strategies
+// Multiplication
 
-// CIOS, no-carry variant, 32-bit limbs with 64-bit accumulators.
+// a * b: CIOS, no-carry variant, 32-bit limbs with 64-bit accumulators.
 template <typename P>
-MONT_INLINE Elem<P> mul_cios32(Elem<P> a, Elem<P> b) {
+MONT_INLINE Elem<P> mul(Elem<P> a, Elem<P> b) {
     Elem<P> t = zero<P>();
 #pragma unroll
     for (int i = 0; i < P::N; i++) {
@@ -218,145 +201,9 @@ MONT_INLINE Elem<P> mul_cios32(Elem<P> a, Elem<P> b) {
     return reduce_once<P>(t);
 }
 
-// lo + hi * 2^32 = a * b + c + d, with 32-bit operations only.
-MONT_INLINE uint mac32(uint a, uint b, uint c, uint d, thread uint &hi) {
-    uint lo = a * b;
-    uint h = mulhi(a, b);
-    lo += c;
-    h += (lo < c) ? 1u : 0u;
-    lo += d;
-    h += (lo < d) ? 1u : 0u;
-    hi = h;
-    return lo;
-}
-
-// CIOS, no-carry variant, 32-bit limbs with `mulhi` and 32-bit carries.
-template <typename P>
-MONT_INLINE Elem<P> mul_mulhi32(Elem<P> a, Elem<P> b) {
-    Elem<P> t = zero<P>();
-#pragma unroll
-    for (int i = 0; i < P::N; i++) {
-        uint A, C;
-        uint t0 = mac32(a.l[0], b.l[i], t.l[0], 0u, A);
-        uint m = t0 * (uint)P::INV;
-        (void)mac32(m, P::mod(0), t0, 0u, C);
-#pragma unroll
-        for (int j = 1; j < P::N; j++) {
-            uint tj = mac32(a.l[j], b.l[i], t.l[j], A, A);
-            t.l[j - 1] = mac32(m, P::mod(j), tj, C, C);
-        }
-        t.l[P::N - 1] = C + A;
-    }
-    return reduce_once<P>(t);
-}
-
-// Finely integrated product scanning: column k sums a[j] b[k-j] and
-// m[j] p[k-j] in a 96-bit accumulator.
-template <typename P>
-MONT_INLINE Elem<P> mul_fips32(Elem<P> a, Elem<P> b) {
-    uint m[P::N];
-    Elem<P> u;
-    ulong acc = 0;
-    uint acc2 = 0;
-#define MONT_FIPS_MAC(x, y)                \
-    {                                      \
-        ulong p_ = (ulong)(x) * (y);       \
-        acc += p_;                         \
-        acc2 += (acc < p_) ? 1u : 0u;      \
-    }
-#pragma unroll
-    for (int i = 0; i < P::N; i++) {
-#pragma unroll
-        for (int j = 0; j < i; j++) {
-            MONT_FIPS_MAC(a.l[j], b.l[i - j]);
-            MONT_FIPS_MAC(m[j], P::mod(i - j));
-        }
-        MONT_FIPS_MAC(a.l[i], b.l[0]);
-        m[i] = (uint)acc * (uint)P::INV;
-        MONT_FIPS_MAC(m[i], P::mod(0));
-        acc = (acc >> 32) | ((ulong)acc2 << 32);
-        acc2 = 0;
-    }
-#pragma unroll
-    for (int i = P::N; i < 2 * P::N - 1; i++) {
-#pragma unroll
-        for (int j = i - P::N + 1; j < P::N; j++) {
-            MONT_FIPS_MAC(a.l[j], b.l[i - j]);
-            MONT_FIPS_MAC(m[j], P::mod(i - j));
-        }
-        u.l[i - P::N] = (uint)acc;
-        acc = (acc >> 32) | ((ulong)acc2 << 32);
-        acc2 = 0;
-    }
-#undef MONT_FIPS_MAC
-    // the result is below 2p < 2^(32 N): the accumulator holds its top limb
-    u.l[P::N - 1] = (uint)acc;
-    return reduce_once<P>(u);
-}
-
-// lo + hi * 2^64 = a * b + c + d on 64-bit limbs.
-MONT_INLINE ulong mac64(ulong a, ulong b, ulong c, ulong d, thread ulong &hi) {
-    ulong lo = a * b;
-    ulong h = mulhi(a, b);
-    lo += c;
-    h += (lo < c) ? 1ul : 0ul;
-    lo += d;
-    h += (lo < d) ? 1ul : 0ul;
-    hi = h;
-    return lo;
-}
-
-// CIOS, no-carry variant, 64-bit limbs.
-template <typename P>
-MONT_INLINE Elem<P> mul_cios64(Elem<P> a, Elem<P> b) {
-    const int W = P::N / 2;
-    ulong x[W], y[W], q[W], t[W];
-#pragma unroll
-    for (int i = 0; i < W; i++) {
-        x[i] = (ulong)a.l[2 * i] | ((ulong)a.l[2 * i + 1] << 32);
-        y[i] = (ulong)b.l[2 * i] | ((ulong)b.l[2 * i + 1] << 32);
-        q[i] = (ulong)P::mod(2 * i) | ((ulong)P::mod(2 * i + 1) << 32);
-        t[i] = 0;
-    }
-    const ulong inv = P::inv64();
-#pragma unroll
-    for (int i = 0; i < W; i++) {
-        ulong A, C;
-        ulong t0 = mac64(x[0], y[i], t[0], 0ul, A);
-        ulong m = t0 * inv;
-        (void)mac64(m, q[0], t0, 0ul, C);
-#pragma unroll
-        for (int j = 1; j < W; j++) {
-            ulong tj = mac64(x[j], y[i], t[j], A, A);
-            t[j - 1] = mac64(m, q[j], tj, C, C);
-        }
-        t[W - 1] = C + A;
-    }
-    Elem<P> r;
-#pragma unroll
-    for (int i = 0; i < W; i++) {
-        r.l[2 * i] = (uint)t[i];
-        r.l[2 * i + 1] = (uint)(t[i] >> 32);
-    }
-    return reduce_once<P>(r);
-}
-
-// ---------------------------------------------------------------------------
-// The default multiplication. It is fixed here, not per kernel file: without
-// the Metal toolchain at build time every shader file is compiled as one
-// translation unit, so a per-file override would not hold. A kernel that
-// wants another strategy calls it by name (`mont::mul_fips32<P>`).
-
-#define MONT_MUL_DEFAULT mul_cios32
-
-template <typename P>
-MONT_INLINE Elem<P> mul(Elem<P> a, Elem<P> b) {
-    return MONT_MUL_DEFAULT<P>(a, b);
-}
-
 template <typename P>
 MONT_INLINE Elem<P> sqr(Elem<P> a) {
-    return MONT_MUL_DEFAULT<P>(a, a);
+    return mul<P>(a, a);
 }
 
 } // namespace mont

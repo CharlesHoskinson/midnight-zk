@@ -21,11 +21,12 @@
 use std::collections::HashMap;
 
 use super::abi::{
-    COLUMN_ADVICE, COLUMN_FIXED, COLUMN_INSTANCE, INDEX_MASK, OP_MUL_ADD, ProgramAbi,
-    QuotientJobAbi, TAG_READ, TAG_SLOT, TAG_UNIFORM, slice,
+    COLUMN_ADVICE, COLUMN_FIXED, COLUMN_INSTANCE, INDEX_MASK, LookupAbi, OP_MUL_ADD, ProgramAbi,
+    QuotientJobAbi, TAG_READ, TAG_SLOT, TAG_UNIFORM, TrashAbi, slice,
 };
 use crate::{Scalar, account::Reason, field};
 
+/// A polynomial handle is `(bank << HANDLE_SHIFT) | index`.
 pub(crate) const HANDLE_SHIFT: u32 = 30;
 pub(crate) const BANK_PROOF: u32 = 0;
 pub(crate) const BANK_KEY_RES: u32 = 1;
@@ -33,6 +34,7 @@ pub(crate) const BANK_KEY_TMP: u32 = 2;
 /// Polynomials per bank.
 pub(crate) const MAX_BANK_POLYS: usize = 1 << HANDLE_SHIFT;
 
+/// The word counts of `shaders/include/quotient.h`.
 const OP_WORDS: usize = 5;
 const PROG_WORDS: usize = 8;
 const LOOKUP_WORDS: usize = 4;
@@ -51,7 +53,10 @@ pub(crate) struct Tables<'j> {
     pub(crate) words: Vec<u32>,
     /// The programs' uniforms.
     pub(crate) uniforms: Vec<Scalar>,
+    /// The word offsets of the key handles in `words`.
     key_words: Vec<usize>,
+    /// Word offsets of the gates program, the permutation's handles, the
+    /// lookup descriptors and the trash descriptors.
     pub(crate) gates: u32,
     pub(crate) perm: u32,
     pub(crate) lookups: u32,
@@ -60,30 +65,49 @@ pub(crate) struct Tables<'j> {
     pub(crate) lagrange: [u32; 3],
     /// Field multiplications per row, about (the command-buffer split).
     pub(crate) cost_per_row: u64,
+    /// The index of each distinct polynomial, by address.
+    proof_ix: HashMap<usize, usize>,
+    key_ix: HashMap<usize, usize>,
+    /// The lengths of a proof polynomial and of a key polynomial.
+    n: usize,
+    en: usize,
 }
 
 fn handle(bank: u32, index: usize) -> u32 {
     (bank << HANDLE_SHIFT) | index as u32
 }
 
+/// The job's columns as handles (a fixed column as its key index).
+struct Columns {
+    advice: Vec<u32>,
+    instance: Vec<u32>,
+    /// `None`: a fixed column the job does not read.
+    fixed: Vec<Option<u32>>,
+}
+
+impl Columns {
+    /// `(handle, is a key index)` of column `c` of `kind`; `None` for a
+    /// column the job does not have.
+    fn get(&self, kind: u32, c: u32) -> Option<(u32, bool)> {
+        match kind {
+            COLUMN_FIXED => self.fixed.get(c as usize).copied().flatten().map(|h| (h, true)),
+            COLUMN_ADVICE => self.advice.get(c as usize).map(|h| (*h, false)),
+            COLUMN_INSTANCE => self.instance.get(c as usize).map(|h| (*h, false)),
+            _ => None,
+        }
+    }
+}
+
 impl<'j> Tables<'j> {
-    /// Flattens `j` (whose header has passed [`super::checked`]).
+    /// Flattens `j`, with every check of the CUDA crate's `checked` and
+    /// `Arena::program` on its tables (`shape`, or `unreduced` for a
+    /// program's uniform), in the CUDA crate's order.
     ///
     /// # Safety
-    /// The job's contract: every pointer and count of `j` is valid.
+    /// The job's contract: every pointer and count of `j` is valid, and its
+    /// header has passed [`super::checked`] (so `k` and `ext_k` are lengths
+    /// the polynomials have).
     pub(crate) unsafe fn new(j: &'j QuotientJobAbi) -> Result<Self, Reason> {
-        let (n, en) = (1usize << j.k, 1usize << j.ext_k);
-        // SAFETY (every `slice`): the job's contract.
-        let advice = unsafe { slice(j.advice, j.nadvice) };
-        let instance = unsafe { slice(j.instance, j.ninstance) };
-        let fixed = unsafe { slice(j.fixed, j.nfixed) };
-        let sigma = unsafe { slice(j.perm_sigma, j.perm_ncolumns) };
-        let products = unsafe { slice(j.perm_products, j.perm_nsets) };
-        let kinds = unsafe { slice(j.perm_column_kind, j.perm_ncolumns) };
-        let index = unsafe { slice(j.perm_column_index, j.perm_ncolumns) };
-        let lookups = unsafe { slice(j.lookups, j.nlookups) };
-        let trash = unsafe { slice(j.trash, j.ntrash) };
-
         let mut t = Tables {
             proof: Vec::new(),
             keys: Vec::new(),
@@ -96,96 +120,146 @@ impl<'j> Tables<'j> {
             trash: 0,
             lagrange: [0; 3],
             cost_per_row: 0,
+            proof_ix: HashMap::new(),
+            key_ix: HashMap::new(),
+            n: 1usize << j.k,
+            en: 1usize << j.ext_k,
         };
-        let mut proof_ix: HashMap<usize, usize> = HashMap::new();
-        let mut key_ix: HashMap<usize, usize> = HashMap::new();
-        // a proof polynomial's handle (its coset in the proof bank)
-        let mut proof_h = |p: *const Scalar, t: &mut Tables<'j>| -> Result<u32, Reason> {
-            if p.is_null() {
-                return Err(Reason::Shape);
-            }
-            let next = proof_ix.len();
-            let i = *proof_ix.entry(p as usize).or_insert_with(|| {
-                // SAFETY: the job's contract: 2^k coefficients.
-                t.proof.push(unsafe { slice(p, n) });
-                next
-            });
-            if i >= MAX_BANK_POLYS {
-                return Err(Reason::Shape);
-            }
-            Ok(handle(BANK_PROOF, i))
-        };
-        // a key polynomial's index in `keys`
-        let mut key_i = |p: *const Scalar, t: &mut Tables<'j>| -> Result<u32, Reason> {
-            if p.is_null() {
-                return Err(Reason::Shape);
-            }
-            let next = key_ix.len();
-            let i = *key_ix.entry(p as usize).or_insert_with(|| {
-                // SAFETY: the job's contract: 2^ext_k values.
-                t.keys.push(unsafe { slice(p, en) });
-                next
-            });
-            if i >= MAX_BANK_POLYS {
-                return Err(Reason::Shape);
-            }
-            Ok(i as u32)
-        };
-
-        // the columns, as handles (fixed: key indices, fixed by place_keys)
-        let advice_h: Vec<u32> =
-            advice.iter().map(|p| proof_h(*p, &mut t)).collect::<Result<_, _>>()?;
-        let instance_h: Vec<u32> =
-            instance.iter().map(|p| proof_h(*p, &mut t)).collect::<Result<_, _>>()?;
-        let fixed_h: Vec<Option<u32>> = fixed
-            .iter()
-            .map(|p| {
-                if p.is_null() {
-                    Ok(None)
-                } else {
-                    key_i(*p, &mut t).map(Some)
-                }
-            })
-            .collect::<Result<_, _>>()?;
-        // (handle, is a key index)
-        let col = |kind: u32, c: u32| -> Option<(u32, bool)> {
-            match kind {
-                COLUMN_FIXED => fixed_h.get(c as usize).copied().flatten().map(|h| (h, true)),
-                COLUMN_ADVICE => advice_h.get(c as usize).map(|h| (*h, false)),
-                COLUMN_INSTANCE => instance_h.get(c as usize).map(|h| (*h, false)),
-                _ => None,
+        // SAFETY (every `slice` and method below): the job's contract.
+        let cols = unsafe {
+            Columns {
+                advice: slice(j.advice, j.nadvice)
+                    .iter()
+                    .map(|p| t.proof_handle(*p))
+                    .collect::<Result<_, _>>()?,
+                instance: slice(j.instance, j.ninstance)
+                    .iter()
+                    .map(|p| t.proof_handle(*p))
+                    .collect::<Result<_, _>>()?,
+                fixed: slice(j.fixed, j.nfixed)
+                    .iter()
+                    .map(|p| {
+                        if p.is_null() {
+                            Ok(None)
+                        } else {
+                            t.key_index(*p).map(Some)
+                        }
+                    })
+                    .collect::<Result<_, _>>()?,
             }
         };
-        let nslots = j.nslots;
-
-        // l0, l_last, l_active
         for (i, p) in [j.l0, j.l_last, j.l_active].into_iter().enumerate() {
-            t.lagrange[i] = key_i(p, &mut t)?;
+            // SAFETY: as above.
+            t.lagrange[i] = unsafe { t.key_index(p)? };
         }
-
-        // the gates
-        t.gates = t.program(&j.gates, nslots, &col)?;
-
-        // the permutation: accumulators, columns, sigmas
-        if j.perm_nsets > 0 {
-            let start = t.words.len();
-            for p in products {
-                let h = proof_h(*p, &mut t)?;
-                t.words.push(h);
+        // SAFETY: as above.
+        unsafe {
+            t.gates = t.program(&j.gates, j.nslots, &cols)?;
+            if j.perm_nsets > 0 {
+                t.permutation(j, &cols)?;
             }
-            for (k, c) in kinds.iter().zip(index) {
-                let (h, key) = col(*k, *c).ok_or(Reason::Shape)?;
-                t.push_handle(h, key);
-            }
-            for s in sigma {
-                let i = key_i(*s, &mut t)?;
-                t.push_handle(i, true);
-            }
-            t.perm = start as u32;
-            t.cost_per_row += 4 * j.perm_ncolumns as u64 + 6 * j.perm_nsets as u64;
+            t.lookup_tables(slice(j.lookups, j.nlookups), j.nslots, &cols)?;
+            t.trash_tables(slice(j.trash, j.ntrash), j.nslots, &cols)?;
         }
+        if t.words.len() > u32::MAX as usize / 2 || t.uniforms.len() > u32::MAX as usize / 2 {
+            return Err(Reason::Shape);
+        }
+        Ok(t)
+    }
 
-        // the lookups: programs first, then the descriptors
+    /// A proof polynomial's handle (its coset in the proof bank).
+    ///
+    /// # Safety
+    /// A non-null `p` is valid for `2^k` reads for `'j`.
+    unsafe fn proof_handle(&mut self, p: *const Scalar) -> Result<u32, Reason> {
+        if p.is_null() {
+            return Err(Reason::Shape);
+        }
+        let next = self.proof_ix.len();
+        let i = *self.proof_ix.entry(p as usize).or_insert_with(|| {
+            // SAFETY: the caller's contract.
+            self.proof.push(unsafe { slice(p, self.n) });
+            next
+        });
+        if i >= MAX_BANK_POLYS {
+            return Err(Reason::Shape);
+        }
+        Ok(handle(BANK_PROOF, i))
+    }
+
+    /// A key polynomial's index in `keys`.
+    ///
+    /// # Safety
+    /// A non-null `p` is valid for `2^ext_k` reads for `'j`.
+    unsafe fn key_index(&mut self, p: *const Scalar) -> Result<u32, Reason> {
+        if p.is_null() {
+            return Err(Reason::Shape);
+        }
+        let next = self.key_ix.len();
+        let i = *self.key_ix.entry(p as usize).or_insert_with(|| {
+            // SAFETY: the caller's contract.
+            self.keys.push(unsafe { slice(p, self.en) });
+            next
+        });
+        if i >= MAX_BANK_POLYS {
+            return Err(Reason::Shape);
+        }
+        Ok(i as u32)
+    }
+
+    fn push_handle(&mut self, h: u32, key: bool) {
+        if key {
+            self.key_words.push(self.words.len());
+        }
+        self.words.push(h);
+    }
+
+    /// The permutation's handles: the accumulators, the permuted columns,
+    /// the sigmas.
+    ///
+    /// # Safety
+    /// The job's contract.
+    unsafe fn permutation(&mut self, j: &'j QuotientJobAbi, cols: &Columns) -> Result<(), Reason> {
+        // SAFETY: the job's contract.
+        let (products, kinds, index, sigma) = unsafe {
+            (
+                slice(j.perm_products, j.perm_nsets),
+                slice(j.perm_column_kind, j.perm_ncolumns),
+                slice(j.perm_column_index, j.perm_ncolumns),
+                slice(j.perm_sigma, j.perm_ncolumns),
+            )
+        };
+        let start = self.words.len();
+        for p in products {
+            // SAFETY: the job's contract.
+            let h = unsafe { self.proof_handle(*p)? };
+            self.words.push(h);
+        }
+        for (k, c) in kinds.iter().zip(index) {
+            let (h, key) = cols.get(*k, *c).ok_or(Reason::Shape)?;
+            self.push_handle(h, key);
+        }
+        for s in sigma {
+            // SAFETY: the job's contract.
+            let i = unsafe { self.key_index(*s)? };
+            self.push_handle(i, true);
+        }
+        self.perm = start as u32;
+        self.cost_per_row += 4 * j.perm_ncolumns as u64 + 6 * j.perm_nsets as u64;
+        Ok(())
+    }
+
+    /// The lookups: the programs first, then the chunk tables, then the
+    /// descriptors.
+    ///
+    /// # Safety
+    /// The job's contract.
+    unsafe fn lookup_tables(
+        &mut self,
+        lookups: &[LookupAbi],
+        nslots: u32,
+        cols: &Columns,
+    ) -> Result<(), Reason> {
         let mut descs = Vec::with_capacity(lookups.len());
         for l in lookups {
             if l.nchunks == 0 {
@@ -199,72 +273,85 @@ impl<'j> Tables<'j> {
                 if p.noutputs != 4 {
                     return Err(Reason::Shape);
                 }
-                let off = t.program(p, nslots, &col)?;
-                chunks.push((proof_h(*h, &mut t)?, off));
+                // SAFETY: the job's contract.
+                let off = unsafe { self.program(p, nslots, cols)? };
+                // SAFETY: the job's contract.
+                chunks.push((unsafe { self.proof_handle(*h)? }, off));
             }
-            let agg = proof_h(l.aggregator, &mut t)?;
-            let mult = proof_h(l.multiplicities, &mut t)?;
+            // SAFETY: the job's contract.
+            let agg = unsafe { self.proof_handle(l.aggregator)? };
+            // SAFETY: the job's contract.
+            let mult = unsafe { self.proof_handle(l.multiplicities)? };
             descs.push((agg, mult, chunks));
-            t.cost_per_row += 6 + 3 * l.nchunks as u64;
+            self.cost_per_row += 6 + 3 * l.nchunks as u64;
         }
         let mut chunk_offs = Vec::with_capacity(descs.len());
         for (_, _, chunks) in &descs {
-            chunk_offs.push(t.words.len() as u32);
+            chunk_offs.push(self.words.len() as u32);
             for (h, off) in chunks {
-                t.words.extend([*h, *off]);
+                let chunk: [u32; CHUNK_WORDS] = [*h, *off];
+                self.words.extend(chunk);
             }
         }
-        t.lookups = t.words.len() as u32;
+        self.lookups = self.words.len() as u32;
         for ((agg, mult, chunks), off) in descs.iter().zip(chunk_offs) {
-            t.words.extend([*agg, *mult, chunks.len() as u32, off]);
+            let desc: [u32; LOOKUP_WORDS] = [*agg, *mult, chunks.len() as u32, off];
+            self.words.extend(desc);
         }
+        Ok(())
+    }
 
-        // the trash arguments
-        let mut tdescs = Vec::with_capacity(trash.len());
+    /// The trash arguments: the programs first, then the descriptors.
+    ///
+    /// # Safety
+    /// The job's contract.
+    unsafe fn trash_tables(
+        &mut self,
+        trash: &[TrashAbi],
+        nslots: u32,
+        cols: &Columns,
+    ) -> Result<(), Reason> {
+        let mut descs = Vec::with_capacity(trash.len());
         for a in trash {
             if a.program.noutputs != 1 {
                 return Err(Reason::Shape);
             }
-            let sel = fixed_h
+            let sel = cols
+                .fixed
                 .get(a.selector_column as usize)
                 .copied()
                 .flatten()
                 .ok_or(Reason::Shape)?;
-            let off = t.program(&a.program, nslots, &col)?;
-            tdescs.push((proof_h(a.trash, &mut t)?, sel, off));
-            t.cost_per_row += 3;
+            // SAFETY: the job's contract.
+            let off = unsafe { self.program(&a.program, nslots, cols)? };
+            // SAFETY: the job's contract.
+            descs.push((unsafe { self.proof_handle(a.trash)? }, sel, off));
+            self.cost_per_row += 3;
         }
-        t.trash = t.words.len() as u32;
-        for (h, sel, off) in tdescs {
-            t.words.push(h);
-            t.push_handle(sel, true);
-            t.words.extend([off, 0]);
+        self.trash = self.words.len() as u32;
+        for (h, sel, off) in descs {
+            let desc: [u32; TRASH_WORDS] = [h, sel, off, 0];
+            // the selector is a key handle
+            self.key_words.push(self.words.len() + 1);
+            self.words.extend(desc);
         }
-        let _ = (LOOKUP_WORDS, CHUNK_WORDS, TRASH_WORDS, PROG_WORDS);
-        if t.words.len() > u32::MAX as usize / 2 || t.uniforms.len() > u32::MAX as usize / 2 {
-            return Err(Reason::Shape);
-        }
-        Ok(t)
-    }
-
-    fn push_handle(&mut self, h: u32, key: bool) {
-        if key {
-            self.key_words.push(self.words.len());
-        }
-        self.words.push(h);
+        Ok(())
     }
 
     /// Packs a program after the checks of the CUDA crate's
     /// `Arena::program`: every operand in range, every slot below the job's
     /// slots, every read on a column the job has, the uniforms reduced.
     /// Returns its word offset.
-    fn program(
+    ///
+    /// # Safety
+    /// The job's contract: the program's pointers are valid for their counts.
+    unsafe fn program(
         &mut self,
         p: &ProgramAbi,
         nslots: u32,
-        col: &dyn Fn(u32, u32) -> Option<(u32, bool)>,
+        cols: &Columns,
     ) -> Result<u32, Reason> {
-        // SAFETY: the job's contract.
+        // SAFETY: the caller's contract.
         let (ops, reads, uniforms, outputs) = unsafe {
             (
                 slice(p.ops, p.nops),
@@ -294,7 +381,7 @@ impl<'j> Tables<'j> {
         }
         let read_cols: Vec<(u32, bool)> = reads
             .iter()
-            .map(|r| col(r.kind, r.column))
+            .map(|r| cols.get(r.kind, r.column))
             .collect::<Option<_>>()
             .ok_or(Reason::Shape)?;
         if !field::all_reduced(uniforms) {
@@ -304,19 +391,20 @@ impl<'j> Tables<'j> {
         let reads_off = ops_off + OP_WORDS * ops.len();
         let outs_off = reads_off + 2 * reads.len();
         let start = self.words.len();
-        let unis = self.uniforms.len();
-        self.words.extend([
+        let header: [u32; PROG_WORDS] = [
             ops_off as u32,
             ops.len() as u32,
             reads_off as u32,
             reads.len() as u32,
-            unis as u32,
+            self.uniforms.len() as u32,
             outs_off as u32,
             outputs.len() as u32,
             0,
-        ]);
+        ];
+        self.words.extend(header);
         for op in ops {
-            self.words.extend([op.kind, op.dst, op.a, op.b, op.c]);
+            let op: [u32; OP_WORDS] = [op.kind, op.dst, op.a, op.b, op.c];
+            self.words.extend(op);
         }
         for (r, (h, key)) in reads.iter().zip(read_cols) {
             self.push_handle(h, key);
@@ -329,7 +417,9 @@ impl<'j> Tables<'j> {
     }
 
     /// Writes the key handles: `bank_of[i]` is `(bank, index)` of key `i`.
+    /// Returns the handles of `l0`, `l_last`, `l_active`.
     pub(crate) fn place_keys(&mut self, bank_of: &[(u32, usize)]) -> [u32; 3] {
+        // every key word holds an index into `keys`, which `bank_of` covers
         for &w in &self.key_words {
             let (b, i) = bank_of[self.words[w] as usize];
             self.words[w] = handle(b, i);

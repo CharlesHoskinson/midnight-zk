@@ -14,8 +14,19 @@
 //! # midnight_metal
 //!
 //! Metal kernels for the accelerator hooks of `midnight-proofs` (feature
-//! `gpu`) on Apple GPUs: the counterpart of the CUDA crate `midnight-gpu`,
-//! with the same entry points, so a process installs them the same way:
+//! `gpu`) on Apple GPUs: BLS12-381 G1 MSM, scalar-field NTT, and the
+//! quotient (coset transforms, numerator, division by the vanishing
+//! polynomial, extended inverse transform). It is the counterpart of the CUDA
+//! crate `midnight-gpu`, with the same entry points.
+//!
+//! Every entry point returns the exact value of the stock CPU code or
+//! declines (`None` / `false`); on a decline the caller's buffer is unchanged
+//! and the caller runs the CPU code. The device is never a correctness
+//! dependency.
+//!
+//! This crate does not depend on midnight-proofs. Its functions have the
+//! signatures of the hook fields of `midnight_proofs::gpu::GpuHooks`, so a
+//! process installs them as they are, and brackets each proof with a request:
 //!
 //! ```ignore
 //! midnight_proofs::gpu::install(midnight_proofs::gpu::GpuHooks {
@@ -24,135 +35,117 @@
 //!     ifft: Some(midnight_metal::ifft),
 //!     quotient: Some(midnight_metal::quotient),
 //! });
-//! // per proof (recommended): the device scratch, which holds witness
-//! // values, is reused across the calls of the proof and zeroed at its end
 //! midnight_metal::begin_request();
 //! let proof = prove(/* ... */);
 //! assert!(midnight_metal::end_request()); // or end_request_report(true)
 //! ```
 //!
-//! With [`begin_request`] / [`end_request`] the per-request device scratch
-//! is reused across the hook calls of one request and wiped at its end.
-//! Without them (only `install`), every hook call wipes it before it
-//! returns, which is slower: each call takes and zeroes its scratch again.
-//!
-//! This crate does not depend on midnight-proofs. On macOS it depends on
-//! midnight-curves for the CPU share of a G1 MSM, which runs the stock
-//! `msm_pippenger` (see "Size thresholds").
+//! On macOS the crate depends on midnight-curves for the CPU share of a G1
+//! MSM, which runs the stock `msm_pippenger` (see the `msm` module, "The CPU
+//! share"). On other targets the crate builds without device code and every
+//! entry point declines `no-device`.
 //!
 //! ## The hook contract
 //!
 //! 1. Every entry point returns the exact value of the stock CPU code on the
-//!    same input, or declines (`None` / `false`).
-//! 2. A decline leaves the caller's buffer unchanged: a kernel writes the
-//!    caller's slice only with the complete device result, after the last
+//!    same input, or declines.
+//! 2. A decline leaves the caller's buffer unchanged: a kernel module writes
+//!    the caller's slice only with the complete device result, after the last
 //!    command buffer has completed without error.
 //! 3. No entry point draws a random value or touches a transcript. Any
-//!    pseudo-random value a kernel needs (for example a load-balancing mask)
-//!    is a fixed public function of the input shape.
-//! 4. The device is never a correctness dependency: every failure (no device,
-//!    an allocation, a pipeline, a command buffer in the error state) is a
-//!    counted decline, never a panic. A panic inside a kernel module is
-//!    caught at the entry point and becomes the counted decline `panic`
-//!    (with the caller's buffer unchanged, per 2), so it never unwinds into
-//!    the prover (unless the process is built with `panic = "abort"`).
+//!    pseudo-random value a kernel needs (for example the MSM's load-balancing
+//!    mask) is a fixed public function of the input shape.
+//! 4. Every failure (no device, an allocation, a pipeline, a command buffer in
+//!    the error state) is a counted decline, never a panic. A panic inside a
+//!    kernel module is caught at the entry point and becomes the decline
+//!    `panic` (with the caller's buffer unchanged, per 2), so it never unwinds
+//!    into the prover (unless the process is built with `panic = "abort"`).
 //!
 //! ## Data layout
 //!
 //! The in-memory form of the `midnight-curves` types (through the zero-copy
 //! adapter `midnight_proofs::gpu::adapter`), the same bytes on the device:
 //! - [`Scalar`]: `blst_fr`, four little-endian `u64` limbs of the Montgomery
-//!   form (`R = 2^256`), reduced modulo `r`. Device type `Fr`
-//!   (`shaders/include/fr.h`), eight 32-bit limbs.
+//!   form (`R = 2^256`), reduced modulo `r` ([`field::FR_MODULUS`]). Device
+//!   type `Fr` (`shaders/include/fr.h`), eight 32-bit limbs.
 //! - [`G1AffineLimbs`]: `blst_p1_affine`, `x` then `y`, six limbs each,
 //!   Montgomery (`R = 2^384`); the point at infinity is all zero. Device type
 //!   `Fp` (`shaders/include/fp.h`), twelve 32-bit limbs per coordinate.
 //! - [`G1JacobianLimbs`]: `blst_p1`, Jacobian `X`, `Y`, `Z`.
 //!
-//! ## Files
+//! ## Requests and wiping
 //!
-//! - `src/lib.rs`: this API, admission, environment.
-//! - `src/account.rs`: decline and service accounting. A kernel ends every
-//!   call with exactly one of `account::served(class, gpu_nanos)` or
-//!   `account::decline(class, reason)`.
-//! - `src/ctx.rs` ([`ctx`]): the device context: device, queue, library,
-//!   pipeline cache, shared buffers (scoped, and per-request ones released by
-//!   [`end_request`]), command buffers with error reporting, byte accounting,
-//!   and what unified memory means for transfers.
-//! - `src/field.rs` ([`field`]): moduli and the reduction check.
-//! - `src/msm.rs`, `src/ntt.rs`, `src/quotient.rs`: one kernel family each
-//!   (the MSM, the forward and inverse NTT, the quotient with its resident
-//!   proving-key copies), compiled on macOS only (on other targets the entry
-//!   points decline `no-device` before reaching them). The entry point calls
-//!   the module after admission; the module serves the call with the stock
-//!   value or declines with a counted reason (see [`declines`]).
-//! - `build.rs`: shader build (metallib with `xcrun metal`, else embedded
-//!   source compiled at first use).
-//! - `shaders/include/mont.h`: Montgomery arithmetic over N 32-bit limbs
-//!   (add, sub, neg, double, the multiplication strategies, square, the
-//!   reduced-ness check); `fr.h`, `fp.h`: the two fields on it (`fr_mul`,
-//!   `fp_add`, ...).
-//! - `shaders/*.metal`: kernel files. Each file is its own translation unit
-//!   when the toolchain is present, and all of them form one translation
-//!   unit on the source path, so a new kernel file:
-//!   - includes the headers it needs (`#include "fr.h"`, `"fp.h"`); header
-//!     guards make repeated includes harmless;
-//!   - prefixes its kernel names with its file stem (`ntt_*`, `msm_*`,
-//!     `quotient_*`) and keeps its helpers in a namespace of that name, so no
-//!     two files clash in the shared library;
-//!   - is picked up by `build.rs` without any other change.
+//! Call [`begin_request`] and [`end_request`] (or [`end_request_report`])
+//! around each proof. Between them the per-request buffers (device scratch
+//! that can hold witness values: the MSM's scalars, digits, histograms,
+//! temporaries and buckets, the transforms' data and scratch, the quotient's
+//! transform scratch) are kept and reused by the next hook call.
+//! [`end_request`] zeroes them; [`end_request_report`]`(true)` also reads
+//! each one back from the host mapping, reads back every idle buffer of the
+//! pool, and counts the regions that are not zero.
 //!
-//!   `field_test.metal` holds the field test and benchmark kernels,
-//!   `diag.metal` the context's diagnostic kernels.
+//! Without a request (a process that only installs the hooks), every hook
+//! call zeroes the per-request buffers before it returns, on success,
+//! decline, error or a caught panic, with no read-back: nothing stays in
+//! device-visible memory between calls, at the cost of making and zeroing
+//! the scratch at every call.
 //!
-//! The Metal Shading Language version is 3.2 (macOS 15+): 64-bit integer
-//! functions (`mulhi` on `ulong`) arrived in 2.3; 3.2 adds device-coherent
-//! memory, `atomic_thread_fence` with scopes and barrier memory scopes, which
-//! single-pass cross-threadgroup algorithms (scans, sorts) in the MSM may
-//! use. Every Apple Silicon Mac runs macOS 15.
+//! Scoped buffers (owned by one call) are zeroed when dropped, at the end of
+//! that call or on a background thread that [`end_request`] waits for. The
+//! large buffers, per-request and scoped, come from a pool of zeroed buffers
+//! and go back to it after their zeroing instead of being released: a new
+//! buffer makes the first command buffer that uses it wait while its pages
+//! are mapped for the GPU (about 20 ms for 448 MiB on an M4 Max), a pooled
+//! one does not. Every idle buffer of the pool reads zero. The pool keeps at
+//! most `MIDNIGHT_METAL_POOL_MIB` (default a quarter of
+//! `recommendedMaxWorkingSetSize`); [`release_pool`] releases it and
+//! [`pool_bytes`] says what it holds.
 //!
-//! ## Environment
-//!
-//! - `MIDNIGHT_METAL=off`: use no device (every call declines `no-device`).
-//! - `MIDNIGHT_METAL_MIN_K` (unset by default): one log2 size threshold for
-//!   every class, replacing the per-class defaults, and opening the one-shot
-//!   MSM, which the defaults keep off (see "Size thresholds").
-//! - `MIDNIGHT_METAL_MSM_CPU_SHARE=off`: run every G1 MSM on the device
-//!   only. By default a measured share of the points of an MSM goes to the
-//!   stock CPU MSM, which runs at the same time as the device: from `2^17`
-//!   on a registered table, from `2^13` on the one-shot path when an
-//!   explicit threshold opens it (see the `msm` module text, "The CPU
-//!   share").
-//! - `MIDNIGHT_METAL_SHADER_SOURCE=1` (run time): compile the embedded source
-//!   instead of loading the embedded metallib. At build time it skips the
-//!   toolchain.
+//! A region that fails the read-back is zeroed again, read back again and
+//! released (never pooled, never kept as scratch), and the report is `Err`.
+//! There is no quarantine and no retry, unlike the wipe layer of the CUDA
+//! crate.
 //!
 //! ## Size thresholds
 //!
 //! A call below its class's threshold declines `below-min-k` before any
-//! device work and the stock CPU code runs. Unless one threshold is set
-//! explicitly ([`set_min_k`] or `MIDNIGHT_METAL_MIN_K`, which then applies to
-//! every class; [`reset_min_k`] undoes [`set_min_k`]), each class has its own
-//! default ([`DEFAULT_THRESHOLDS`]), the measured break-even of the device
-//! against the stock CPU code:
+//! device work, and the stock CPU code runs. Each class has its own default
+//! ([`DEFAULT_THRESHOLDS`]), the measured break-even of the device against
+//! the stock CPU code on Apple M4 Max (40-core GPU), release builds. One
+//! explicit threshold ([`set_min_k`] or `MIDNIGHT_METAL_MIN_K`) replaces
+//! every default; [`reset_min_k`] undoes [`set_min_k`]. [`thresholds`] gives
+//! the effective values. Other machines may break even elsewhere: set one
+//! threshold explicitly there.
 //!
-//! | Class | Threshold (log2) | Measured |
+//! | Class | Default (log2) | Measured |
 //! |---|---|---|
 //! | `fft`, `ifft` | 15 (`log_n`) | the device wins from `2^15`, loses at `2^14` |
 //! | `msm` on a registered SRS table | 13 (size class of the length) | wins from `2^13` in a proof |
 //! | `msm` without a table (one-shot) | never (`None`) | loses at every size with its per-call G1 check |
 //! | `quotient` | 14 (`ext_k`) | wins from `ext_k = 14` in a proof |
 //!
-//! Measured on Apple M4 Max (40-core GPU, 128 GB), 2026-11-18, release
-//! builds, against the stock CPU code of `midnight-proofs` on the same
-//! machine; the table MSM and quotient rows again on 2026-11-19 inside
-//! proofs (below). Other machines may break even elsewhere: set one
-//! threshold explicitly there. [`thresholds`] gives the effective values
-//! (for reports).
-//!
 //! The size class of an MSM length is its log2 rounded to the nearest
-//! integer ([`msm_admission`]): the multi-open commits `n - 1`
-//! coefficients, which are in the class of `n`.
+//! integer ([`msm_admission`]): the multi-open commits `n - 1` coefficients,
+//! which are in the class of `n`.
+//!
+//! The table MSM and quotient thresholds come from whole proofs, not from
+//! isolated kernels: between the device calls of a proof the GPU idles while
+//! the CPU works, and an idle GPU runs the next command buffer at a lower
+//! clock (a `2^14` MSM after 100 ms of idle takes 10.1 to 10.8 ms of GPU
+//! time for its first one or two calls and 3.4 to 3.9 ms after). A proof that
+//! sends the device only its quotient runs it at the low clock; one that also
+//! sends its dense commitments keeps the GPU at the high clock. Proof times of
+//! the rc1 chain circuit (`gpu-prover/bench/rc1`) at `k = 13`, warm, 8 to 12
+//! proofs per process, two to four processes per setting, range of the
+//! minimum and of the median per process in ms:
+//!
+//! | stock CPU build | `msm_table` 14, `quotient` 14 | 14, 15 | 13, 15 | 13, 14 |
+//! |-----------------|------------|------------|------------|------------|
+//! | 41.3 to 42.1, 42.6 to 43.8 | 44.0, 45.0 to 47.3 | 39.9 to 40.1, 41.5 to 41.9 | 36.8 to 37.0, 37.9 to 40.1 | 33.6 to 34.4, 34.1 to 36.3 |
+//!
+//! At `k = 14` these settings send the same calls (47.8 to 48.2, 49.4 to
+//! 49.5; the stock build 76.9 to 77.1, 77.7 to 79.1). `fft` and `ifft` at 13,
+//! 14 or 15 give the same proof times within 1 ms at `k = 13` and `k = 14`.
 //!
 //! ### MSMs without a registered table
 //!
@@ -162,50 +155,22 @@
 //! prefix outside G1). Any other MSM declines `unregistered-bases` before
 //! any scalar is read and before any check of its points, and the stock CPU
 //! MSM runs it: bases that were never registered, and a slice whose table
-//! the identity comparison found stale (the table is then dropped). A table
-//! with a point outside G1 in the prefix declines `bases-not-in-subgroup`
-//! instead. The reason is the per-call G1 check (on the curve and in the
-//! prime-order subgroup) that the device needs on bases it has not checked
-//! before (see the `msm` module text, "Bases outside G1"): measured on Apple
-//! M4 Max, 2026-11-19, it alone takes 187 ms for `2^16` points and 593 ms for
-//! `2^18`, against about 25 ms and 78 ms for the whole stock CPU MSM (about
-//! 2.1 s at `2^20`), so the one-shot device path loses to the CPU at every
-//! size. The stock CPU MSM is exact for any point on the curve and needs no
-//! such check. The decline depends only on public facts (the registry and
-//! the points), so its count and timing do not depend on the witness.
+//! the identity comparison finds stale (the table is then dropped). A table
+//! with a point outside G1 in the prefix declines `bases-not-in-subgroup`.
+//! The reason is the per-call G1 check (on the curve and in the prime-order
+//! subgroup) that the device needs on bases it has not checked before (see
+//! the `msm` module, "Bases outside G1"): it alone takes 187 ms for `2^16`
+//! points and 593 ms for `2^18` on Apple M4 Max, against about 25 ms and
+//! 78 ms for the whole stock CPU MSM. The stock CPU MSM is exact for any
+//! point on the curve and needs no such check. The decline depends only on
+//! public facts (the registry and the points), so its count and timing do
+//! not depend on the witness.
 //!
-//! The one-shot device path stays, with its per-call G1 check of every
-//! base unchanged, and is reached only with an explicit threshold
-//! ([`set_min_k`] or `MIDNIGHT_METAL_MIN_K`), which sets `msm_one_shot` of
+//! The one-shot device path, with its per-call G1 check of every base, is
+//! reached only with an explicit threshold, which sets `msm_one_shot` of
 //! [`thresholds`] to that value.
 //!
-//! An isolated kernel and the same kernel inside a proof do not break even
-//! at the same size. Between device calls of a proof the GPU idles for
-//! milliseconds while the CPU works, and an idle GPU runs the next command
-//! buffer at a lower clock: measured on 2026-11-19, a `2^14` MSM after 100
-//! ms of idle took 10.1 to 10.8 ms of GPU time for its first one or two
-//! calls and 3.4 to 3.9 ms from the next one, and a burst of short
-//! transforms did not raise the clock. A proof that sends the device only
-//! its quotient and a few MSMs runs them at the low clock; one that sends
-//! its dense commitments as well keeps the GPU busy enough to run at the
-//! high clock. The thresholds of the table MSM and of the quotient are
-//! therefore the result of whole proofs: the rc1 chain circuit
-//! (`gpu-prover/bench/rc1`) at `k = 13`, warm proofs, 8 to 12 per process,
-//! two to four processes per setting, the range of the minimum and of the
-//! median per process in ms (load average 3 to 7 from other processes):
-//!
-//! | stock CPU build | `msm_table` 14, `quotient` 14 | 14, 15 | 13, 15 | 13, 14 |
-//! |-----------------|------------|------------|------------|------------|
-//! | 41.3 to 42.1, 42.6 to 43.8 | 44.0, 45.0 to 47.3 | 39.9 to 40.1, 41.5 to 41.9 | 36.8 to 37.0, 37.9 to 40.1 | 33.6 to 34.4, 34.1 to 36.3 |
-//!
-//! (with the MSM need of the next paragraph and the device shares of the
-//! `msm` module). With `msm_table` 14 a `k = 13` proof sends the device its
-//! quotient alone, which runs at the low clock (7.4 to 8.2 ms against 4.5
-//! to 4.9 on the CPU); with 13 its dense commitments go first and the
-//! quotient after them wins. At `k = 14` these settings send the same calls
-//! (47.8 to 48.2, 49.4 to 49.5; the stock build 76.9 to 77.1, 77.7 to
-//! 79.1). `fft` and `ifft` at 13, 14 or 15 gave the same proof times within
-//! 1 ms at `k = 13` and `k = 14`; they stay at 15.
+//! ### The effective size of an MSM
 //!
 //! An MSM is compared twice: by its length against its threshold, and by its
 //! effective size, the count of its non-zero scalars (1 when all are zero),
@@ -213,59 +178,102 @@
 //! (`n` the length). A mostly-zero MSM (a permutation product or quotient
 //! limb with a handful of non-zero coefficients) costs the masked device MSM
 //! as much as a dense one of its length, while the stock CPU MSM, whose time
-//! follows the sparsity, finishes in about a millisecond; the fraction is
-//! the measured crossover on Apple M4 Max, 2026-11-19 (`n/5.3` on `2^20`
-//! points, with the CPU share of the split active; measured under load, see
-//! the `msm` module), and `2^12` is the part of the crossover that does not
-//! grow with the length (measured at `2^13` to `2^15`, see the `msm`
-//! module). Below its need the MSM declines `below-min-k` before any device
-//! work. The count is not kept, logged, counted or returned: the ordinary
-//! `below-min-k` decline is the only observable. An explicit threshold
-//! replaces the need entirely (`2^min_k`, no fraction of `n`, on the table
-//! and the one-shot path), so `set_min_k(0)` admits every MSM.
+//! follows the sparsity, finishes in about a millisecond; `n/5` is the
+//! measured crossover on Apple M4 Max with the CPU share of the split active,
+//! and `2^12` the part of it that does not grow with the length (see the
+//! `msm` module). Below its need the MSM declines `below-min-k` before any
+//! device work. The count is not kept, logged, counted or returned: the
+//! ordinary `below-min-k` decline is the only observable. An explicit
+//! threshold replaces the need entirely (`2^min_k`, no fraction of `n`, on
+//! the table and the one-shot path), so `set_min_k(0)` admits every MSM.
 //!
-//! ## Requests
+//! ## Registered tables and keys
 //!
-//! Call [`begin_request`] and [`end_request`] (or [`end_request_report`])
-//! around each proof. Between them the per-request buffers (device scratch
-//! that can hold witness values: the MSM's scalars, digits, histograms,
-//! temporaries and buckets, the transforms' data and scratch, the
-//! quotient's transform scratch) are kept and reused by the next call;
-//! [`end_request`] zeroes them, and [`end_request_report`]`(true)` also
-//! reads each one back from the host mapping, reads back every idle buffer
-//! of the pool, and counts the regions that are not zero. Without a request
-//! (an integrator that only installs the hooks), every hook call zeroes the
-//! per-request buffers before it returns, on success, decline, error or a
-//! caught panic, with no read-back: nothing stays in device-visible memory
-//! between calls, at the cost of making and zeroing the scratch at every
-//! call.
+//! - SRS base tables ([`register_srs`], handle [`SrsHandle`]): a host copy of a
+//!   base slice, checked to be in G1 once, uploaded at the first MSM on it and
+//!   kept on the device while the handle lives. [`srs_handles`], [`srs_stale`]
+//!   and [`msm_counts`] count them and their use.
+//! - Proving-key polynomials ([`register_key`], handle [`KeyHandle`]): the
+//!   quotient serves the job's fixed and permutation polynomials from resident
+//!   device copies of their extended values. [`end_request`] frees the copies
+//!   unless [`keep_resident`] (`MIDNIGHT_METAL_KEEP_KEYS=1`,
+//!   [`set_keep_resident`]); [`evict_key_copies`] frees them at any time.
+//!   [`need_bytes`] bounds the device memory of one quotient.
 //!
-//! Scoped buffers (owned by one call) are zeroed when dropped, at the end
-//! of that call or on a background thread that [`end_request`] waits for;
-//! they go back to the pool, whose idle buffers the check reads back. A
-//! region that fails the check is zeroed again, read back again and
-//! released (never pooled, never kept as scratch), and the report is `Err`:
-//! there is no quarantine and no retry, unlike the wipe layer of the CUDA
-//! crate.
+//! ## Environment
 //!
-//! The large buffers, per-request and scoped, come from a pool of zeroed
-//! buffers and go back to it after their zeroing, instead of being released:
-//! a new buffer makes the first command buffer that uses it wait while its
-//! pages are mapped for the GPU (about 20 ms for 448 MiB on an M4 Max), a
-//! pooled one does not. Every buffer in the pool reads zero. The pool keeps
-//! at most `ctx::pool_limit` bytes (`MIDNIGHT_METAL_POOL_MIB`, default a
-//! quarter of `recommendedMaxWorkingSetSize`); [`release_pool`] releases it,
-//! and [`pool_bytes`] says what it holds.
+//! Run time:
+//! - `MIDNIGHT_METAL=off`: use no device (every call declines `no-device`).
+//! - `MIDNIGHT_METAL_MIN_K`: one log2 size threshold for every class, replacing
+//!   the per-class defaults and opening the one-shot MSM (see "Size
+//!   thresholds").
+//! - `MIDNIGHT_METAL_MSM_CPU_SHARE=off`: run every G1 MSM on the device only.
+//!   By default a measured share of the points goes to the stock CPU MSM, which
+//!   runs at the same time as the device: from `2^17` on a registered table,
+//!   from `2^13` on the one-shot path (see the `msm` module, "The CPU share").
+//! - `MIDNIGHT_METAL_POOL_MIB`: the most bytes the pool of zeroed buffers keeps
+//!   idle (default a quarter of `recommendedMaxWorkingSetSize`).
+//! - `MIDNIGHT_METAL_QUOTIENT_THREADS`: the threads of one numerator dispatch
+//!   ([`quotient_threads`]).
+//! - `MIDNIGHT_METAL_KEEP_KEYS=1`: keep the proving-key copies between requests
+//!   ([`keep_resident`]).
+//! - `MIDNIGHT_METAL_SHADER_SOURCE=1`: compile the embedded shader source
+//!   instead of loading the embedded metallib ([`library_source`]).
+//!
+//! Build time (see `build.rs`): `MIDNIGHT_METAL_SHADER_SOURCE=1` skips the
+//! Metal toolchain and embeds the source only;
+//! `MIDNIGHT_METAL_REQUIRE_METALLIB=1` makes a missing toolchain or a failed
+//! shader compile a build error.
+//!
+//! Detection ([`present`]) loads no shader library; the first device call
+//! ([`device`]) makes the context.
+//!
+//! ## Declines and counters
+//!
+//! [`declines`] lists every decline by class and reason, [`stats`] the calls
+//! the device served and their GPU time; [`reset_stats`] clears both. The
+//! reasons are listed at [`declines`].
+//!
+//! ## Limits
+//!
+//! Transforms up to `2^`[`MAX_LOG_N`], MSMs up to `2^`[`MAX_MSM_LOG`] terms,
+//! each buffer at most `maxBufferLength` ([`MetalInfo`]). The shaders use the
+//! Metal Shading Language 3.2 (macOS 15+, every Apple Silicon Mac runs it).
+//!
+//! ## Source layout
+//!
+//! - `src/lib.rs`: this API, admission, thresholds, the hook boundary.
+//! - `src/account.rs`: decline and service accounting. A kernel module ends
+//!   every call with exactly one of `account::served` or `account::decline`.
+//! - `src/ctx.rs` ([`ctx`]): the device context: device, queue, library,
+//!   pipeline cache, buffers (scoped, pooled, per-request), command buffers
+//!   with error reporting, byte accounting, the erasure report.
+//! - `src/field.rs` ([`field`]): moduli and the reduction check.
+//! - `src/msm.rs`, `src/ntt.rs`, `src/quotient.rs`: one kernel family each. The
+//!   entry point calls the module after admission.
+//! - `build.rs`: the shader build (a metallib with `xcrun metal`, else the
+//!   embedded source compiled at first use).
+//! - `shaders/include/mont.h`: Montgomery arithmetic over N 32-bit limbs;
+//!   `fr.h`, `fp.h`: the two fields on it (`fr_mul`, `fp_add`, ...).
+//! - `shaders/*.metal`: kernel files. Each file is its own translation unit
+//!   with the Metal toolchain, and all of them form one translation unit on the
+//!   source path, so a kernel file includes the headers it needs (header guards
+//!   make repeated includes harmless), prefixes its kernel names with its file
+//!   stem (`ntt_*`, `msm_*`, `quotient_*`) and keeps its helpers in a namespace
+//!   of that name. `build.rs` picks up a new file without any other change.
+//!   `field_test.metal`, `msm_test.metal` and `diag.metal` hold test kernels,
+//!   compiled only with the feature `test-support`.
 
 #![deny(missing_docs)]
 #![deny(missing_debug_implementations)]
+// Other targets keep the host-side code they do not call.
 #![cfg_attr(not(target_os = "macos"), allow(dead_code, unused_imports))]
 
 use std::{
     ffi::c_void,
     sync::{
         OnceLock,
-        atomic::{AtomicU32, AtomicU64, Ordering::Relaxed},
+        atomic::{AtomicU32, Ordering::Relaxed},
     },
 };
 
@@ -277,28 +285,28 @@ pub mod ctx;
 #[cfg(target_os = "macos")]
 mod msm;
 #[cfg(target_os = "macos")]
-pub use msm::{SrsHandle, msm_counts, register_srs, srs_handles, srs_stale};
+mod ntt;
+#[cfg(target_os = "macos")]
+mod quotient;
+
 /// The MSM's measurement entry (feature `test-support`; not a stable
 /// interface, not for secret scalars).
 #[cfg(all(target_os = "macos", any(test, feature = "test-support")))]
 #[doc(hidden)]
 pub use msm::{MsmStages, msm_g1_stages, one_shot_g1_checks};
 #[cfg(target_os = "macos")]
-mod ntt;
-/// Host-to-host wrappers of the NTT device building blocks, for this crate's
-/// integration tests (not a stable interface).
-#[cfg(target_os = "macos")]
+pub use msm::{SrsHandle, msm_counts, register_srs, srs_handles, srs_stale};
+/// Host-to-host wrappers of the NTT device building blocks (feature
+/// `test-support`; not a stable interface).
+#[cfg(all(target_os = "macos", any(test, feature = "test-support")))]
 #[doc(hidden)]
 pub use ntt::test_support as ntt_test_support;
-#[cfg(target_os = "macos")]
-mod quotient;
-#[cfg(target_os = "macos")]
-pub use quotient::{
-    KeyHandle, QuotientStages, evict_key_copies, keep_resident, key_stale, keys_registered,
-    need_bytes, quotient_counts, register_key, set_keep_resident, threads as quotient_threads,
-};
-/// The quotient job layout and test and measurement entry points of the
-/// quotient, for this crate's integration tests (not a stable interface).
+/// The stage timings of the last quotient served (feature `test-support`).
+#[cfg(all(target_os = "macos", any(test, feature = "test-support")))]
+#[doc(hidden)]
+pub use quotient::QuotientStages;
+/// The quotient job layout, for this crate's integration tests (not a stable
+/// interface).
 #[cfg(target_os = "macos")]
 #[doc(hidden)]
 pub use quotient::abi as quotient_abi;
@@ -307,6 +315,11 @@ pub use quotient::abi as quotient_abi;
 #[cfg(all(target_os = "macos", any(test, feature = "test-support")))]
 #[doc(hidden)]
 pub use quotient::test_support as quotient_test_support;
+#[cfg(target_os = "macos")]
+pub use quotient::{
+    KeyHandle, evict_key_copies, keep_resident, key_stale, keys_registered, need_bytes,
+    quotient_counts, register_key, set_keep_resident, threads as quotient_threads,
+};
 
 #[cfg(all(test, target_os = "macos"))]
 mod tests;
@@ -327,9 +340,9 @@ pub const MAX_MSM_LOG: u32 = 28;
 
 /// log2 rounded to the nearest integer on the log scale: the floor of
 /// `log2(n sqrt 2)`. The size class of an MSM length: its admission (see
-/// "Size thresholds"), its window plan and its CPU share (the `msm`
-/// module) all go by it, so that a length just below a power of two (the
-/// `n - 1` coefficients of a multi-open quotient) is treated as that power.
+/// "Size thresholds"), its window plan and its CPU share (the `msm` module)
+/// all go by it, so that a length just below a power of two (the `n - 1`
+/// coefficients of a multi-open quotient) is treated as that power.
 pub(crate) const fn lg2_nearest(n: usize) -> u32 {
     // 181 / 128 = 1.4140625, just below sqrt 2
     let mut m = ((n as u128 * 181) >> 7) as usize;
@@ -340,6 +353,9 @@ pub(crate) const fn lg2_nearest(n: usize) -> u32 {
     }
     r
 }
+
+// ---------------------------------------------------------------------------
+// Device
 
 /// The Metal device as its properties describe it.
 #[derive(Clone, Debug, PartialEq, Eq)]
@@ -371,6 +387,7 @@ pub const fn metal_built() -> bool {
     cfg!(target_os = "macos")
 }
 
+/// Whether `MIDNIGHT_METAL=off` (read once).
 fn disabled() -> bool {
     static OFF: OnceLock<bool> = OnceLock::new();
     *OFF.get_or_init(|| std::env::var("MIDNIGHT_METAL").as_deref() == Ok("off"))
@@ -417,6 +434,37 @@ pub fn library_source() -> Option<&'static str> {
     None
 }
 
+/// `(free, total)` bytes for the device, when a device is usable.
+///
+/// `total` is `MTLDevice.recommendedMaxWorkingSetSize`: Metal's estimate of
+/// the memory the GPU can use without hurting performance. `free` is `total`
+/// minus `MTLDevice.currentAllocatedSize` (everything this process has
+/// allocated on the device: buffers, the library, pipelines, driver
+/// structures), plus the idle buffers of the pool ([`pool_bytes`]: a new
+/// allocation that would not fit releases idle buffers first, so they are
+/// free for any allocation), saturating at zero and at most `total`.
+///
+/// On unified memory these are neither physical figures nor reservations:
+/// the GPU allocates from the same system memory as the CPU, other processes
+/// and this process's own heap draw on it too, and nothing is set aside. A
+/// `free` above zero does not promise that an allocation succeeds, and an
+/// allocation beyond `total` can succeed (with paging). Use it as a budget
+/// hint, not as a guarantee.
+pub fn mem_info() -> Option<(usize, usize)> {
+    if !device() {
+        return None;
+    }
+    #[cfg(target_os = "macos")]
+    {
+        ctx::mem_info()
+    }
+    #[cfg(not(target_os = "macos"))]
+    None
+}
+
+// ---------------------------------------------------------------------------
+// Thresholds
+
 /// The log2 size from which each kernel class is sent to the device (see
 /// [`thresholds`] and the crate text, "Size thresholds").
 ///
@@ -429,10 +477,10 @@ pub struct Thresholds {
     pub fft: u32,
     /// Inverse FFTs: the transform size `log_n`.
     pub ifft: u32,
-    /// MSMs served from a registered SRS table: log2 of the length.
+    /// MSMs served from a registered SRS table: the size class of the length.
     pub msm_table: u32,
-    /// MSMs with no registered table that serves their bases (one-shot):
-    /// log2 of the length; `None`: never, every such MSM declines
+    /// MSMs with no registered table that serves their bases (one-shot): the
+    /// size class of the length; `None`: never, every such MSM declines
     /// `unregistered-bases` (the default). Only an explicit threshold sets
     /// it.
     pub msm_one_shot: Option<u32>,
@@ -471,10 +519,10 @@ impl Thresholds {
     }
 }
 
-/// The per-class break-evens measured on Apple M4 Max (40-core GPU, 128 GB),
-/// 2026-11-18, release build: the size from which the device call is faster
-/// than the stock CPU code (see the crate text, "Size thresholds"). The
-/// one-shot MSM never is, with its per-call G1 check (`None`).
+/// The per-class break-evens measured on Apple M4 Max (40-core GPU), release
+/// build: the size from which the device call is faster than the stock CPU
+/// code (see the crate text, "Size thresholds"). The one-shot MSM never is,
+/// with its per-call G1 check (`None`).
 pub const DEFAULT_THRESHOLDS: Thresholds = Thresholds {
     fft: 15,
     ifft: 15,
@@ -488,6 +536,7 @@ pub const DEFAULT_THRESHOLDS: Thresholds = Thresholds {
 const MIN_K_UNREAD: u32 = u32::MAX;
 /// [`MIN_K`]: no explicit value (the per-class defaults apply).
 const MIN_K_DEFAULTS: u32 = u32::MAX - 1;
+/// The explicit threshold, or one of the two markers above.
 static MIN_K: AtomicU32 = AtomicU32::new(MIN_K_UNREAD);
 
 /// The explicit threshold: [`set_min_k`], else `MIDNIGHT_METAL_MIN_K`
@@ -541,6 +590,9 @@ pub fn reset_min_k() {
     MIN_K.store(MIN_K_UNREAD, Relaxed);
 }
 
+// ---------------------------------------------------------------------------
+// Counters
+
 /// Calls served by the device in one hook class since the last
 /// [`reset_stats`].
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
@@ -564,7 +616,7 @@ pub struct Stats {
     pub quotient: ClassStats,
 }
 
-/// The counters.
+/// The service counters since the last [`reset_stats`].
 pub fn stats() -> Stats {
     Stats {
         msm: account::class_stats(Class::Msm),
@@ -575,20 +627,23 @@ pub fn stats() -> Stats {
 }
 
 /// Every decline since the last [`reset_stats`]: `(class, reason, count)`.
-/// Classes: `msm`, `fft`, `ifft`, `quotient`. Reasons: `no-device` (another
-/// target, no usable device, `MIDNIGHT_METAL=off`), `below-min-k` (below the
-/// class's threshold, see [`thresholds`]), `shape` (a length, root, job
-/// layout or version the device does not take), `unreduced` (a scalar not
-/// below the modulus), `memory` (a buffer above `maxBufferLength`, a failed
-/// allocation or a budget), `device-error` (a pipeline, encoder or command
-/// buffer failed), `panic` (the kernel module panicked; the entry point
-/// caught it), `bases-not-in-subgroup` (`msm` only: a base that is not a
-/// point of G1, off the curve or outside the prime-order subgroup),
-/// `unregistered-bases` (`msm` only: no registered table serves the bases,
-/// never registered or found stale, and the one-shot path is off, as it is
-/// with the default thresholds; decided before any scalar is read and
-/// before any G1 check, see "MSMs without a registered table" in the crate
-/// text).
+///
+/// Classes: `msm`, `fft`, `ifft`, `quotient`. Reasons:
+/// - `no-device`: another target, no usable device, `MIDNIGHT_METAL=off`;
+/// - `below-min-k`: below the class's threshold ([`thresholds`]), or an MSM
+///   below its effective-size need;
+/// - `shape`: a length, root, job layout or version the device does not take;
+/// - `unreduced`: a scalar not below the modulus;
+/// - `memory`: a buffer above `maxBufferLength`, a failed allocation or a
+///   budget;
+/// - `device-error`: a pipeline, encoder or command buffer failed;
+/// - `panic`: the kernel module panicked and the entry point caught it;
+/// - `bases-not-in-subgroup` (`msm` only): a base that is not a point of G1,
+///   off the curve or outside the prime-order subgroup;
+/// - `unregistered-bases` (`msm` only): no registered table serves the bases
+///   (never registered, or found stale) and the one-shot path is off, as it is
+///   with the default thresholds; decided before any scalar is read and before
+///   any G1 check (see "MSMs without a registered table" in the crate text).
 pub fn declines() -> Vec<(&'static str, &'static str, u64)> {
     account::declines()
 }
@@ -598,6 +653,9 @@ pub fn reset_stats() {
     account::reset();
 }
 
+// ---------------------------------------------------------------------------
+// MSM
+
 /// The admission of an MSM on its lengths: an empty input, unequal lengths
 /// or a length above `2^max_log` is `shape`; a length whose size class (its
 /// log2 rounded to the nearest integer, so `2^k - 1` is in class `k`) is
@@ -606,13 +664,29 @@ pub fn reset_stats() {
 /// also declines: `unregistered-bases` when `msm_one_shot` is `None` (the
 /// default), `below-min-k` below its class otherwise.
 pub fn msm_admission(scalars: usize, bases: usize, max_log: u32) -> Result<(), &'static str> {
+    length_admission(scalars, bases, max_log).map_err(Reason::name)
+}
+
+/// [`msm_admission`] with the reason as a [`Reason`].
+fn length_admission(scalars: usize, bases: usize, max_log: u32) -> Result<(), Reason> {
     if scalars == 0 || scalars != bases || scalars > (1usize << max_log.min(62)) {
-        return Err(Reason::Shape.name());
+        return Err(Reason::Shape);
     }
     if lg2_nearest(scalars) < thresholds().msm_table {
-        return Err(Reason::BelowMinK.name());
+        return Err(Reason::BelowMinK);
     }
     Ok(())
+}
+
+/// The one-shot admission of an MSM of `len` scalars whose bases no
+/// registered table serves: `unregistered-bases` when `msm_one_shot` is
+/// `None`, `below-min-k` below its class; else the threshold.
+fn one_shot_admission(len: usize, t: &Thresholds) -> Result<u32, Reason> {
+    match t.msm_one_shot {
+        None => Err(Reason::UnregisteredBases),
+        Some(k) if lg2_nearest(len) < k => Err(Reason::BelowMinK),
+        Some(k) => Ok(k),
+    }
 }
 
 /// Whether [`msm_g1`] takes an MSM of `len` scalars over `bases` by its
@@ -621,35 +695,26 @@ pub fn msm_admission(scalars: usize, bases: usize, max_log: u32) -> Result<(), &
 /// identity comparison as [`msm_g1`], which drops a stale table, and no
 /// point of the prefix outside G1), or none does and the one-shot path is
 /// open with `len` in the class `msm_one_shot` of [`thresholds`] (with the
-/// default thresholds it is not: `false`). It reads no scalar: the checks
-/// that do (the effective size of a sparse MSM, the reduction) come after it
-/// in [`msm_g1`], which may still decline, and so may the per-call G1 check
-/// of the one-shot path, which this does not run. A figure that does not
-/// depend on the scalar values, for a caller that must not report one that
-/// does. It does not look at the device ([`device`]).
+/// default thresholds it is not: `false`).
+///
+/// It reads no scalar: the checks that do (the effective size of a sparse
+/// MSM, the reduction) come after it in [`msm_g1`], which may still
+/// decline, and so may the per-call G1 check of the one-shot path, which
+/// this does not run. A figure that does not depend on the scalar values,
+/// for a caller that must not report one that does. It does not look at the
+/// device ([`device`]).
 pub fn msm_sized(len: usize, bases: &[G1AffineLimbs]) -> bool {
-    if msm_admission(len, bases.len(), MAX_MSM_LOG).is_err() {
+    if length_admission(len, bases.len(), MAX_MSM_LOG).is_err() {
         return false;
     }
     #[cfg(target_os = "macos")]
     match msm::lookup(bases, len) {
         msm::Lookup::Table(_) => true,
         msm::Lookup::NotInG1 => false,
-        msm::Lookup::Unregistered => one_shot_admits(len, &thresholds()).is_ok(),
+        msm::Lookup::Unregistered => one_shot_admission(len, &thresholds()).is_ok(),
     }
     #[cfg(not(target_os = "macos"))]
-    one_shot_admits(len, &thresholds()).is_ok()
-}
-
-/// The one-shot admission of an MSM of `len` scalars whose bases no
-/// registered table serves: `unregistered-bases` when `msm_one_shot` is
-/// `None`, `below-min-k` below its class.
-fn one_shot_admits(len: usize, t: &Thresholds) -> Result<u32, Reason> {
-    match t.msm_one_shot {
-        None => Err(Reason::UnregisteredBases),
-        Some(k) if lg2_nearest(len) < k => Err(Reason::BelowMinK),
-        Some(k) => Ok(k),
-    }
+    one_shot_admission(len, &thresholds()).is_ok()
 }
 
 /// G1 MSM `sum scalars[i] * bases[i]` (equal lengths): the hook
@@ -675,12 +740,7 @@ pub fn msm_g1(scalars: &[Scalar], bases: &[G1AffineLimbs]) -> Option<G1JacobianL
 }
 
 fn msm_g1_body(scalars: &[Scalar], bases: &[G1AffineLimbs]) -> Option<G1JacobianLimbs> {
-    if let Err(why) = msm_admission(scalars.len(), bases.len(), MAX_MSM_LOG) {
-        let r = if why == Reason::Shape.name() {
-            Reason::Shape
-        } else {
-            Reason::BelowMinK
-        };
+    if let Err(r) = length_admission(scalars.len(), bases.len(), MAX_MSM_LOG) {
         account::decline(Class::Msm, r);
         return None;
     }
@@ -704,7 +764,7 @@ fn msm_g1_body(scalars: &[Scalar], bases: &[G1AffineLimbs]) -> Option<G1Jacobian
                 account::decline(Class::Msm, msm::BASES_REASON);
                 return None;
             }
-            msm::Lookup::Unregistered => match one_shot_admits(n, &t) {
+            msm::Lookup::Unregistered => match one_shot_admission(n, &t) {
                 Ok(k) => (None, msm::effective_need(n, k, false, t.explicit)),
                 Err(r) => {
                     account::decline(Class::Msm, r);
@@ -713,8 +773,7 @@ fn msm_g1_body(scalars: &[Scalar], bases: &[G1AffineLimbs]) -> Option<G1Jacobian
             },
         };
         // the effective size (the non-zero scalars) against the need of the
-        // path (crate text, "Size thresholds"); only the decline is
-        // observable
+        // path; only the decline is observable
         if !msm::effective_size_reaches(scalars, need) {
             account::decline(Class::Msm, Reason::BelowMinK);
             return None;
@@ -724,7 +783,7 @@ fn msm_g1_body(scalars: &[Scalar], bases: &[G1AffineLimbs]) -> Option<G1Jacobian
             return None;
         }
         let r = msm::msm_g1(scalars, bases, table);
-        // a test panic after the backend used its scratch
+        // the test panic comes after the backend used its scratch
         test_switch::hook_panic(Class::Msm);
         r
     }
@@ -732,7 +791,11 @@ fn msm_g1_body(scalars: &[Scalar], bases: &[G1AffineLimbs]) -> Option<G1Jacobian
     None
 }
 
-/// The admission shared by [`fft`] and [`ifft`].
+// ---------------------------------------------------------------------------
+// Transforms
+
+/// The admission shared by [`fft`] and [`ifft`]: the shape, the threshold,
+/// the device, then the reduction of the root, the divisor and the data.
 fn transform_admission(
     class: Class,
     a: &[Scalar],
@@ -781,7 +844,9 @@ fn fft_body(a: &mut [Scalar], omega: Scalar, log_n: u32) -> bool {
 /// The FFT of `a` at `omega_inv`, then each element times `divisor`, in
 /// place: the hook `GpuHooks::ifft`. `false`: declined, `a` unchanged.
 pub fn ifft(a: &mut [Scalar], omega_inv: Scalar, log_n: u32, divisor: Scalar) -> bool {
-    guarded(Class::Ifft, false, || ifft_body(a, omega_inv, log_n, divisor))
+    guarded(Class::Ifft, false, || {
+        ifft_body(a, omega_inv, log_n, divisor)
+    })
 }
 
 fn ifft_body(a: &mut [Scalar], omega_inv: Scalar, log_n: u32, divisor: Scalar) -> bool {
@@ -796,6 +861,9 @@ fn ifft_body(a: &mut [Scalar], omega_inv: Scalar, log_n: u32, divisor: Scalar) -
     false
 }
 
+// ---------------------------------------------------------------------------
+// Quotient
+
 /// The quotient `h(X)` of a job (`midnight_proofs::gpu::abi::QuotientJobAbi`):
 /// the hook `GpuHooks::quotient`, writing the first `out.len()` coefficients.
 /// `false`: declined, `out` unchanged.
@@ -805,7 +873,9 @@ fn ifft_body(a: &mut [Scalar], omega_inv: Scalar, log_n: u32, divisor: Scalar) -
 /// for the call (the prover passes such a job).
 pub unsafe fn quotient(job: *const c_void, out: &mut [Scalar]) -> bool {
     // SAFETY: the caller's contract, passed on.
-    guarded(Class::Quotient, false, || unsafe { quotient_body(job, out) })
+    guarded(Class::Quotient, false, || unsafe {
+        quotient_body(job, out)
+    })
 }
 
 /// # Safety
@@ -819,7 +889,7 @@ unsafe fn quotient_body(job: *const c_void, out: &mut [Scalar]) -> bool {
     }
     #[cfg(target_os = "macos")]
     {
-        // a test panic before the backend: `out` is not written yet
+        // the test panic comes before the backend: `out` is not written yet
         test_switch::hook_panic(Class::Quotient);
         // SAFETY: the caller's contract.
         unsafe { quotient::quotient(job, out) }
@@ -831,25 +901,17 @@ unsafe fn quotient_body(job: *const c_void, out: &mut [Scalar]) -> bool {
     }
 }
 
-/// Hook calls whose backend panicked ([`Reason::Panic`]), since process
-/// start. For tests: a panic is otherwise only the decline `panic`.
-static HOOK_PANICS: AtomicU64 = AtomicU64::new(0);
+// ---------------------------------------------------------------------------
+// The hook boundary
 
-/// Hook calls whose backend panicked since process start (each one also a
-/// decline `panic` of its class). Not a stable interface.
-#[doc(hidden)]
-pub fn hook_panics() -> u64 {
-    HOOK_PANICS.load(Relaxed)
-}
-
-/// The scope of one hook call: when no request is open
-/// ([`begin_request`]) at its start or at its end, its drop zeroes every
-/// per-request buffer (the device scratch and the idle lendable buffers,
-/// which can hold witness values) before the hook returns, on success,
-/// decline, error or a caught panic. The wipe takes the device, so it never
-/// zeroes a buffer another call is using (see `ctx::wipe_unbracketed`).
-/// Inside a request it does nothing: the scratch is reused by the next call
-/// and zeroed by [`end_request`].
+/// The scope of one hook call: when no request is open ([`begin_request`])
+/// at its start or at its end, its drop zeroes every per-request buffer (the
+/// device scratch and the idle lendable buffers, which can hold witness
+/// values) before the hook returns, on success, decline, error or a caught
+/// panic. The wipe takes the device, so it never zeroes a buffer another
+/// call is using (see `ctx::wipe_unbracketed`). Inside a request it does
+/// nothing: the scratch is reused by the next call and zeroed by
+/// [`end_request`].
 struct HookScope {
     #[cfg(target_os = "macos")]
     open: bool,
@@ -883,24 +945,26 @@ fn guarded<R>(class: Class, declined: R, body: impl FnOnce() -> R) -> R {
     match std::panic::catch_unwind(std::panic::AssertUnwindSafe(body)) {
         Ok(r) => r,
         Err(_) => {
-            HOOK_PANICS.fetch_add(1, Relaxed);
+            test_switch::count_panic();
             account::decline(class, Reason::Panic);
             declined
         }
     }
 }
 
-/// Test switches of the hook entries (feature `test-support`); no-ops
-/// otherwise.
-pub(crate) mod test_switch {
+/// Test switches of the hook entries (feature `test-support`, or this crate's
+/// unit tests).
+#[cfg(any(test, feature = "test-support"))]
+mod test_switch {
+    use std::sync::atomic::{AtomicU32, AtomicU64, Ordering::Relaxed};
+
     use crate::account::Class;
-    #[cfg(any(test, feature = "test-support"))]
-    use std::sync::atomic::{AtomicU32, Ordering::Relaxed};
 
-    #[cfg(any(test, feature = "test-support"))]
+    /// One bit per class ([`bit`]) whose backend panics.
     static HOOK_PANIC: AtomicU32 = AtomicU32::new(0);
+    /// Hook calls whose backend panicked, since process start.
+    static HOOK_PANICS: AtomicU64 = AtomicU64::new(0);
 
-    #[cfg(any(test, feature = "test-support"))]
     fn bit(class: Class) -> u32 {
         match class {
             Class::Msm => 1,
@@ -910,10 +974,7 @@ pub(crate) mod test_switch {
         }
     }
 
-    /// Makes every later call of the hook `class` (`msm`, `fft`, `ifft`,
-    /// `quotient`) panic inside its backend (`true`), or stops it.
-    #[cfg(any(test, feature = "test-support"))]
-    pub fn set_hook_panic(class: &str, on: bool) {
+    pub(super) fn set_hook_panic(class: &str, on: bool) {
         let b = [Class::Msm, Class::Fft, Class::Ifft, Class::Quotient]
             .into_iter()
             .find(|c| c.name() == class)
@@ -926,14 +987,34 @@ pub(crate) mod test_switch {
     }
 
     /// Panics when [`set_hook_panic`] is on for `class`.
-    #[inline]
-    #[allow(unused_variables)]
     pub(crate) fn hook_panic(class: Class) {
-        #[cfg(any(test, feature = "test-support"))]
         if HOOK_PANIC.load(Relaxed) & bit(class) != 0 {
-            panic!("midnight-metal test switch: a panic in the {} backend", class.name());
+            panic!(
+                "midnight-metal test switch: a panic in the {} backend",
+                class.name()
+            );
         }
     }
+
+    pub(super) fn count_panic() {
+        HOOK_PANICS.fetch_add(1, Relaxed);
+    }
+
+    pub(super) fn hook_panics() -> u64 {
+        HOOK_PANICS.load(Relaxed)
+    }
+}
+
+/// The test switches of a normal build: no-ops.
+#[cfg(not(any(test, feature = "test-support")))]
+mod test_switch {
+    use crate::account::Class;
+
+    #[inline(always)]
+    pub(crate) fn hook_panic(_: Class) {}
+
+    #[inline(always)]
+    pub(super) fn count_panic() {}
 }
 
 /// Makes every later call of the hook `class` (`msm`, `fft`, `ifft`,
@@ -945,21 +1026,34 @@ pub fn set_hook_panic(class: &str, on: bool) {
     test_switch::set_hook_panic(class, on);
 }
 
+/// Hook calls whose backend panicked since process start (each one also a
+/// decline `panic` of its class; feature `test-support`).
+#[cfg(any(test, feature = "test-support"))]
+#[doc(hidden)]
+pub fn hook_panics() -> u64 {
+    test_switch::hook_panics()
+}
+
+// ---------------------------------------------------------------------------
+// Requests and memory
+
 /// Starts a request: the per-request buffers (device scratch that can hold
 /// witness values) are then kept for reuse across the hook calls of the
-/// request until [`end_request`] / [`end_request_report`] zeroes them; also
-/// resets the peaks of [`device_bytes`] and [`request_peak_bytes`]. Without a request every hook call
-/// zeroes them before it returns (see "Requests" in the crate text).
+/// request until [`end_request`] / [`end_request_report`] zeroes them. Also
+/// resets the peaks of [`device_bytes`] and [`request_peak_bytes`]. Without
+/// a request every hook call zeroes them before it returns (see "Requests
+/// and wiping" in the crate text).
 pub fn begin_request() {
     #[cfg(target_os = "macos")]
-    ctx::begin_request();
-    #[cfg(target_os = "macos")]
-    quotient::begin_request();
+    {
+        ctx::begin_request();
+        quotient::begin_request();
+    }
 }
 
 /// What [`end_request_report`] erased: the per-request buffers (regions) of
-/// the request, zeroed before their release, and with `check` read back,
-/// with (check mode) the idle buffers of the pool read back.
+/// the request, zeroed before their release and, with `check`, read back,
+/// together with (check mode) the idle buffers of the pool read back.
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
 pub struct WipeStats {
     /// Regions zeroed (then pooled, or released when one failed its check):
@@ -994,14 +1088,15 @@ pub struct WipeStats {
 /// progress and for the zeroing still running in the background; with
 /// `check` reads back every idle buffer of the pool of zeroed buffers; then
 /// zeroes every per-request buffer, with `check` reads each one back from
-/// the host and compares it with zero, and puts it back into the pool;
-/// then frees the proving-key copies unless [`keep_resident`]. `Err`: a
-/// region read back non-zero or could not be read, or a zeroing panicked
-/// (`erasure_failures`). A region (a per-request buffer, or an idle buffer
-/// of the pool) that read back non-zero or could not be read back is zeroed
-/// again, read back again and released: it never goes back into the pool
-/// and is never kept as scratch (there is no quarantine). On other targets, or
-/// before the context exists, there is no region.
+/// the host and compares it with zero, and puts it back into the pool; then
+/// frees the proving-key copies unless [`keep_resident`].
+///
+/// `Err`: a region read back non-zero or could not be read, or a zeroing
+/// panicked (`erasure_failures`). A region (a per-request buffer, or an idle
+/// buffer of the pool) that read back non-zero or could not be read back is
+/// zeroed again, read back again and released: it never goes back into the
+/// pool and is never kept as scratch. On other targets, or before the
+/// context exists, there is no region.
 pub fn end_request_report(check: bool) -> Result<WipeStats, WipeStats> {
     #[cfg(target_os = "macos")]
     {
@@ -1023,9 +1118,9 @@ pub fn end_request() -> bool {
     end_request_report(false).is_ok()
 }
 
-/// Releases the pool of zeroed buffers (see "Requests" in the crate text),
-/// after the zeroing still running in the background has ended. Returns the
-/// bytes released.
+/// Releases the pool of zeroed buffers (see "Requests and wiping" in the
+/// crate text), after the zeroing still running in the background has
+/// ended. Returns the bytes released.
 pub fn release_pool() -> u64 {
     #[cfg(target_os = "macos")]
     {
@@ -1072,32 +1167,4 @@ pub fn request_peak_bytes() -> u64 {
     }
     #[cfg(not(target_os = "macos"))]
     0
-}
-
-/// `(free, total)` bytes for the device, when a device is usable.
-///
-/// `total` is `MTLDevice.recommendedMaxWorkingSetSize`: Metal's estimate of
-/// the memory the GPU can use without hurting performance. `free` is `total`
-/// minus `MTLDevice.currentAllocatedSize` (everything this process has
-/// allocated on the device: buffers, the library, pipelines, driver
-/// structures), plus the idle buffers of the pool ([`pool_bytes`]: a new
-/// allocation that would not fit releases idle buffers first, so they are
-/// free for any allocation), saturating at zero and at most `total`.
-///
-/// On unified memory these are neither physical figures nor reservations:
-/// the GPU allocates from the same system memory as the CPU, other processes
-/// and this process's own heap draw on it too, and nothing is set aside. A
-/// `free` above zero does not promise that an allocation succeeds, and an
-/// allocation beyond `total` can succeed (with paging). Use it as a budget
-/// hint, not as a guarantee.
-pub fn mem_info() -> Option<(usize, usize)> {
-    if !device() {
-        return None;
-    }
-    #[cfg(target_os = "macos")]
-    {
-        ctx::mem_info()
-    }
-    #[cfg(not(target_os = "macos"))]
-    None
 }

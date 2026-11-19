@@ -34,20 +34,20 @@ const OP_MUL: u32 = 2;
 const OP_SQR: u32 = 3;
 const OP_NEG: u32 = 4;
 const OP_DBL: u32 = 5;
-const OP_MUL_CIOS32: u32 = 6;
-const OP_MUL_MULHI32: u32 = 7;
-const OP_MUL_FIPS32: u32 = 8;
-const OP_MUL_CIOS64: u32 = 9;
-const OP_IS_REDUCED: u32 = 10;
-const OP_ONE: u32 = 11;
-const OP_EQ: u32 = 12;
+const OP_IS_REDUCED: u32 = 6;
+const OP_ONE: u32 = 7;
+const OP_EQ: u32 = 8;
 
-const MUL_OPS: [(u32, &str); 5] = [
-    (OP_MUL, "default"),
-    (OP_MUL_CIOS32, "cios32"),
-    (OP_MUL_MULHI32, "mulhi32"),
-    (OP_MUL_FIPS32, "fips32"),
-    (OP_MUL_CIOS64, "cios64"),
+/// The operations compared with blst on edge and random pairs.
+const OPS: [(u32, &str); 8] = [
+    (OP_ADD, "add"),
+    (OP_SUB, "sub"),
+    (OP_MUL, "mul"),
+    (OP_SQR, "sqr"),
+    (OP_NEG, "neg"),
+    (OP_DBL, "dbl"),
+    (OP_ONE, "one"),
+    (OP_EQ, "eq"),
 ];
 
 fn require_device() {
@@ -115,9 +115,7 @@ fn fr_ref(op: u32, a: &Scalar, b: &Scalar) -> Scalar {
     match op {
         OP_ADD => fr2(blst_fr_add, a, b),
         OP_SUB => fr2(blst_fr_sub, a, b),
-        OP_MUL | OP_MUL_CIOS32 | OP_MUL_MULHI32 | OP_MUL_FIPS32 | OP_MUL_CIOS64 => {
-            fr2(blst_fr_mul, a, b)
-        }
+        OP_MUL => fr2(blst_fr_mul, a, b),
         OP_SQR => {
             // SAFETY: valid blst_fr values.
             unsafe { blst_fr_sqr(&mut r, &blst_fr { l: *a }) };
@@ -145,9 +143,7 @@ fn fp_ref(op: u32, a: &FpLimbs, b: &FpLimbs) -> FpLimbs {
     match op {
         OP_ADD => fp2(blst_fp_add, a, b),
         OP_SUB => fp2(blst_fp_sub, a, b),
-        OP_MUL | OP_MUL_CIOS32 | OP_MUL_MULHI32 | OP_MUL_FIPS32 | OP_MUL_CIOS64 => {
-            fp2(blst_fp_mul, a, b)
-        }
+        OP_MUL => fp2(blst_fp_mul, a, b),
         OP_SQR => {
             // SAFETY: valid blst_fp values.
             unsafe { blst_fp_sqr(&mut r, &blst_fp { l: *a }) };
@@ -304,51 +300,17 @@ fn check_fp(op: u32, name: &str) {
 // --- field tests ------------------------------------------------------------
 
 #[test]
-fn fr_add_sub_neg_dbl() {
-    for (op, name) in [
-        (OP_ADD, "add"),
-        (OP_SUB, "sub"),
-        (OP_NEG, "neg"),
-        (OP_DBL, "dbl"),
-    ] {
+fn fr_matches_blst() {
+    for (op, name) in OPS {
         check_fr(op, name);
     }
 }
 
 #[test]
-fn fr_mul_square() {
-    for (op, name) in MUL_OPS {
-        check_fr(op, name);
-    }
-    check_fr(OP_SQR, "sqr");
-}
-
-#[test]
-fn fp_add_sub_neg_dbl() {
-    for (op, name) in [
-        (OP_ADD, "add"),
-        (OP_SUB, "sub"),
-        (OP_NEG, "neg"),
-        (OP_DBL, "dbl"),
-    ] {
+fn fp_matches_blst() {
+    for (op, name) in OPS {
         check_fp(op, name);
     }
-}
-
-#[test]
-fn fp_mul_square() {
-    for (op, name) in MUL_OPS {
-        check_fp(op, name);
-    }
-    check_fp(OP_SQR, "sqr");
-}
-
-#[test]
-fn one_and_eq() {
-    check_fr(OP_ONE, "one");
-    check_fp(OP_ONE, "one");
-    check_fr(OP_EQ, "eq");
-    check_fp(OP_EQ, "eq");
 }
 
 /// Values at, just above and far above the modulus, and the largest limbs.
@@ -397,7 +359,8 @@ fn reduced_check() {
     }
 }
 
-// --- context tests ------------------------------------------------------------
+// --- context tests
+// ------------------------------------------------------------
 
 #[test]
 fn context_and_info() {
@@ -408,11 +371,6 @@ fn context_and_info() {
     assert!(crate::library_source().is_some());
     let (free, total) = crate::mem_info().unwrap();
     assert!(free <= total && total as u64 == info.recommended_max_working_set);
-    eprintln!(
-        "{info:#?}\nlibrary: {:?}\nmem_info: {:?}",
-        crate::library_source(),
-        (free, total)
-    );
 }
 
 #[test]
@@ -565,7 +523,8 @@ fn pooled_buffers_come_back_zeroed() {
     assert!(crate::end_request());
 }
 
-// --- the entry points against the stock CPU code ------------------------------
+// --- the entry points against the stock CPU code
+// ------------------------------
 
 mod stock {
     use ff::{Field, PrimeField};
@@ -645,7 +604,10 @@ unsafe fn checked_quotient(job: *const std::ffi::c_void, out: &mut [Scalar]) -> 
     let before = decline_count("quotient", "unreduced");
     // SAFETY: the job's tables, within the prover's call.
     let ok = unsafe { crate::quotient(&bad as *const QuotientJobAbi as *const _, &mut o) };
-    assert!(!ok && o == sentinel, "an unreduced job declines, out unchanged");
+    assert!(
+        !ok && o == sentinel,
+        "an unreduced job declines, out unchanged"
+    );
     assert_eq!(decline_count("quotient", "unreduced") - before, 1);
     // SAFETY: the caller's job.
     unsafe { crate::quotient(job, out) }
@@ -671,6 +633,8 @@ fn install_checked_quotient() {
 /// caller's buffer unchanged.
 #[test]
 fn entry_points_serve_small_calls() {
+    use std::sync::atomic::Ordering::Relaxed;
+
     use group::Curve;
     use midnight_curves::Fq;
     use midnight_proofs::gpu::{
@@ -678,7 +642,6 @@ fn entry_points_serve_small_calls() {
         adapter::{affine, from_jacobian, scalar, scalars, scalars_mut},
         test_switches::{QUOTIENT_CHECK, RandomCircuit},
     };
-    use std::sync::atomic::Ordering::Relaxed;
     let _g = serial();
     require_device();
     assert!(crate::set_min_k(1));
@@ -700,12 +663,21 @@ fn entry_points_serve_small_calls() {
     let mut want = input.clone();
     stock::ifft(&mut want, wi, log_n, div);
     let mut got = input.clone();
-    assert!(crate::ifft(scalars_mut(&mut got), scalar(wi), log_n, scalar(div)));
+    assert!(crate::ifft(
+        scalars_mut(&mut got),
+        scalar(wi),
+        log_n,
+        scalar(div)
+    ));
     assert_eq!(got, want, "ifft");
     // msm (one-shot: no table registered)
     let points = stock::points(n, 2);
     let r = crate::msm_g1(scalars(&input), affine(&points)).expect("the msm is served");
-    assert_eq!(from_jacobian(r).to_affine(), stock::msm(&input, &points), "msm");
+    assert_eq!(
+        from_jacobian(r).to_affine(),
+        stock::msm(&input, &points),
+        "msm"
+    );
     let now = crate::stats();
     assert_eq!(now.fft.served - served.fft.served, 1);
     assert_eq!(now.ifft.served - served.ifft.served, 1);
@@ -720,7 +692,12 @@ fn entry_points_serve_small_calls() {
     let (_, verified) = RandomCircuit::new(8, true, 7).prove();
     QUOTIENT_CHECK.store(false, Relaxed);
     assert!(verified, "the proof with the device quotient verifies");
-    assert_eq!(crate::stats().quotient.served - q, 1, "{:?}", crate::declines());
+    assert_eq!(
+        crate::stats().quotient.served - q,
+        1,
+        "{:?}",
+        crate::declines()
+    );
     assert_eq!(hooks::quotient_checks() - checks, 1);
     assert_eq!(hooks::quotient_check_diffs(), diffs, "the stock quotient");
 
@@ -801,7 +778,11 @@ fn per_class_thresholds() {
     let input = stock::scalars(1 << log_n, 3);
     let mut a = input.clone();
     let below = decline_count("fft", "below-min-k");
-    assert!(!crate::fft(scalars_mut(&mut a), scalar(stock::root(log_n)), log_n));
+    assert!(!crate::fft(
+        scalars_mut(&mut a),
+        scalar(stock::root(log_n)),
+        log_n
+    ));
     assert_eq!(a, input);
     assert_eq!(decline_count("fft", "below-min-k") - below, 1);
 
@@ -821,9 +802,15 @@ fn per_class_thresholds() {
     let h = crate::register_srs(affine(&points));
     assert_eq!(h.device_bytes(), 0, "a registration is host memory");
     let r = crate::msm_g1(scalars(&input), affine(&points[..m])).expect("served from the table");
-    assert_eq!(from_jacobian(r).to_affine(), stock::msm(&input, &points[..m]));
+    assert_eq!(
+        from_jacobian(r).to_affine(),
+        stock::msm(&input, &points[..m])
+    );
     let (cached2, one_shot2, uploads2) = crate::msm_counts();
-    assert_eq!((cached2 - cached, one_shot2 - one_shot, uploads2 - uploads), (1, 0, 1));
+    assert_eq!(
+        (cached2 - cached, one_shot2 - one_shot, uploads2 - uploads),
+        (1, 0, 1)
+    );
     assert_eq!(h.device_bytes(), (points.len() * 96) as u64);
     // the table threshold goes by the size class of the length (its log2
     // rounded to the nearest integer): 2^13 - 1 is taken, a length of class
@@ -837,7 +824,10 @@ fn per_class_thresholds() {
     );
     let quarter = 1 << 12;
     assert!(crate::msm_g1(scalars(&input[..quarter]), affine(&points[..quarter])).is_none());
-    assert_eq!(crate::msm_admission(5793, 5793, crate::MAX_MSM_LOG), Err("below-min-k"));
+    assert_eq!(
+        crate::msm_admission(5793, 5793, crate::MAX_MSM_LOG),
+        Err("below-min-k")
+    );
     assert_eq!(crate::msm_admission(5794, 5794, crate::MAX_MSM_LOG), Ok(()));
     drop(h);
 
@@ -849,7 +839,11 @@ fn per_class_thresholds() {
     assert_eq!(crate::min_k(), 10);
     assert!(crate::msm_sized(m, affine(&points[..m])));
     let mut a = input;
-    assert!(crate::fft(scalars_mut(&mut a), scalar(stock::root(log_n)), log_n));
+    assert!(crate::fft(
+        scalars_mut(&mut a),
+        scalar(stock::root(log_n)),
+        log_n
+    ));
     crate::reset_min_k();
     assert_eq!(crate::thresholds(), crate::DEFAULT_THRESHOLDS);
     assert!(crate::end_request());
@@ -873,7 +867,10 @@ fn erase_report_reads_back_every_region() {
     // the per-request regions, then (check mode) the idle buffers of the
     // pool, read back before them
     assert_eq!(
-        (w.regions - w.pool_regions, w.checked_regions - w.pool_regions),
+        (
+            w.regions - w.pool_regions,
+            w.checked_regions - w.pool_regions
+        ),
         (2, 2)
     );
     assert_eq!(w.checked_regions, w.regions);
@@ -893,7 +890,11 @@ fn erase_report_reads_back_every_region() {
     ctx::set_plant_nonzero(false);
     let w = r.expect_err("a non-zero region fails the report");
     assert_eq!(
-        (w.regions - w.pool_regions, w.nonzero_regions, w.check_failures),
+        (
+            w.regions - w.pool_regions,
+            w.nonzero_regions,
+            w.check_failures
+        ),
         (2, 1, 0)
     );
     // the region was released all the same: not kept as scratch, not in the
@@ -927,7 +928,10 @@ fn erase_report_reads_back_the_idle_pool() {
     let idle = ctx::idle_pool_addresses().len() as u64;
     assert!(idle >= 1);
     let w = crate::end_request_report(true).expect("the idle pool reads zero");
-    assert_eq!((w.regions, w.pool_regions, w.checked_regions), (idle, idle, idle));
+    assert_eq!(
+        (w.regions, w.pool_regions, w.checked_regions),
+        (idle, idle, idle)
+    );
     assert_eq!(w.bytes, w.pool_bytes);
     assert!(w.pool_bytes >= 1 << 20);
     // a stray non-zero byte in an idle buffer
@@ -957,8 +961,12 @@ fn short_uploads_copy_exactly_their_bytes() {
         b.read(&mut back);
         assert_eq!(back, data, "{len} bytes");
         // SAFETY: the allocation is `alloc_bytes` long; nothing writes it
-        let whole = unsafe { std::slice::from_raw_parts(b.as_slice::<u8>().as_ptr(), b.alloc_bytes()) };
-        assert!(whole[len..].iter().all(|x| *x == 0), "the tail of {len} bytes");
+        let whole =
+            unsafe { std::slice::from_raw_parts(b.as_slice::<u8>().as_ptr(), b.alloc_bytes()) };
+        assert!(
+            whole[len..].iter().all(|x| *x == 0),
+            "the tail of {len} bytes"
+        );
     }
 }
 
@@ -992,7 +1000,10 @@ fn settle_releases_waits_for_every_caller() {
             })
             .collect();
         for h in hs {
-            assert!(h.join().unwrap(), "a caller returned before the zeroing ended");
+            assert!(
+                h.join().unwrap(),
+                "a caller returned before the zeroing ended"
+            );
         }
     });
     assert!(ctx::idle_pool_reads_zero());
@@ -1047,123 +1058,6 @@ fn off_switch_declines_no_device() {
     assert!(status.success());
 }
 
-// --- measurements (run with --ignored --nocapture) ------------------------------
-
-/// Multiplication strategies: `2^20` threads, each a chain of 64 dependent
-/// multiplications (2^26 per run), five runs each, GPU time.
-#[test]
-#[ignore]
-fn bench_mul_strategies() {
-    require_device();
-    const N: usize = 1 << 20;
-    const REPS: u32 = 64;
-    const RUNS: usize = 5;
-    let mut rng = ChaCha20Rng::seed_from_u64(1);
-    let fr_a: Vec<Scalar> = (0..N).map(|_| random_below(&mut rng, &FR_MODULUS)).collect();
-    let fr_b: Vec<Scalar> = (0..N).map(|_| random_below(&mut rng, &FR_MODULUS)).collect();
-    let fp_a: Vec<FpLimbs> = (0..N).map(|_| random_below(&mut rng, &FP_MODULUS)).collect();
-    let fp_b: Vec<FpLimbs> = (0..N).map(|_| random_below(&mut rng, &FP_MODULUS)).collect();
-    let s = ctx::lock().unwrap();
-    let c = s.ctx();
-    for (field, a, b, bytes) in [
-        (
-            "fr",
-            c.upload(&fr_a).unwrap(),
-            c.upload(&fr_b).unwrap(),
-            32usize,
-        ),
-        ("fp", c.upload(&fp_a).unwrap(), c.upload(&fp_b).unwrap(), 48),
-    ] {
-        let mut first: Option<Vec<u64>> = None;
-        for strat in ["cios32", "mulhi32", "fips32", "cios64"] {
-            let kernel = format!("field_bench_{field}_{strat}");
-            let out = c.alloc(N * bytes).unwrap();
-            let n = N as u32;
-            let mut times = Vec::new();
-            for _ in 0..RUNS + 1 {
-                let (_, ns) = c
-                    .run(|cmd| {
-                        cmd.dispatch(
-                            &kernel,
-                            N,
-                            &[
-                                Arg::Buffer(&a),
-                                Arg::Buffer(&b),
-                                Arg::Buffer(&out),
-                                Arg::value(&REPS),
-                                Arg::value(&n),
-                            ],
-                        )
-                    })
-                    .unwrap();
-                times.push(ns);
-            }
-            // the first run includes the pipeline's first use
-            let mut t = times[1..].to_vec();
-            t.sort();
-            let muls = (N as u64) * REPS as u64;
-            let res: Vec<u64> = out.as_slice::<u64>().to_vec();
-            match &first {
-                None => first = Some(res),
-                Some(f) => assert_eq!(f, &res, "{kernel} disagrees with cios32"),
-            }
-            println!(
-                "{field} {strat:8} min {:7.3} ms  median {:7.3} ms  {:6.2} Gmul/s (min)",
-                t[0] as f64 / 1e6,
-                t[t.len() / 2] as f64 / 1e6,
-                muls as f64 / t[0] as f64
-            );
-        }
-    }
-}
-
-/// How long one command buffer may run: a spinning kernel held for growing
-/// durations, reporting the GPU time or the error.
-#[test]
-#[ignore]
-fn command_buffer_duration() {
-    require_device();
-    let s = ctx::lock().unwrap();
-    let c = s.ctx();
-    let threads: u32 = 1 << 16;
-    let out = c.alloc(threads as usize * 4).unwrap();
-    // calibrate
-    let mut iters: u32 = 1 << 16;
-    let (_, ns) = c
-        .run(|cmd| {
-            cmd.dispatch(
-                "diag_spin",
-                threads as usize,
-                &[Arg::Buffer(&out), Arg::value(&iters), Arg::value(&threads)],
-            )
-        })
-        .unwrap();
-    let per_iter = ns as f64 / iters as f64;
-    let secs: Vec<f64> = std::env::var("MIDNIGHT_METAL_SPIN_SECS")
-        .ok()
-        .map(|v| v.split(',').filter_map(|x| x.parse().ok()).collect())
-        .unwrap_or_else(|| vec![0.5, 1.0, 2.0, 5.0, 10.0]);
-    for target in secs {
-        iters = ((target * 1e9 / per_iter) as u64).min(u32::MAX as u64) as u32;
-        let t0 = std::time::Instant::now();
-        let r = c.run(|cmd| {
-            cmd.dispatch(
-                "diag_spin",
-                threads as usize,
-                &[Arg::Buffer(&out), Arg::value(&iters), Arg::value(&threads)],
-            )
-        });
-        let wall = t0.elapsed().as_secs_f64();
-        match r {
-            Ok((_, ns)) => println!(
-                "target {target:5.1} s: ok, GPU {:.3} s, wall {wall:.3} s",
-                ns as f64 / 1e9
-            ),
-            Err(e) => println!("target {target:5.1} s: {e} (wall {wall:.3} s)"),
-        }
-    }
-}
-
 // --- hook calls outside a request, panics at the hook boundary ---------------
 
 /// The per-request buffers that exist now, for messages.
@@ -1176,7 +1070,10 @@ fn request_buffer_keys() -> Vec<&'static str> {
 fn assert_wiped(after: &str) {
     let left = ctx::request_buffers();
     assert!(left.is_empty(), "after {after}: {left:?}");
-    assert!(ctx::idle_pool_reads_zero(), "after {after}: an idle buffer is not zero");
+    assert!(
+        ctx::idle_pool_reads_zero(),
+        "after {after}: an idle buffer is not zero"
+    );
 }
 
 /// Without `begin_request` every hook call zeroes its per-request buffers
@@ -1209,7 +1106,12 @@ fn hooks_outside_a_request_wipe_before_they_return() {
     let q = crate::stats().quotient.served;
     let (_, verified) = RandomCircuit::new(8, true, 9).prove();
     assert!(verified);
-    assert_eq!(crate::stats().quotient.served - q, 1, "{:?}", crate::declines());
+    assert_eq!(
+        crate::stats().quotient.served - q,
+        1,
+        "{:?}",
+        crate::declines()
+    );
     assert_wiped("quotient");
 
     // inside a request the scratch stays for the next call
@@ -1226,12 +1128,14 @@ fn hooks_outside_a_request_wipe_before_they_return() {
     let mut a = input.clone();
     assert!(crate::fft(scalars_mut(&mut a), w, log_n));
     let second = ctx::request_buffers();
-    let addr = |rows: &[(&str, usize, bool, usize)]| {
-        rows.iter().find(|r| r.0 == "ntt-data").map(|r| r.3)
-    };
+    let addr =
+        |rows: &[(&str, usize, bool, usize)]| rows.iter().find(|r| r.0 == "ntt-data").map(|r| r.3);
     assert_eq!(addr(&first), addr(&second), "the same buffer, reused");
     assert!(crate::msm_g1(scalars(&input[..1 << 10]), affine(&points)).is_some());
-    assert!(ctx::request_buffers().len() > second.len(), "the msm's scratch");
+    assert!(
+        ctx::request_buffers().len() > second.len(),
+        "the msm's scratch"
+    );
     assert!(crate::end_request());
     assert!(!ctx::request_open());
     assert_wiped("end_request");
@@ -1288,7 +1192,10 @@ fn a_backend_panic_is_a_counted_decline() {
     crate::set_hook_panic("quotient", true);
     // SAFETY: the test switch panics before the job is read.
     let ok = unsafe {
-        crate::quotient(&placeholder as *const u64 as *const std::ffi::c_void, &mut out)
+        crate::quotient(
+            &placeholder as *const u64 as *const std::ffi::c_void,
+            &mut out,
+        )
     };
     crate::set_hook_panic("quotient", false);
     assert!(!ok);
@@ -1297,7 +1204,7 @@ fn a_backend_panic_is_a_counted_decline() {
     assert_wiped("quotient");
     assert_eq!(crate::hook_panics() - panics, 4);
     // the hooks serve again afterwards
-    let mut a = input.clone();
+    let mut a = input;
     assert!(crate::fft(scalars_mut(&mut a), scalar(w), log_n));
     crate::reset_min_k();
     assert!(crate::end_request());
@@ -1313,7 +1220,10 @@ fn ntt_pass_takes_the_planned_threadgroups() {
     let max = p.maxTotalThreadsPerThreadgroup();
     for log_n in 1..=crate::MAX_LOG_N {
         for t in crate::ntt::pass_group_threads(log_n) {
-            assert!(t >= 1 && t <= max, "2^{log_n}: {t} threads, pipeline max {max}");
+            assert!(
+                t >= 1 && t <= max,
+                "2^{log_n}: {t} threads, pipeline max {max}"
+            );
         }
     }
 }

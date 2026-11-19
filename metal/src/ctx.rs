@@ -68,45 +68,48 @@
 //! # Buffers
 //!
 //! - [`Buffer`]: owned by the caller, zeroed when dropped if it may hold a
-//!   non-zero byte (written by the host or bound to a kernel since it was
-//!   made or zeroed). Large zeroing runs on several threads.
-//! - Pooled buffers ([`Ctx::alloc_pooled`]): a zeroed buffer from the pool,
-//!   or a new one; when dropped it is zeroed and goes back to the pool
-//!   instead of being released. [`release_later`] drops buffers on a
-//!   background thread; [`end_request_report`] waits for it.
-//! - Per-request buffers ([`Session::scratch`], and [`take_request_buffer`]
-//!   for a call that fills its buffer without holding the device): kept by
-//!   the context under a key while a request is open ([`begin_request`])
-//!   until [`end_request_report`], which zeroes each one, with its check
-//!   reads it back from the host mapping (and every idle buffer of the pool
-//!   too), and puts it back into the pool; a region, or an idle buffer of the
-//!   pool, that reads back non-zero (or cannot be read back) is zeroed again,
-//!   read back again and released, never pooled, and the report is `Err`. A kernel uses them for
-//!   scratch it wants to reuse across calls of one request. A hook call made
-//!   outside a request zeroes them before it returns (`crate::HookScope`,
+//!   non-zero byte (written by the host or bound to a kernel since it was made
+//!   or zeroed). Large zeroing runs on several threads.
+//! - Pooled buffers ([`Ctx::alloc_pooled`]): a zeroed buffer from the pool, or
+//!   a new one; when dropped it is zeroed and goes back to the pool instead of
+//!   being released. [`release_later`] drops buffers on a background thread;
+//!   [`end_request_report`] waits for it.
+//! - Per-request buffers ([`Session::scratch`], and [`take_request_buffer`] for
+//!   a call that fills its buffer without holding the device): kept by the
+//!   context under a key while a request is open ([`begin_request`]) until
+//!   [`end_request_report`], which zeroes each one, with its check reads it
+//!   back from the host mapping (and every idle buffer of the pool too), and
+//!   puts it back into the pool; a region, or an idle buffer of the pool, that
+//!   reads back non-zero (or cannot be read back) is zeroed again, read back
+//!   again and released, never pooled, and the report is `Err`. A kernel uses
+//!   them for scratch it reuses across the calls of one request. A hook call
+//!   made outside a request zeroes them before it returns (`crate::HookScope`,
 //!   [`wipe_unbracketed`]).
 //!
 //! # Residency and first use
 //!
-//! The pool and the queue's residency set exist because the start of a
-//! command buffer waits while Metal makes its buffers resident: for a new
-//! buffer, and for one not used for about two seconds (see [`Ctx`]'s
-//! residency set and the pool's text). Measured on an M4 Max, both cost 13
-//! to 30 ms for the 448 MiB of the quotient's cosets at k = 20, at every
-//! proof, before them.
+//! The start of a command buffer waits while Metal makes its buffers
+//! resident: for a new buffer, and for one not used for about two seconds.
+//! On an M4 Max each costs 13 to 30 ms for the 448 MiB of the quotient's
+//! cosets at `k = 20`. The pool of zeroed buffers avoids the first, the
+//! queue's residency set (see [`Ctx`]) the second.
 
 use std::{
-    collections::{BTreeSet, HashMap},
+    collections::{BTreeSet, HashMap, hash_map::Entry},
     ffi::c_void,
     marker::PhantomData,
     panic::{AssertUnwindSafe, catch_unwind},
     ptr::NonNull,
     sync::{
         Arc, Condvar, Mutex, MutexGuard, OnceLock,
-        atomic::{AtomicBool, AtomicU64, Ordering::Relaxed, Ordering::SeqCst},
+        atomic::{
+            AtomicBool, AtomicU64,
+            Ordering::{Relaxed, SeqCst},
+        },
     },
 };
 
+#[cfg(midnight_metal_metallib)]
 use dispatch2::DispatchData;
 use objc2::{rc::Retained, runtime::ProtocolObject};
 use objc2_foundation::{NSObjectProtocol, NSString};
@@ -118,7 +121,7 @@ use objc2_metal::{
     MTLStorageMode,
 };
 
-use crate::MetalInfo;
+use crate::{MetalInfo, account::Reason};
 
 // MTLCreateSystemDefaultDevice returns no device in a process that does not
 // link CoreGraphics.
@@ -150,12 +153,7 @@ impl Error {
     /// The decline reason of this error: `no-device`, `memory`,
     /// `device-error` or `unreduced`.
     pub fn reason(&self) -> &'static str {
-        match self {
-            Error::NoDevice(_) => "no-device",
-            Error::Memory(_) => "memory",
-            Error::Device(_) => "device-error",
-            Error::Unreduced(_) => "unreduced",
-        }
+        Reason::of(self).name()
     }
 }
 
@@ -247,7 +245,7 @@ const RESIDENT_MIN: usize = 1 << 20;
 /// adds every buffer of at least [`RESIDENT_MIN`] bytes when it is made and
 /// removes it when it is released; an idle buffer of the pool stays in it.
 /// The set also makes a new buffer resident when it is added, so its first
-/// command buffer no longer waits for that either.
+/// command buffer does not wait for that either.
 struct Resident {
     set: Retained<ProtocolObject<dyn MTLResidencySet>>,
 }
@@ -337,12 +335,13 @@ fn make_context() -> Result<Ctx, String> {
     })
 }
 
+/// The shader library and where it came from ([`Ctx::library_source`]): the
+/// embedded metallib, else the embedded source compiled now.
 fn load_library(
     device: &Device,
 ) -> Result<(Retained<ProtocolObject<dyn MTLLibrary>>, String), String> {
-    let force_source = std::env::var("MIDNIGHT_METAL_SHADER_SOURCE").as_deref() == Ok("1");
     #[cfg(midnight_metal_metallib)]
-    let how = if force_source {
+    let how = if std::env::var("MIDNIGHT_METAL_SHADER_SOURCE").as_deref() == Ok("1") {
         "source (MIDNIGHT_METAL_SHADER_SOURCE=1)".to_string()
     } else {
         let data = DispatchData::from_static_bytes(METALLIB);
@@ -359,10 +358,7 @@ fn load_library(
         }
     };
     #[cfg(not(midnight_metal_metallib))]
-    let how = {
-        let _ = (force_source, DispatchData::empty);
-        "source (no metallib was built)".to_string()
-    };
+    let how = "source (no metallib was built)".to_string();
     let options = MTLCompileOptions::new();
     options.setLanguageVersion(language_version()?);
     let lib = device
@@ -371,6 +367,7 @@ fn load_library(
     Ok((lib, how))
 }
 
+/// [`MSL_VERSION`] as `MTLCompileOptions.languageVersion`.
 fn language_version() -> Result<MTLLanguageVersion, String> {
     let (major, minor) = MSL_VERSION
         .split_once('.')
@@ -396,6 +393,7 @@ fn in_use_add(bytes: u64) {
     IN_USE_PEAK.fetch_max(now, Relaxed);
 }
 
+/// Counts a new buffer of `bytes` bytes (held and in use).
 fn count_alloc(bytes: u64) {
     let now = BYTES_NOW.fetch_add(bytes, Relaxed) + bytes;
     BYTES_PEAK.fetch_max(now, Relaxed);
@@ -477,6 +475,7 @@ struct Pool {
 // idle (no host reference to their contents, no GPU work).
 unsafe impl Send for Pool {}
 
+/// The pool of zeroed buffers.
 static POOL: Mutex<Pool> = Mutex::new(Pool {
     free: Vec::new(),
     bytes: 0,
@@ -484,15 +483,19 @@ static POOL: Mutex<Pool> = Mutex::new(Pool {
 /// [`pool_limit`]: [`POOL_LIMIT_UNREAD`] until read; every stored limit is
 /// below it.
 static POOL_LIMIT: AtomicU64 = AtomicU64::new(POOL_LIMIT_UNREAD);
+/// [`POOL_LIMIT`] before the environment is read.
 const POOL_LIMIT_UNREAD: u64 = u64::MAX;
 
+/// The pool, locked. Like every lock of this crate, a poisoned one is taken
+/// over: no update under it is left half done by a panic.
 fn pool() -> MutexGuard<'static, Pool> {
     POOL.lock().unwrap_or_else(|e| e.into_inner())
 }
 
-/// The most bytes the pool keeps idle: [`set_pool_limit`], else
-/// `MIDNIGHT_METAL_POOL_MIB`, else a quarter of the device's
-/// `recommendedMaxWorkingSetSize` (0 without a device).
+/// The most bytes the pool keeps idle: `MIDNIGHT_METAL_POOL_MIB` (read
+/// once), else a quarter of the device's `recommendedMaxWorkingSetSize` (0
+/// without a device); the tests can set it (`set_pool_limit`, feature
+/// `test-support`).
 pub fn pool_limit() -> u64 {
     let l = POOL_LIMIT.load(Relaxed);
     if l != POOL_LIMIT_UNREAD {
@@ -510,7 +513,9 @@ pub fn pool_limit() -> u64 {
 }
 
 /// Sets [`pool_limit`] in bytes (`None`: the default again) and releases
-/// idle buffers above it.
+/// idle buffers above it. Test support.
+#[cfg(any(test, feature = "test-support"))]
+#[doc(hidden)]
 pub fn set_pool_limit(limit: Option<u64>) {
     POOL_LIMIT.store(
         limit.map_or(POOL_LIMIT_UNREAD, |l| l.min(POOL_LIMIT_UNREAD - 1)),
@@ -542,6 +547,12 @@ fn release_raw(bufs: Vec<Retained<ProtocolObject<dyn MTLBuffer>>>) -> u64 {
         bufs.iter().all(|b| raw_reads_zero(b)),
         "an idle buffer of the pool does not read zero"
     );
+    release_unchecked(bufs)
+}
+
+/// Releases buffers taken out of the pool: out of the residency set and out
+/// of the byte count. Returns their bytes.
+fn release_unchecked(bufs: Vec<Retained<ProtocolObject<dyn MTLBuffer>>>) -> u64 {
     let bytes: u64 = bufs.iter().map(|b| b.length() as u64).sum();
     for b in &bufs {
         unkeep(b);
@@ -637,6 +648,7 @@ struct Releases {
     outstanding: BTreeSet<u64>,
 }
 
+/// The tickets of [`release_later`].
 static RELEASES: Mutex<Releases> = Mutex::new(Releases {
     next: 0,
     outstanding: BTreeSet::new(),
@@ -644,6 +656,7 @@ static RELEASES: Mutex<Releases> = Mutex::new(Releases {
 /// Notified whenever a ticket of [`RELEASES`] completes.
 static RELEASED: Condvar = Condvar::new();
 
+/// The tickets, locked (a poisoned lock is taken over).
 fn releases() -> MutexGuard<'static, Releases> {
     RELEASES.lock().unwrap_or_else(|e| e.into_inner())
 }
@@ -893,6 +906,7 @@ impl Buffer {
         self.bytes
     }
 
+    /// The host address of the contents.
     fn ptr(&self) -> *mut u8 {
         self.raw.contents().as_ptr().cast()
     }
@@ -987,6 +1001,8 @@ impl Ctx {
         &self.library_source
     }
 
+    /// A new buffer as a [`Buffer`]: counted, and in the residency set when
+    /// large. `None` from Metal is [`Error::Memory`].
     fn wrap(
         &self,
         raw: Option<Retained<ProtocolObject<dyn MTLBuffer>>>,
@@ -1004,6 +1020,8 @@ impl Ctx {
         })
     }
 
+    /// The allocation length of a buffer of `bytes` bytes: `Err` above
+    /// `maxBufferLength`.
     fn check_len(&self, bytes: usize) -> Result<usize, Error> {
         let max = self.device.maxBufferLength();
         if bytes > max {
@@ -1095,9 +1113,7 @@ impl Ctx {
             // SAFETY: `data` is valid for `bytes` bytes, the new buffer for
             // at least `bytes` bytes (its allocation is `max(bytes, 16)`),
             // nothing else uses it yet, and the two do not overlap.
-            unsafe {
-                std::ptr::copy_nonoverlapping(data.as_ptr().cast::<u8>(), b.ptr(), bytes)
-            };
+            unsafe { std::ptr::copy_nonoverlapping(data.as_ptr().cast::<u8>(), b.ptr(), bytes) };
         }
         Ok(b)
     }
@@ -1198,6 +1214,8 @@ impl std::fmt::Debug for Command<'_> {
 }
 
 impl<'a> Command<'a> {
+    /// Sets the pipeline of `kernel`, its arguments and its threadgroup
+    /// memory; returns the pipeline.
     fn bind(&self, kernel: &str, args: &[Arg<'a>], tg_mem: &[usize]) -> Result<Pipeline, Error> {
         let p = self.ctx.pipeline(kernel)?;
         self.enc.setComputePipelineState(&p);
@@ -1226,10 +1244,11 @@ impl<'a> Command<'a> {
                             v.len()
                         )));
                     }
-                    // SAFETY: valid for `v.len()` bytes; Metal copies them.
+                    // SAFETY: valid for `v.len()` bytes; Metal copies them
+                    // and never writes through the pointer.
                     unsafe {
                         self.enc.setBytes_length_atIndex(
-                            NonNull::new(v.as_ptr() as *mut c_void).unwrap(),
+                            NonNull::from(v).cast::<c_void>(),
                             v.len(),
                             i,
                         )
@@ -1272,12 +1291,7 @@ impl<'a> Command<'a> {
         tg_mem: &[usize],
     ) -> Result<(), Error> {
         let p = self.bind(kernel, args, tg_mem)?;
-        if group == 0 || group > p.maxTotalThreadsPerThreadgroup() {
-            return Err(Error::Device(format!(
-                "`{kernel}`: threadgroup of {group} threads (pipeline max {})",
-                p.maxTotalThreadsPerThreadgroup()
-            )));
-        }
+        check_group(kernel, &p, group)?;
         self.threads(threads, group);
         Ok(())
     }
@@ -1293,18 +1307,14 @@ impl<'a> Command<'a> {
         tg_mem: &[usize],
     ) -> Result<(), Error> {
         let p = self.bind(kernel, args, tg_mem)?;
-        if group == 0 || group > p.maxTotalThreadsPerThreadgroup() {
-            return Err(Error::Device(format!(
-                "`{kernel}`: threadgroup of {group} threads (pipeline max {})",
-                p.maxTotalThreadsPerThreadgroup()
-            )));
-        }
+        check_group(kernel, &p, group)?;
         if groups > 0 {
             self.enc.dispatchThreadgroups_threadsPerThreadgroup(size1(groups), size1(group));
         }
         Ok(())
     }
 
+    /// Dispatches `threads` threads in groups of `group` (none when zero).
     fn threads(&self, threads: usize, group: usize) {
         if threads > 0 {
             self.enc.dispatchThreads_threadsPerThreadgroup(size1(threads), size1(group));
@@ -1312,6 +1322,19 @@ impl<'a> Command<'a> {
     }
 }
 
+/// A threadgroup of `group` threads must be non-empty and within the
+/// pipeline's `maxTotalThreadsPerThreadgroup`.
+fn check_group(kernel: &str, p: &Pipeline, group: usize) -> Result<(), Error> {
+    let max = p.maxTotalThreadsPerThreadgroup();
+    if group == 0 || group > max {
+        return Err(Error::Device(format!(
+            "`{kernel}`: threadgroup of {group} threads (pipeline max {max})"
+        )));
+    }
+    Ok(())
+}
+
+/// A one-dimensional `MTLSize`.
 fn size1(width: usize) -> MTLSize {
     MTLSize {
         width,
@@ -1323,11 +1346,13 @@ fn size1(width: usize) -> MTLSize {
 // ---------------------------------------------------------------------------
 // Sessions and per-request buffers
 
+/// The per-request buffers of [`Session::scratch`], by key.
 #[derive(Default)]
 struct State {
     scratch: HashMap<&'static str, Buffer>,
 }
 
+/// The device lock and the per-request buffers it guards.
 static STATE: Mutex<Option<State>> = Mutex::new(None);
 /// A per-request buffer of [`Session::scratch`] may exist (set when one is
 /// made, cleared under [`STATE`] when they are all zeroed): lets a call
@@ -1361,25 +1386,24 @@ impl Session {
         self.ctx
     }
 
-    fn st(&mut self) -> &mut State {
-        self.state.get_or_insert_with(State::default)
-    }
-
     /// The per-request buffer `key`, of at least `bytes` bytes: the existing
     /// one with its contents if it is long enough, else a zero-filled one
     /// from the pool of zeroed buffers or a new one (the shorter one is
     /// zeroed and goes back to the pool, see [`Ctx::alloc_pooled`]).
     pub fn scratch(&mut self, key: &'static str, bytes: usize) -> Result<&mut Buffer, Error> {
         let ctx = self.ctx;
-        let st = self.st();
+        let st = self.state.get_or_insert_with(State::default);
         if st.scratch.get(key).is_some_and(|b| b.bytes < bytes) {
             st.scratch.remove(key);
         }
-        if !st.scratch.contains_key(key) {
-            st.scratch.insert(key, ctx.alloc_pooled(bytes)?);
-            SCRATCH_ANY.store(true, SeqCst);
-        }
-        Ok(st.scratch.get_mut(key).unwrap())
+        Ok(match st.scratch.entry(key) {
+            Entry::Occupied(e) => e.into_mut(),
+            Entry::Vacant(e) => {
+                let b = e.insert(ctx.alloc_pooled(bytes)?);
+                SCRATCH_ANY.store(true, SeqCst);
+                b
+            }
+        })
     }
 
     /// The per-request buffer `key`, if it exists.
@@ -1390,14 +1414,13 @@ impl Session {
     /// Several per-request buffers at once (for binding them together).
     pub fn scratch_many<const N: usize>(&self, keys: [&'static str; N]) -> Option<[&Buffer; N]> {
         let st = self.state.as_ref()?;
-        let mut out = [None; N];
-        for (o, k) in out.iter_mut().zip(keys) {
-            *o = Some(st.scratch.get(k)?);
-        }
-        Some(out.map(|b| b.unwrap()))
+        let found: Vec<&Buffer> = keys.iter().map(|k| st.scratch.get(k)).collect::<Option<_>>()?;
+        found.try_into().ok()
     }
 
-    /// Bytes held in per-request buffers.
+    /// Bytes held in per-request buffers. Test support.
+    #[cfg(any(test, feature = "test-support"))]
+    #[doc(hidden)]
     pub fn scratch_bytes(&self) -> u64 {
         self.state.as_ref().map_or(0, |s| {
             s.scratch.values().map(|b| b.raw.length() as u64).sum()
@@ -1413,11 +1436,13 @@ struct Lendable {
     free: Vec<(&'static str, Buffer)>,
 }
 
+/// The idle buffers of [`take_request_buffer`].
 static LENDABLE: Mutex<Lendable> = Mutex::new(Lendable {
     epoch: 0,
     free: Vec::new(),
 });
 
+/// The idle lendable buffers, locked (a poisoned lock is taken over).
 fn lendable() -> MutexGuard<'static, Lendable> {
     LENDABLE.lock().unwrap_or_else(|e| e.into_inner())
 }
@@ -1449,100 +1474,103 @@ pub fn take_request_buffer(key: &'static str, bytes: usize) -> Result<RequestBuf
         Some(b) => b,
         None => context()?.alloc_pooled(bytes)?,
     };
-    Ok(RequestBuffer {
-        key,
-        epoch,
-        buf: Some(buf),
-    })
+    Ok(RequestBuffer { key, epoch, buf })
 }
 
-/// A per-request buffer checked out by [`take_request_buffer`].
+/// A per-request buffer checked out by [`take_request_buffer`]. Dropped
+/// instead of given back, its buffer is zeroed and goes back to the pool.
 #[derive(Debug)]
 pub struct RequestBuffer {
     key: &'static str,
     epoch: u64,
-    buf: Option<Buffer>,
+    buf: Buffer,
 }
 
 impl RequestBuffer {
     /// The buffer.
     pub fn buf(&self) -> &Buffer {
-        self.buf.as_ref().expect("a buffer until given back")
+        &self.buf
     }
 
     /// The buffer, mutably.
     pub fn buf_mut(&mut self) -> &mut Buffer {
-        self.buf.as_mut().expect("a buffer until given back")
+        &mut self.buf
     }
 
     /// Gives the buffer back to its request (its contents stay until
     /// [`end_request_report`] zeroes it); after the end of its request it is
     /// zeroed and goes back to the pool.
-    pub fn give_back(mut self) {
-        let b = self.buf.take().expect("a buffer until given back");
+    pub fn give_back(self) {
+        let RequestBuffer { key, epoch, buf } = self;
         let mut l = lendable();
-        if l.epoch == self.epoch {
-            l.free.push((self.key, b));
+        if l.epoch == epoch {
+            l.free.push((key, buf));
         } else {
             drop(l);
-            drop(b);
+            drop(buf);
         }
     }
 }
 
-/// Test switches (feature `test-support`, or this crate's unit tests): in
-/// other builds every switch is a no-op that the compiler removes, and no
+/// Test switches (feature `test-support`, or this crate's unit tests). In
+/// other builds every switch is a no-op that the compiler removes, so no
 /// code outside the crate can force an erasure failure.
+#[cfg(any(test, feature = "test-support"))]
 mod test_switch {
-    #[cfg(any(test, feature = "test-support"))]
     use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering::Relaxed};
 
-    #[cfg(any(test, feature = "test-support"))]
+    use objc2::runtime::ProtocolObject;
+    use objc2_metal::MTLBuffer;
+
+    /// [`super::set_plant_nonzero`].
     pub(super) static PLANT_NONZERO: AtomicBool = AtomicBool::new(false);
-    #[cfg(any(test, feature = "test-support"))]
+    /// The contents address of the region of the last planted byte.
     pub(super) static LAST_PLANT: AtomicUsize = AtomicUsize::new(0);
     /// The contents address of the buffer whose next zeroing panics (0:
     /// none).
-    #[cfg(any(test, feature = "test-support"))]
     pub(super) static ZEROING_PANIC: AtomicUsize = AtomicUsize::new(0);
 
-    /// Whether [`super::end_request_report`] plants a non-zero byte.
-    #[inline]
-    pub(super) fn plant() -> bool {
-        #[cfg(any(test, feature = "test-support"))]
-        {
-            PLANT_NONZERO.load(Relaxed)
+    /// After the zeroing of region `i` of a wipe: plants a non-zero byte into
+    /// the first region of a checked wipe when [`super::set_plant_nonzero`]
+    /// is on.
+    pub(super) fn plant_after_zeroing(check: bool, i: usize, raw: &ProtocolObject<dyn MTLBuffer>) {
+        if check && i == 0 && PLANT_NONZERO.load(Relaxed) {
+            plant_raw(raw);
         }
-        #[cfg(not(any(test, feature = "test-support")))]
-        false
     }
 
     /// Panics once, in the zeroing of the buffer at `addr`, after
     /// [`super::set_zeroing_panic`].
-    #[inline]
-    #[allow(unused_variables)]
     pub(super) fn zeroing_panic(addr: usize) {
-        #[cfg(any(test, feature = "test-support"))]
-        if addr != 0
-            && ZEROING_PANIC.compare_exchange(addr, 0, Relaxed, Relaxed).is_ok()
-        {
+        if addr != 0 && ZEROING_PANIC.compare_exchange(addr, 0, Relaxed, Relaxed).is_ok() {
             panic!("midnight-metal test switch: a panic in a zeroing");
         }
     }
 
     /// Writes one non-zero byte into the middle of `raw`'s allocation through
     /// the raw host pointer (the buffer's `dirty` flag is not set, as for a
-    /// write the crate did not see) and records its address.
-    #[cfg_attr(not(any(test, feature = "test-support")), allow(dead_code))]
-    pub(super) fn plant_raw(raw: &objc2::runtime::ProtocolObject<dyn objc2_metal::MTLBuffer>) {
-        use objc2_metal::MTLBuffer;
+    /// write the crate did not see) and records its address. The caller has
+    /// exclusive use of the buffer.
+    pub(super) fn plant_raw(raw: &ProtocolObject<dyn MTLBuffer>) {
         let p = raw.contents().as_ptr().cast::<u8>();
         // SAFETY: the middle byte is inside the allocation; the caller has
         // exclusive use of the buffer.
         unsafe { std::ptr::write_volatile(p.add(raw.length() / 2), 0xa5) };
-        #[cfg(any(test, feature = "test-support"))]
         LAST_PLANT.store(p as usize, Relaxed);
     }
+}
+
+/// The test switches of a normal build: no-ops.
+#[cfg(not(any(test, feature = "test-support")))]
+mod test_switch {
+    use objc2::runtime::ProtocolObject;
+    use objc2_metal::MTLBuffer;
+
+    #[inline(always)]
+    pub(super) fn plant_after_zeroing(_: bool, _: usize, _: &ProtocolObject<dyn MTLBuffer>) {}
+
+    #[inline(always)]
+    pub(super) fn zeroing_panic(_: usize) {}
 }
 
 /// Makes every later [`end_request_report`]`(true)` write a non-zero byte
@@ -1621,16 +1649,37 @@ pub fn request_buffers() -> Vec<(&'static str, usize, bool, usize)> {
     out
 }
 
-/// Whether every byte of `b`'s allocation reads back zero from the host
-/// mapping.
-fn reads_zero(b: &Buffer) -> bool {
-    raw_reads_zero(&b.raw)
+/// The result of reading one region back from the host mapping.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum ReadBack {
+    /// Every byte reads zero.
+    Zero,
+    /// A byte reads non-zero.
+    NonZero,
+    /// Not in shared storage: the host cannot read it back.
+    Unreadable,
+}
+
+/// Reads back the whole allocation of a region (check mode) and counts the
+/// result in `w`.
+fn read_back(raw: &ProtocolObject<dyn MTLBuffer>, w: &mut crate::WipeStats) -> ReadBack {
+    w.checked_regions += 1;
+    if raw.storageMode() != MTLStorageMode::Shared {
+        w.check_failures += 1;
+        ReadBack::Unreadable
+    } else if !raw_reads_zero(raw) {
+        w.nonzero_regions += 1;
+        ReadBack::NonZero
+    } else {
+        ReadBack::Zero
+    }
 }
 
 /// Check mode of the erasure report: reads back every idle buffer of the
-/// pool (its whole allocation) and counts it as a region. A buffer that is
-/// not in shared storage (so cannot be read back) or reads back non-zero is
-/// zeroed again, read back again, taken out of the pool and released.
+/// pool (its whole allocation) and counts it as a region. A buffer that
+/// reads back non-zero is zeroed again and read back again; it, and a
+/// buffer not in shared storage (which cannot be read back), is taken out
+/// of the pool and released.
 fn check_idle_pool(w: &mut crate::WipeStats) {
     let bad: Vec<_> = {
         let mut p = pool();
@@ -1641,20 +1690,17 @@ fn check_idle_pool(w: &mut crate::WipeStats) {
             let len = raw.length() as u64;
             w.regions += 1;
             w.bytes += len;
-            w.checked_regions += 1;
             w.pool_regions += 1;
             w.pool_bytes += len;
-            let fault = if raw.storageMode() != MTLStorageMode::Shared {
-                w.check_failures += 1;
-                true
-            } else if !raw_reads_zero(raw) {
-                w.nonzero_regions += 1;
-                // idle under the pool's lock: exclusive
-                raw_zero(raw);
-                let _again = raw_reads_zero(raw);
-                true
-            } else {
-                false
+            let fault = match read_back(raw, w) {
+                ReadBack::Zero => false,
+                ReadBack::Unreadable => true,
+                ReadBack::NonZero => {
+                    // idle under the pool's lock: exclusive
+                    raw_zero(raw);
+                    let _again = raw_reads_zero(raw);
+                    true
+                }
             };
             if fault {
                 let b = p.free.swap_remove(i);
@@ -1666,14 +1712,9 @@ fn check_idle_pool(w: &mut crate::WipeStats) {
         }
         bad
     };
-    // not through `release_raw`: a buffer not in shared storage could not be
+    // not through `release_raw`: a buffer not in shared storage cannot be
     // read back, so its debug read-back would fail too
-    let bytes: u64 = bad.iter().map(|b| b.length() as u64).sum();
-    for b in &bad {
-        unkeep(b);
-    }
-    drop(bad);
-    BYTES_NOW.fetch_sub(bytes, Relaxed);
+    release_unchecked(bad);
 }
 
 /// Zeroes every per-request buffer (the device is held: `state` is its
@@ -1698,32 +1739,17 @@ fn wipe_locked(state: &mut Option<State>, check: bool, w: &mut crate::WipeStats)
         .map(|st| st.scratch.drain().map(|(_, b)| b).collect())
         .unwrap_or_default();
     SCRATCH_ANY.store(false, SeqCst);
-    let plant = check && test_switch::plant();
     for (i, mut b) in scratch.into_iter().chain(lent).enumerate() {
         b.zero();
         w.regions += 1;
         w.bytes += b.alloc_bytes() as u64;
-        if plant && i == 0 {
-            // exclusive: the region is owned here
-            test_switch::plant_raw(&b.raw);
-        }
-        if check {
-            w.checked_regions += 1;
-            let fault = if b.raw.storageMode() != MTLStorageMode::Shared {
-                w.check_failures += 1;
-                true
-            } else if !reads_zero(&b) {
-                w.nonzero_regions += 1;
-                true
-            } else {
-                false
-            };
-            if fault {
-                // zeroed again unconditionally, read back again, released
-                b.zero();
-                let _again = reads_zero(&b);
-                b.pooled = false;
-            }
+        // exclusive: the region is owned here
+        test_switch::plant_after_zeroing(check, i, &b.raw);
+        if check && read_back(&b.raw, w) != ReadBack::Zero {
+            // zeroed again unconditionally, read back again, released
+            b.zero();
+            let _again = raw_reads_zero(&b.raw);
+            b.pooled = false;
         }
         // zero (and not dirty): pooled, or released when it failed
         drop(b);

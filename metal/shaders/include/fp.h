@@ -28,7 +28,6 @@
 struct FpParams {
     enum : int { N = 12 };
     enum : uint { INV = 0xfffcfffdu };
-    static MONT_INLINE ulong inv64() { return 0x89f3fffcfffcfffdull; }
     static MONT_INLINE uint mod(int i) {
         switch (i) {
         case 0: return 0xffffaaabu;
