@@ -197,6 +197,19 @@ in `declines` or `fallbacks`. The `gpu` or `cpu` label is decided from
 witness-independent facts only: the admitted phases, the served `fft`,
 `ifft` and `quotient` calls (which depend on sizes only), and the MSM calls
 that the device takes by their length and table, before any scalar is read.
+With the default thresholds the device takes only MSMs whose bases a
+registered table serves (the four SRS vectors of the proving parameters,
+every point compared with the table at each call). Any other MSM, on bases
+never registered or on a slice whose table no longer matches, declines
+`unregistered-bases` before any scalar is read and before any check of its
+points, and the stock CPU MSM runs it. The reason is cost: the one-shot
+device path must check every base for membership in G1 at every call, and
+that check alone takes longer than the whole CPU MSM (on Apple M4 Max, 187 ms
+for `2^16` points and 593 ms for `2^18`, against about 25 ms and 78 ms). The
+CPU MSM is exact for any point on the curve and needs no such check. The
+one-shot path, with its per-call check unchanged, runs only when an explicit
+threshold (`MIDNIGHT_METAL_MIN_K`) opens it. The decline depends only on
+public facts, so it does not make the record depend on the witness.
 The per-path split stays inside the process (`midnight_metal::stats` and
 `declines`, for local benchmarks and debugging). The time of a proof still
 depends on the sparsity, as the CPU MSM time does: timing is out of scope

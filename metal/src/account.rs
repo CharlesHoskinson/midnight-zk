@@ -69,6 +69,10 @@ pub(crate) enum Reason {
     /// An MSM base that is not a point of G1 (off the curve or outside the
     /// prime-order subgroup).
     BasesNotInSubgroup,
+    /// An MSM whose bases no registered table serves (never registered, or
+    /// the registered table no longer holds the caller's points), with the
+    /// one-shot path off (the default thresholds, see `crate::thresholds`).
+    UnregisteredBases,
 }
 
 impl Reason {
@@ -82,6 +86,7 @@ impl Reason {
             Reason::DeviceError => "device-error",
             Reason::Panic => "panic",
             Reason::BasesNotInSubgroup => "bases-not-in-subgroup",
+            Reason::UnregisteredBases => "unregistered-bases",
         }
     }
 

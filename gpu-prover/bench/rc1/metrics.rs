@@ -157,8 +157,14 @@ pub mod device {
         let key =
             metal::register_key(&polys.iter().map(|p| adapter::scalars(p)).collect::<Vec<_>>());
         eprintln!(
-            "metal size thresholds (log2): {:?}{}",
-            metal::thresholds().named(),
+            "metal size thresholds (log2): {}{}",
+            metal::thresholds()
+                .named()
+                .map(|(c, k)| match k {
+                    Some(k) => format!("{c} {k}"),
+                    None => format!("{c} never"),
+                })
+                .join(", "),
             if metal::thresholds().explicit {
                 " (explicit)"
             } else {

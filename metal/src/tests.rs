@@ -793,7 +793,7 @@ fn per_class_thresholds() {
     let d = crate::DEFAULT_THRESHOLDS;
     assert_eq!(
         (d.fft, d.ifft, d.msm_table, d.msm_one_shot, d.quotient),
-        (15, 15, 13, 18, 14)
+        (15, 15, 13, None, 14)
     );
 
     // a transform below its threshold declines, unchanged
@@ -805,15 +805,19 @@ fn per_class_thresholds() {
     assert_eq!(a, input);
     assert_eq!(decline_count("fft", "below-min-k") - below, 1);
 
-    // 2^14 terms: a one-shot MSM declines before any device work; the same
-    // MSM on a prefix of a registered table is served from it
+    // 2^14 terms: an MSM without a table declines `unregistered-bases`
+    // before any device work and any G1 check; the same MSM on a prefix of
+    // a registered table is served from it
     let points = stock::points(3 << 13, 4);
     let m = 1 << 14;
     let (cached, one_shot, uploads) = crate::msm_counts();
-    let below = decline_count("msm", "below-min-k");
+    let checks = crate::one_shot_g1_checks();
+    let unregistered = decline_count("msm", "unregistered-bases");
+    assert!(!crate::msm_sized(m, affine(&points[..m])));
     assert!(crate::msm_g1(scalars(&input), affine(&points[..m])).is_none());
-    assert_eq!(decline_count("msm", "below-min-k") - below, 1);
+    assert_eq!(decline_count("msm", "unregistered-bases") - unregistered, 1);
     assert_eq!(crate::msm_counts().1, one_shot, "no one-shot device MSM");
+    assert_eq!(crate::one_shot_g1_checks(), checks, "no G1 check");
     let h = crate::register_srs(affine(&points));
     assert_eq!(h.device_bytes(), 0, "a registration is host memory");
     let r = crate::msm_g1(scalars(&input), affine(&points[..m])).expect("served from the table");
@@ -837,10 +841,13 @@ fn per_class_thresholds() {
     assert_eq!(crate::msm_admission(5794, 5794, crate::MAX_MSM_LOG), Ok(()));
     drop(h);
 
-    // an explicit threshold applies to every class
+    // an explicit threshold applies to every class, and opens the one-shot
+    // MSM
     assert!(crate::set_min_k(10));
     assert_eq!(crate::thresholds(), crate::Thresholds::all(10));
+    assert_eq!(crate::thresholds().msm_one_shot, Some(10));
     assert_eq!(crate::min_k(), 10);
+    assert!(crate::msm_sized(m, affine(&points[..m])));
     let mut a = input;
     assert!(crate::fft(scalars_mut(&mut a), scalar(stock::root(log_n)), log_n));
     crate::reset_min_k();

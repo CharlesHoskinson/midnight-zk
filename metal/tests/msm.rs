@@ -589,11 +589,10 @@ fn sparse_msm_declines_below_min_k() {
     assert!(!t.explicit, "MIDNIGHT_METAL_MIN_K is set: {t:?}");
     let n = 1usize << 20;
     let bases = &points_cache()[..n];
-    // the needs with the default thresholds: max(2^threshold, n/3) one-shot,
-    // 2^12 + n/5 on a table (the measured sparse crossovers)
-    let one_shot = (1usize << t.msm_one_shot).max(n / 3);
+    // the need with the default thresholds: 2^12 + n/5 on a table (the
+    // measured sparse crossover); the defaults take no MSM without a table
+    assert_eq!(t.msm_one_shot, None);
     let table = (1usize << 12) + n / 5;
-    assert_eq!(one_shot, n / 3);
 
     let served = |nz: usize, seed: u64| {
         let s = sparse_scalars(n, nz, seed);
@@ -602,17 +601,11 @@ fn sparse_msm_declines_below_min_k() {
             assert!(got == msm_pippenger(&s, bases), "{nz}");
         }
     };
-    // one-shot: a mostly-zero MSM (as a permutation product or a quotient
-    // limb) declines, and so does one below the crossover although above the
-    // length threshold; from the crossover it is served; dense is served
-    for nz in [0, 2, 11, 1 << t.msm_one_shot, one_shot - 1] {
-        assert!(
-            try_device_msm(&sparse_scalars(n, nz, nz as u64), bases).is_none(),
-            "{nz}"
-        );
+    // without a table: every MSM declines `unregistered-bases`, sparse or
+    // dense, before any scan of the scalars
+    for nz in [0, 2, 11, n / 3, n] {
+        declines_unregistered(&format!("{nz}"), &sparse_scalars(n, nz, nz as u64), bases);
     }
-    served(one_shot, 1);
-    served(n, 2);
 
     // a registered table: its own need
     let h = midnight_metal::register_srs(adapter::affine(bases));
@@ -645,6 +638,149 @@ fn sparse_msm_declines_below_min_k() {
     drop(h);
     served(1 << 14, 9);
     assert!(try_device_msm(&sparse_scalars(n, (1 << 14) - 1, 10), bases).is_none());
+    assert!(midnight_metal::set_min_k(14));
+}
+
+/// Checks that `msm_g1` declines `unregistered-bases` (the only decline)
+/// with no device MSM, no table upload and no G1 check of the bases.
+fn declines_unregistered(what: &str, s: &[Fq], b: &[G1Affine]) {
+    midnight_metal::reset_stats();
+    let counts = midnight_metal::msm_counts();
+    let checks = midnight_metal::one_shot_g1_checks();
+    let r = midnight_metal::msm_g1(adapter::scalars(s), adapter::affine(b));
+    assert!(r.is_none(), "{what}: served");
+    assert_eq!(midnight_metal::stats().msm.served, 0, "{what}");
+    let declines = midnight_metal::declines();
+    assert_eq!(declines, vec![("msm", UNREGISTERED, 1)], "{what}");
+    let now = midnight_metal::msm_counts();
+    assert_eq!(now, counts, "{what}: no device MSM, no upload");
+    let checked = midnight_metal::one_shot_g1_checks();
+    assert_eq!(checked, checks, "{what}: no G1 check");
+}
+
+/// `msm_sized` on the caller's slice.
+fn sized(b: &[G1Affine]) -> bool {
+    midnight_metal::msm_sized(b.len(), adapter::affine(b))
+}
+
+/// The decline reason of an MSM no registered table serves, with the
+/// one-shot path off (the default thresholds).
+const UNREGISTERED: &str = "unregistered-bases";
+
+/// The hook as the prover uses it: the device value, or the stock CPU MSM
+/// when it declines.
+fn hook_or_stock(s: &[Fq], b: &[G1Affine]) -> G1Projective {
+    midnight_metal::msm_g1(adapter::scalars(s), adapter::affine(b))
+        .map_or_else(|| msm_pippenger(s, b), adapter::from_jacobian)
+}
+
+/// With the default thresholds an MSM on bases no registered table serves
+/// (above the old one-shot threshold of `2^18`) declines `unregistered-bases`
+/// with no device MSM and no G1 check, and the stock value results; once the
+/// slice is registered the device serves it from the table; `msm_sized`
+/// agrees in each case.
+#[test]
+fn unregistered_bases_decline_by_default() {
+    let _g = serial();
+    require_device();
+    midnight_metal::reset_min_k();
+    let t = midnight_metal::thresholds();
+    if t.explicit {
+        eprintln!("MIDNIGHT_METAL_MIN_K is set: the defaults are not in force; skipped");
+        assert!(midnight_metal::set_min_k(14));
+        return;
+    }
+    assert_eq!(t.msm_one_shot, None);
+    set_cpu_share(true);
+    for k in [18u32, 20] {
+        let n = 1usize << k;
+        let bases = &points_cache()[..n];
+        let s = random_scalars(n, 500 + k as u64);
+        let want = msm_pippenger(&s, bases);
+
+        // (a) never registered
+        assert!(!sized(bases), "2^{k}");
+        declines_unregistered(&format!("2^{k}"), &s, bases);
+        assert!(hook_or_stock(&s, bases) == want, "2^{k}");
+
+        // (b) registered: served from the table, still no G1 check per call
+        let h = midnight_metal::register_srs(adapter::affine(bases));
+        assert!(sized(bases), "2^{k}");
+        let checks = midnight_metal::one_shot_g1_checks();
+        let (c0, o0, _) = midnight_metal::msm_counts();
+        check("registered", &s, bases);
+        let (c1, o1, _) = midnight_metal::msm_counts();
+        assert_eq!((c1 - c0, o1 - o0), (1, 0), "2^{k}: from the table");
+        assert_eq!(midnight_metal::one_shot_g1_checks(), checks, "2^{k}");
+        drop(h);
+
+        // dropped: unregistered again
+        assert!(!sized(bases), "2^{k}");
+        declines_unregistered(&format!("2^{k}, dropped"), &s, bases);
+    }
+    assert!(midnight_metal::set_min_k(14));
+}
+
+/// A registered table made stale by one changed point: with the default
+/// thresholds the call declines `unregistered-bases` (the stock MSM on the
+/// current points results), with no device MSM and no G1 check; with an
+/// explicit threshold the one-shot path serves it on the device, its G1
+/// check included. `msm_sized` agrees in each case.
+#[test]
+fn stale_table_declines_by_default_and_one_shot_when_explicit() {
+    let _g = serial();
+    require_device();
+    midnight_metal::reset_min_k();
+    if midnight_metal::thresholds().explicit {
+        eprintln!("MIDNIGHT_METAL_MIN_K is set: the defaults are not in force; skipped");
+        assert!(midnight_metal::set_min_k(14));
+        return;
+    }
+    set_cpu_share(true);
+    let n = 1usize << 18;
+    let fresh = random_points(2, 4711);
+    let s = random_scalars(n, 4712);
+    let i = 3 * n / 7 + 5;
+    assert!(!sampled(n).contains(&i));
+
+    // the default: the lookup finds the table stale (msm_sized drops it),
+    // and the call declines
+    let mut bases = points_cache()[..n].to_vec();
+    let h = midnight_metal::register_srs(adapter::affine(&bases));
+    check("table", &s, &bases);
+    bases[i] = fresh[0];
+    let stale = midnight_metal::srs_stale();
+    assert!(!sized(&bases));
+    assert_eq!(midnight_metal::srs_stale(), stale + 1);
+    declines_unregistered("stale, msm_sized first", &s, &bases);
+    assert!(hook_or_stock(&s, &bases) == msm_pippenger(&s, &bases));
+    assert_eq!(midnight_metal::srs_stale(), stale + 1);
+    drop(h);
+
+    // the same without msm_sized first: msm_g1's own lookup drops the table
+    let mut bases = points_cache()[..n].to_vec();
+    let h = midnight_metal::register_srs(adapter::affine(&bases));
+    bases[i] = fresh[1];
+    let stale = midnight_metal::srs_stale();
+    declines_unregistered("stale", &s, &bases);
+    assert_eq!(midnight_metal::srs_stale(), stale + 1);
+    assert!(!sized(&bases));
+    drop(h);
+
+    // an explicit threshold: the one-shot path, with its per-call G1 check
+    assert!(midnight_metal::set_min_k(14));
+    let mut bases = points_cache()[..n].to_vec();
+    let h = midnight_metal::register_srs(adapter::affine(&bases));
+    bases[i] = fresh[0];
+    let stale = midnight_metal::srs_stale();
+    assert!(sized(&bases));
+    assert_eq!(midnight_metal::srs_stale(), stale + 1);
+    let checks = midnight_metal::one_shot_g1_checks();
+    let (c0, o0, u0) = midnight_metal::msm_counts();
+    check("stale, explicit threshold", &s, &bases);
+    assert_eq!(midnight_metal::msm_counts(), (c0, o0 + 1, u0));
+    assert_eq!(midnight_metal::one_shot_g1_checks(), checks + 1);
+    drop(h);
     assert!(midnight_metal::set_min_k(14));
 }
 

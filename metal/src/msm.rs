@@ -21,12 +21,29 @@
 //! curve formulas in `shaders/include/g1.h`.
 //!
 //! [`crate::msm_g1`] has admitted the call (equal non-zero lengths up to
-//! `2^MAX_MSM_LOG`, at least `2^msm_table` of [`crate::thresholds`], and at
-//! least `2^msm_one_shot` unless a registered table serves the bases, a
-//! usable device, every scalar reduced) before it calls [`msm_g1`]. That
-//! function ends with exactly one of `account::served` or `account::decline`
-//! (`below-min-k` when the table it counted on turned out stale and the
-//! call's effective size is below the one-shot threshold).
+//! `2^MAX_MSM_LOG`, at least `2^msm_table` of [`crate::thresholds`], a
+//! usable device, a registered table that serves the bases ([`lookup`]) or
+//! else an open one-shot path with at least `2^msm_one_shot` scalars, the
+//! effective size, every scalar reduced) before it calls [`msm_g1`]. That
+//! function ends with exactly one of `account::served` or `account::decline`.
+//!
+//! # Which MSMs take which path
+//!
+//! The path is decided before any scalar is read, on public facts only:
+//! [`lookup`] finds the registered table by address and length, compares
+//! every point of the caller's slice with it (dropping it when one differs)
+//! and applies the table's G1 check. A table that serves the bases gives the
+//! table path. Without one, with the default thresholds (`msm_one_shot` is
+//! `None`), the call declines `unregistered-bases` at once: no scan of the
+//! scalars and no G1 check of the bases, and the stock CPU MSM runs it. The
+//! one-shot path needs a G1 check of every base at every call ("Bases
+//! outside G1"), which alone costs more than the whole stock CPU MSM
+//! (measured on Apple M4 Max, 2026-11-19: 187 ms for `2^16` points and 593 ms
+//! for `2^18`, against about 25 ms and 78 ms for the CPU MSM, about 2.1 s at
+//! `2^20`); the CPU MSM is exact for any point on the curve without it. The
+//! one-shot path is taken only with an explicit threshold
+//! ([`crate::set_min_k`], `MIDNIGHT_METAL_MIN_K`), with its per-call check
+//! unchanged.
 //!
 //! # Effective size
 //!
@@ -36,11 +53,12 @@
 //! `2^20` as for a dense one (about 108 ms on Apple M4 Max), while the stock
 //! CPU MSM, whose time already follows the sparsity, takes about a
 //! millisecond. [`crate::msm_g1`] checks it (with
-//! [`effective_size_reaches`]) after the length admission and before any
-//! device work, against the need of the path the call would take
-//! ([`effective_need`]): `2^12 + n/5` with a registered table,
-//! else `max(2^msm_one_shot, n/3)`, the measured crossovers of the stock CPU
-//! MSM on sparse inputs ([`SPARSE_TABLE_DIV`]); below it, the call declines
+//! [`effective_size_reaches`]) after the length admission and the choice of
+//! the path ("Which MSMs take which path") and before any device work,
+//! against the need of that path ([`effective_need`]): with the default
+//! thresholds `2^12 + n/5` on a registered table, the measured crossover of
+//! the stock CPU MSM on sparse inputs ([`SPARSE_TABLE_DIV`]) (the defaults
+//! take no MSM without a table); below it, the call declines
 //! `below-min-k`, the ordinary reason of a short MSM. The count itself is
 //! not kept, logged, counted or returned: the decline is the only
 //! observable, and it is the one a short dense MSM gives. An explicit
@@ -118,9 +136,11 @@
 //! host-visible copy) that later MSMs use without a transfer. Before each
 //! use every point of the caller's slice is compared with the table, in
 //! every build, on several threads (as the CUDA crate compares its host
-//! copy), before any device work. A slice that fails the check drops its
-//! table, with its cached `MSM(r)`, and takes the one-shot path with the
-//! caller's current points. The table holds public points only; it lives
+//! copy), before any scalar is read and before any device work. A slice
+//! that fails the check drops its table, with its cached `MSM(r)`, and the
+//! call declines `unregistered-bases` (the stock CPU MSM runs on the
+//! caller's current points), or with an explicit threshold takes the
+//! one-shot path with them. The table holds public points only; it lives
 //! until the handle is dropped ([`SrsHandle::device_bytes`] says how many
 //! bytes it holds on the device).
 //!
@@ -147,9 +167,11 @@
 //! keeps the first index that fails: an MSM on a prefix that reaches it
 //! declines (the stock CPU code then runs, exact for any input, a point off
 //! the curve included); shorter prefixes are served. The one-shot path
-//! checks every base at every call before any device work and declines at
-//! the first failure. Both checks run on several threads; the decline
-//! reason is [`BASES_REASON`].
+//! (taken only with an explicit threshold, see "Which MSMs take which
+//! path") checks every base at every call before any device work and
+//! declines at the first failure; this check is never skipped or sampled.
+//! Both checks run on several threads; the decline reason is
+//! [`BASES_REASON`].
 //!
 //! A table serves the registered slice and its prefixes, by address: the
 //! caller has to register the very slice the prover passes. The KZG prover of
@@ -161,7 +183,8 @@
 //! `bases::<LagrangeDoubleDeltaCoeff>()` (permutation products, LogUp
 //! helpers and aggregators, trash, phase 2); a registrant registers all four.
 //! Every other MSM base slice of the prover (the residue bases of an
-//! interleaved commitment, a copy) takes the one-shot path.
+//! interleaved commitment, a copy) has no table: the stock CPU MSM runs it
+//! with the default thresholds, the one-shot path with an explicit one.
 //!
 //! # Where the port departs from sppark
 //!
@@ -522,6 +545,8 @@ static STALE: AtomicU64 = AtomicU64::new(0);
 static UPLOADS: AtomicU64 = AtomicU64::new(0);
 static CACHED: AtomicU64 = AtomicU64::new(0);
 static ONE_SHOT: AtomicU64 = AtomicU64::new(0);
+/// Per-call G1 checks of the one-shot path started ([`all_in_g1`] calls).
+static G1_CHECKS: AtomicU64 = AtomicU64::new(0);
 
 fn tables() -> MutexGuard<'static, Option<HashMap<(usize, usize), Arc<Table>>>> {
     lock(&TABLES)
@@ -627,6 +652,15 @@ pub fn msm_counts() -> (u64, u64, u64) {
         ONE_SHOT.load(Relaxed),
         UPLOADS.load(Relaxed),
     )
+}
+
+/// Per-call G1 checks of the bases started on the one-shot path since
+/// process start (feature `test-support`; not a stable interface). The
+/// check of [`register_srs`] is not counted.
+#[doc(hidden)]
+#[cfg(any(test, feature = "test-support"))]
+pub fn one_shot_g1_checks() -> u64 {
+    G1_CHECKS.load(Relaxed)
 }
 
 /// The table that serves an MSM of `m` scalars on the slice `key`: the exact
@@ -799,6 +833,7 @@ fn first_not_in_g1(bases: &[G1AffineLimbs]) -> usize {
 /// stopping at the first that is not; a part that panicked counts as a
 /// failure.
 fn all_in_g1(bases: &[G1AffineLimbs]) -> bool {
+    G1_CHECKS.fetch_add(1, Relaxed);
     let bad = AtomicBool::new(false);
     let done = par_parts(bases.len(), host_threads(), POINT_BLOCK, |lo, hi| {
         for s in (lo..hi).step_by(POINT_BLOCK) {
@@ -949,26 +984,22 @@ impl Drop for ScrubOnExit {
 /// the log2 threshold `k` of its path (`table`: a registered table serves
 /// it). With the default thresholds, `SPARSE_TABLE_FIXED + n /
 /// SPARSE_TABLE_DIV` on the table path (`k` is not used: the length
-/// admission has applied it) and `max(2^k, n / SPARSE_ONE_SHOT_DIV)` on the
-/// one-shot path;
-/// with an explicit threshold (`explicit`, [`crate::set_min_k`] or
-/// `MIDNIGHT_METAL_MIN_K`), `2^k` alone.
+/// admission has applied it); with an explicit threshold (`explicit`,
+/// [`crate::set_min_k`] or `MIDNIGHT_METAL_MIN_K`), `2^k` alone, on either
+/// path. The one-shot path is reached only with an explicit threshold (the
+/// defaults decline it `unregistered-bases`), so it has no default need.
 pub(crate) fn effective_need(n: usize, k: u32, table: bool, explicit: bool) -> usize {
-    let min = 1usize << k.min(40);
-    if explicit {
-        return min;
-    }
-    if table {
+    if table && !explicit {
         SPARSE_TABLE_FIXED + n / SPARSE_TABLE_DIV
     } else {
-        min.max(n / SPARSE_ONE_SHOT_DIV)
+        1usize << k.min(40)
     }
 }
 
-/// The sparse crossovers: the device takes an MSM of `n` scalars only from
-/// `SPARSE_TABLE_FIXED + n / SPARSE_TABLE_DIV` non-zero scalars on the
-/// table path and from `max(2^msm_one_shot, n / SPARSE_ONE_SHOT_DIV)` on
-/// the one-shot path (with the default thresholds).
+/// The sparse crossover: with the default thresholds the device takes an
+/// MSM of `n` scalars on a registered table only from `SPARSE_TABLE_FIXED +
+/// n / SPARSE_TABLE_DIV` non-zero scalars. (The one-shot column below is
+/// kept as measured; the defaults never take the one-shot path.)
 ///
 /// The device MSM costs the same for any number of non-zero scalars of a
 /// given length (the masked scalars are dense), while the stock CPU MSM
@@ -990,8 +1021,8 @@ pub(crate) fn effective_need(n: usize, k: u32, table: bool, explicit: bool) -> u
 /// | 2^19 (n/2)      | 152.0 | 61.3 | 105.4 |
 /// | 3·2^18 (n/1.33) | 218.7 | 61.4 | 102.3 |
 ///
-/// The CPU time crosses the table path's at about `n/5.3` and the one-shot
-/// path's at about `n/2.9`: hence `n/5` and `n/3`. (Before the split, on a
+/// The CPU time crosses the table path's at about `n/5.3`: hence `n/5`.
+/// (The one-shot path's crossover was about `n/2.9`. Before the split, on a
 /// busier machine, the crossovers were about `n/3.4` and `n/1.5`; the
 /// device-only figures are in the report of that measurement, not here.)
 ///
@@ -1025,8 +1056,6 @@ pub(crate) const SPARSE_TABLE_DIV: usize = 5;
 /// See [`SPARSE_TABLE_DIV`]: the part of the table path's need that does not
 /// grow with the length, in non-zero scalars.
 pub(crate) const SPARSE_TABLE_FIXED: usize = 1 << 12;
-/// See [`SPARSE_TABLE_DIV`].
-pub(crate) const SPARSE_ONE_SHOT_DIV: usize = 3;
 
 /// Whether an MSM over `scalars` has an effective size of at least `need`:
 /// its count of non-zero scalars, taken as 1 when every scalar is zero (so a
@@ -1072,18 +1101,41 @@ pub(crate) fn effective_size_reaches(scalars: &[Scalar], need: usize) -> bool {
 // ---------------------------------------------------------------------------
 // Entry points.
 
-/// Whether a registered table would serve an MSM on `bases` (the registered
-/// slice or a prefix of it, by address and length; the content is compared
-/// when the MSM runs).
-pub(crate) fn has_table(bases: &[G1AffineLimbs]) -> bool {
-    let key = (bases.as_ptr() as usize, bases.len());
-    tables().as_ref().is_some_and(|t| table_for(t, key, bases.len()).is_some())
+/// A registered table that serves an MSM, pinned ([`lookup`]): every point
+/// of the caller's slice was compared with it, and no point of the prefix
+/// is outside G1.
+pub(crate) struct Pinned(Arc<Table>);
+
+/// What [`lookup`] found for an MSM's bases.
+pub(crate) enum Lookup {
+    /// A registered table serves them.
+    Table(Pinned),
+    /// A registered table holds them, but a point of the prefix is not in
+    /// G1 ([`BASES_REASON`]).
+    NotInG1,
+    /// No registered table serves them: none was registered for the slice,
+    /// or the registered one no longer holds the caller's points (it was
+    /// dropped as stale now, or before).
+    Unregistered,
 }
 
-/// `sum scalars[i] * bases[i]`, or `None` (declined). Without a table that
-/// serves `bases` (none registered, or the registered one no longer matches),
-/// an MSM whose effective size is below `one_shot_min` (the one-shot path's
-/// [`effective_need`]) declines `below-min-k`.
+/// The registered table that serves an MSM of `n` scalars on `bases`: the
+/// registry lookup by address and length, then the comparison of every
+/// point (a table that does not match is dropped, see [`serving_table`]),
+/// then the table's G1 check of the prefix. Public facts only: no scalar is
+/// read. A part of the comparison that panicked counts as a difference
+/// ([`points_equal`]).
+pub(crate) fn lookup(bases: &[G1AffineLimbs], n: usize) -> Lookup {
+    match serving_table(bases, n) {
+        Some(t) if n > t.first_bad => Lookup::NotInG1,
+        Some(t) => Lookup::Table(Pinned(t)),
+        None => Lookup::Unregistered,
+    }
+}
+
+/// `sum scalars[i] * bases[i]`, or `None` (declined), on the pinned table
+/// `table` ([`lookup`]), or on the one-shot path without one (the caller
+/// has admitted it: an explicit threshold), which first checks every base.
 ///
 /// A base that is not a point of G1 declines [`BASES_REASON`] (see "Bases
 /// outside G1" in the module text). Nothing panics out of this function: a
@@ -1093,23 +1145,19 @@ pub(crate) fn has_table(bases: &[G1AffineLimbs]) -> bool {
 pub(crate) fn msm_g1(
     scalars: &[Scalar],
     bases: &[G1AffineLimbs],
-    one_shot_min: usize,
+    table: Option<Pinned>,
 ) -> Option<G1JacobianLimbs> {
     if scalars.is_empty() || scalars.len() != bases.len() {
         account::decline(Class::Msm, Reason::Shape);
         return None;
     }
-    let ran = catch(|| dispatch(scalars, bases, one_shot_min, None));
+    let ran = catch(|| dispatch(scalars, bases, table.map(|p| p.0), None));
     scrub_stack();
     match ran {
-        Some(Ok(Some((r, ns)))) => {
+        Some(Ok((r, ns))) => {
             account::served(Class::Msm, ns);
             // the result leaves; the guard `r` zeroes its own copy
             Some(*r)
-        }
-        Some(Ok(None)) => {
-            account::decline(Class::Msm, Reason::BelowMinK);
-            None
         }
         Some(Err(Fail::Bases)) => {
             account::decline(Class::Msm, BASES_REASON);
@@ -1130,7 +1178,7 @@ pub(crate) fn msm_g1(
 /// `bases-not-in-subgroup`.
 pub(crate) const BASES_REASON: Reason = Reason::BasesNotInSubgroup;
 
-/// Why [`dispatch`] did not serve a call (besides `Ok(None)`).
+/// Why [`dispatch`] did not serve a call.
 enum Fail {
     /// A base the device would use is not a point of G1.
     Bases,
@@ -1210,29 +1258,34 @@ pub fn msm_g1_stages(
         return None;
     }
     let mut st = MsmStages::default();
-    let ran = catch(|| dispatch(scalars, bases, 0, Some(&mut st)));
+    let ran = catch(|| {
+        let table = match lookup(bases, scalars.len()) {
+            Lookup::Table(p) => Some(p.0),
+            Lookup::NotInG1 => return Err(Fail::Bases),
+            Lookup::Unregistered => None,
+        };
+        dispatch(scalars, bases, table, Some(&mut st))
+    });
     scrub_stack();
-    let (r, _) = ran?.ok()??;
+    let (r, _) = ran?.ok()?;
     Some((*r, st))
 }
 
-/// The table or one-shot path, then the masked MSM. `Ok(None)`: no table
-/// serves `bases` and the MSM's effective size is below `one_shot_min` (no
-/// device work was done).
+/// The table path on the pinned table `table` (its points equal the
+/// caller's, and its G1 check covers the prefix: [`lookup`]), or the
+/// one-shot path without one (the G1 check of every base first), then the
+/// masked MSM.
 #[allow(clippy::type_complexity)]
 fn dispatch(
     scalars: &[Scalar],
     bases: &[G1AffineLimbs],
-    one_shot_min: usize,
+    table: Option<Arc<Table>>,
     mut prof: Option<&mut MsmStages>,
-) -> Result<Option<(Secret<G1JacobianLimbs>, u64)>, Fail> {
-    let n = scalars.len();
-    if let Some(t) = serving_table(bases, n) {
-        // every point of `bases` equals the table's: the table's G1 check
-        // applies to them
-        if n > t.first_bad {
-            return Err(Fail::Bases);
-        }
+) -> Result<(Secret<G1JacobianLimbs>, u64), Fail> {
+    if let Some(t) = table {
+        // every point of `bases` equals the table's, and the table's G1
+        // check covers them ([`lookup`])
+        debug_assert!(scalars.len() <= t.first_bad);
         let mut s = ctx::lock()?;
         if matches!(*read(&t.store), Store::Host(_)) {
             let t0 = Instant::now();
@@ -1267,24 +1320,21 @@ fn dispatch(
         // dropped meanwhile, this is the last reference)
         drop(s);
         drop(t);
-        return Ok(Some(r));
-    }
-    if !effective_size_reaches(scalars, one_shot_min) {
-        return Ok(None);
+        return Ok(r);
     }
     if !all_in_g1(bases) {
         return Err(Fail::Bases);
     }
     ONE_SHOT.fetch_add(1, Relaxed);
     let mut s = ctx::lock()?;
-    Ok(Some(split(
+    Ok(split(
         &mut s,
         Points::Host(bases),
         scalars,
         bases,
         None,
         prof,
-    )?))
+    )?)
 }
 
 /// The device share `m` of an MSM of `n` points on the table path or the

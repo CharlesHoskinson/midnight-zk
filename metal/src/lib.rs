@@ -115,12 +115,14 @@
 //!
 //! - `MIDNIGHT_METAL=off`: use no device (every call declines `no-device`).
 //! - `MIDNIGHT_METAL_MIN_K` (unset by default): one log2 size threshold for
-//!   every class, replacing the per-class defaults (see "Size thresholds").
+//!   every class, replacing the per-class defaults, and opening the one-shot
+//!   MSM, which the defaults keep off (see "Size thresholds").
 //! - `MIDNIGHT_METAL_MSM_CPU_SHARE=off`: run every G1 MSM on the device
 //!   only. By default a measured share of the points of an MSM goes to the
 //!   stock CPU MSM, which runs at the same time as the device: from `2^17`
-//!   on a registered table, from `2^13` on the one-shot path (see the `msm`
-//!   module text, "The CPU share").
+//!   on a registered table, from `2^13` on the one-shot path when an
+//!   explicit threshold opens it (see the `msm` module text, "The CPU
+//!   share").
 //! - `MIDNIGHT_METAL_SHADER_SOURCE=1` (run time): compile the embedded source
 //!   instead of loading the embedded metallib. At build time it skips the
 //!   toolchain.
@@ -138,7 +140,7 @@
 //! |---|---|---|
 //! | `fft`, `ifft` | 15 (`log_n`) | the device wins from `2^15`, loses at `2^14` |
 //! | `msm` on a registered SRS table | 13 (size class of the length) | wins from `2^13` in a proof |
-//! | `msm` without a table (one-shot) | 18 (size class of the length) | wins from `2^18` |
+//! | `msm` without a table (one-shot) | never (`None`) | loses at every size with its per-call G1 check |
 //! | `quotient` | 14 (`ext_k`) | wins from `ext_k = 14` in a proof |
 //!
 //! Measured on Apple M4 Max (40-core GPU, 128 GB), 2026-11-18, release
@@ -151,6 +153,31 @@
 //! The size class of an MSM length is its log2 rounded to the nearest
 //! integer ([`msm_admission`]): the multi-open commits `n - 1`
 //! coefficients, which are in the class of `n`.
+//!
+//! ### MSMs without a registered table
+//!
+//! With the default thresholds the device takes only an MSM whose bases a
+//! registered table serves ([`register_srs`]: the registered slice or a
+//! prefix of it, every point equal to the table's, and no point of the
+//! prefix outside G1). Any other MSM declines `unregistered-bases` before
+//! any scalar is read and before any check of its points, and the stock CPU
+//! MSM runs it: bases that were never registered, and a slice whose table
+//! the identity comparison found stale (the table is then dropped). A table
+//! with a point outside G1 in the prefix declines `bases-not-in-subgroup`
+//! instead. The reason is the per-call G1 check (on the curve and in the
+//! prime-order subgroup) that the device needs on bases it has not checked
+//! before (see the `msm` module text, "Bases outside G1"): measured on Apple
+//! M4 Max, 2026-11-19, it alone takes 187 ms for `2^16` points and 593 ms for
+//! `2^18`, against about 25 ms and 78 ms for the whole stock CPU MSM (about
+//! 2.1 s at `2^20`), so the one-shot device path loses to the CPU at every
+//! size. The stock CPU MSM is exact for any point on the curve and needs no
+//! such check. The decline depends only on public facts (the registry and
+//! the points), so its count and timing do not depend on the witness.
+//!
+//! The one-shot device path stays, with its per-call G1 check of every
+//! base unchanged, and is reached only with an explicit threshold
+//! ([`set_min_k`] or `MIDNIGHT_METAL_MIN_K`), which sets `msm_one_shot` of
+//! [`thresholds`] to that value.
 //!
 //! An isolated kernel and the same kernel inside a proof do not break even
 //! at the same size. Between device calls of a proof the GPU idles for
@@ -182,21 +209,20 @@
 //!
 //! An MSM is compared twice: by its length against its threshold, and by its
 //! effective size, the count of its non-zero scalars (1 when all are zero),
-//! against `2^12 + n/5` on a registered table and `max(2^msm_one_shot,
-//! n/3)` otherwise (`n` the length). A mostly-zero MSM
-//! (a permutation product or quotient limb with a handful of non-zero
-//! coefficients) costs the masked device MSM as much as a dense one of its
-//! length, while the stock CPU MSM, whose time follows the sparsity,
-//! finishes in about a millisecond; the fractions are the measured
-//! crossovers on Apple M4 Max, 2026-11-19 (`n/5.3` and `n/2.9` on `2^20`
+//! against `2^12 + n/5` on a registered table with the default thresholds
+//! (`n` the length). A mostly-zero MSM (a permutation product or quotient
+//! limb with a handful of non-zero coefficients) costs the masked device MSM
+//! as much as a dense one of its length, while the stock CPU MSM, whose time
+//! follows the sparsity, finishes in about a millisecond; the fraction is
+//! the measured crossover on Apple M4 Max, 2026-11-19 (`n/5.3` on `2^20`
 //! points, with the CPU share of the split active; measured under load, see
-//! the `msm` module), and `2^12` is the part of the table path's crossover
-//! that does not grow with the length (measured at `2^13` to `2^15`, see
-//! the `msm` module). Below its need the MSM declines `below-min-k` before
-//! any device work. The count is not kept, logged, counted or returned: the
-//! ordinary `below-min-k` decline is the only observable. An explicit
-//! threshold replaces the need entirely (`2^min_k`, no fraction of `n`), so
-//! `set_min_k(0)` admits every MSM.
+//! the `msm` module), and `2^12` is the part of the crossover that does not
+//! grow with the length (measured at `2^13` to `2^15`, see the `msm`
+//! module). Below its need the MSM declines `below-min-k` before any device
+//! work. The count is not kept, logged, counted or returned: the ordinary
+//! `below-min-k` decline is the only observable. An explicit threshold
+//! replaces the need entirely (`2^min_k`, no fraction of `n`, on the table
+//! and the one-shot path), so `set_min_k(0)` admits every MSM.
 //!
 //! ## Requests
 //!
@@ -256,7 +282,7 @@ pub use msm::{SrsHandle, msm_counts, register_srs, srs_handles, srs_stale};
 /// interface, not for secret scalars).
 #[cfg(all(target_os = "macos", any(test, feature = "test-support")))]
 #[doc(hidden)]
-pub use msm::{MsmStages, msm_g1_stages};
+pub use msm::{MsmStages, msm_g1_stages, one_shot_g1_checks};
 #[cfg(target_os = "macos")]
 mod ntt;
 /// Host-to-host wrappers of the NTT device building blocks, for this crate's
@@ -393,6 +419,10 @@ pub fn library_source() -> Option<&'static str> {
 
 /// The log2 size from which each kernel class is sent to the device (see
 /// [`thresholds`] and the crate text, "Size thresholds").
+///
+/// `msm_one_shot` is an `Option`: `None` means the class never goes to the
+/// device (the default, see "MSMs without a registered table" in the crate
+/// text).
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub struct Thresholds {
     /// Forward FFTs: the transform size `log_n`.
@@ -401,8 +431,11 @@ pub struct Thresholds {
     pub ifft: u32,
     /// MSMs served from a registered SRS table: log2 of the length.
     pub msm_table: u32,
-    /// MSMs with no registered table (one-shot): log2 of the length.
-    pub msm_one_shot: u32,
+    /// MSMs with no registered table that serves their bases (one-shot):
+    /// log2 of the length; `None`: never, every such MSM declines
+    /// `unregistered-bases` (the default). Only an explicit threshold sets
+    /// it.
+    pub msm_one_shot: Option<u32>,
     /// Quotients: the extended domain `ext_k`.
     pub quotient: u32,
     /// Whether one value was set explicitly ([`set_min_k`] or
@@ -418,33 +451,35 @@ impl Thresholds {
             fft: k,
             ifft: k,
             msm_table: k,
-            msm_one_shot: k,
+            msm_one_shot: Some(k),
             quotient: k,
             explicit: true,
         }
     }
 
     /// `(class, log2 size)` pairs, for reports: `fft`, `ifft`, `msm-table`,
-    /// `msm-one-shot`, `quotient-ext`.
-    pub fn named(&self) -> [(&'static str, u32); 5] {
+    /// `msm-one-shot`, `quotient-ext`; `None`: the class never goes to the
+    /// device (`msm-one-shot` with the default thresholds).
+    pub fn named(&self) -> [(&'static str, Option<u32>); 5] {
         [
-            ("fft", self.fft),
-            ("ifft", self.ifft),
-            ("msm-table", self.msm_table),
+            ("fft", Some(self.fft)),
+            ("ifft", Some(self.ifft)),
+            ("msm-table", Some(self.msm_table)),
             ("msm-one-shot", self.msm_one_shot),
-            ("quotient-ext", self.quotient),
+            ("quotient-ext", Some(self.quotient)),
         ]
     }
 }
 
 /// The per-class break-evens measured on Apple M4 Max (40-core GPU, 128 GB),
 /// 2026-11-18, release build: the size from which the device call is faster
-/// than the stock CPU code (see the crate text, "Size thresholds").
+/// than the stock CPU code (see the crate text, "Size thresholds"). The
+/// one-shot MSM never is, with its per-call G1 check (`None`).
 pub const DEFAULT_THRESHOLDS: Thresholds = Thresholds {
     fft: 15,
     ifft: 15,
     msm_table: 13,
-    msm_one_shot: 18,
+    msm_one_shot: None,
     quotient: 14,
     explicit: false,
 };
@@ -479,16 +514,19 @@ pub fn thresholds() -> Thresholds {
 }
 
 /// The explicit threshold when one was set ([`set_min_k`], else
-/// `MIDNIGHT_METAL_MIN_K`), else the smallest per-class default (14). The
+/// `MIDNIGHT_METAL_MIN_K`), else the smallest per-class default (13). The
 /// threshold of each class is [`thresholds`].
 pub fn min_k() -> u32 {
     let t = thresholds();
-    t.fft.min(t.ifft).min(t.msm_table).min(t.msm_one_shot).min(t.quotient)
+    let m = t.fft.min(t.ifft).min(t.msm_table).min(t.quotient);
+    t.msm_one_shot.map_or(m, |k| m.min(k))
 }
 
 /// Sets one threshold for every class (log2 size; for a quotient, the
-/// extended domain). Returns `false` and keeps the old value when `k` is
-/// above [`MAX_LOG_N`] (no size would be admitted).
+/// extended domain), the one-shot MSM included, which this opens (see "MSMs
+/// without a registered table" in the crate text). Returns `false` and
+/// keeps the old value when `k` is above [`MAX_LOG_N`] (no size would be
+/// admitted).
 pub fn set_min_k(k: u32) -> bool {
     if k > MAX_LOG_N {
         return false;
@@ -545,7 +583,12 @@ pub fn stats() -> Stats {
 /// allocation or a budget), `device-error` (a pipeline, encoder or command
 /// buffer failed), `panic` (the kernel module panicked; the entry point
 /// caught it), `bases-not-in-subgroup` (`msm` only: a base that is not a
-/// point of G1, off the curve or outside the prime-order subgroup).
+/// point of G1, off the curve or outside the prime-order subgroup),
+/// `unregistered-bases` (`msm` only: no registered table serves the bases,
+/// never registered or found stale, and the one-shot path is off, as it is
+/// with the default thresholds; decided before any scalar is read and
+/// before any G1 check, see "MSMs without a registered table" in the crate
+/// text).
 pub fn declines() -> Vec<(&'static str, &'static str, u64)> {
     account::declines()
 }
@@ -559,8 +602,9 @@ pub fn reset_stats() {
 /// or a length above `2^max_log` is `shape`; a length whose size class (its
 /// log2 rounded to the nearest integer, so `2^k - 1` is in class `k`) is
 /// below `msm_table` of [`thresholds`] (the lower of the two MSM thresholds)
-/// is `below-min-k`. [`msm_g1`] also declines `below-min-k` below the class
-/// `msm_one_shot` when no registered table serves the bases.
+/// is `below-min-k`. When no registered table serves the bases, [`msm_g1`]
+/// also declines: `unregistered-bases` when `msm_one_shot` is `None` (the
+/// default), `below-min-k` below its class otherwise.
 pub fn msm_admission(scalars: usize, bases: usize, max_log: u32) -> Result<(), &'static str> {
     if scalars == 0 || scalars != bases || scalars > (1usize << max_log.min(62)) {
         return Err(Reason::Shape.name());
@@ -572,38 +616,60 @@ pub fn msm_admission(scalars: usize, bases: usize, max_log: u32) -> Result<(), &
 }
 
 /// Whether [`msm_g1`] takes an MSM of `len` scalars over `bases` by its
-/// length: `len` passes [`msm_admission`] (with [`MAX_MSM_LOG`]) and, when
-/// no registered table serves `bases`, reaches the class `msm_one_shot` of
-/// [`thresholds`]. It reads no scalar: the checks that do (the effective
-/// size of a sparse MSM, the reduction) come after it in [`msm_g1`], which
-/// may still decline. A figure that does not depend on the scalar values,
-/// for a caller that must not report one that does.
+/// length and bases: `len` passes [`msm_admission`] (with [`MAX_MSM_LOG`]),
+/// and either a registered table serves `bases` (the same lookup and
+/// identity comparison as [`msm_g1`], which drops a stale table, and no
+/// point of the prefix outside G1), or none does and the one-shot path is
+/// open with `len` in the class `msm_one_shot` of [`thresholds`] (with the
+/// default thresholds it is not: `false`). It reads no scalar: the checks
+/// that do (the effective size of a sparse MSM, the reduction) come after it
+/// in [`msm_g1`], which may still decline, and so may the per-call G1 check
+/// of the one-shot path, which this does not run. A figure that does not
+/// depend on the scalar values, for a caller that must not report one that
+/// does. It does not look at the device ([`device`]).
 pub fn msm_sized(len: usize, bases: &[G1AffineLimbs]) -> bool {
     if msm_admission(len, bases.len(), MAX_MSM_LOG).is_err() {
         return false;
     }
-    if lg2_nearest(len) >= thresholds().msm_one_shot {
-        return true;
-    }
     #[cfg(target_os = "macos")]
-    {
-        msm::has_table(bases)
+    match msm::lookup(bases, len) {
+        msm::Lookup::Table(_) => true,
+        msm::Lookup::NotInG1 => false,
+        msm::Lookup::Unregistered => one_shot_admits(len, &thresholds()).is_ok(),
     }
     #[cfg(not(target_os = "macos"))]
-    false
+    one_shot_admits(len, &thresholds()).is_ok()
+}
+
+/// The one-shot admission of an MSM of `len` scalars whose bases no
+/// registered table serves: `unregistered-bases` when `msm_one_shot` is
+/// `None`, `below-min-k` below its class.
+fn one_shot_admits(len: usize, t: &Thresholds) -> Result<u32, Reason> {
+    match t.msm_one_shot {
+        None => Err(Reason::UnregisteredBases),
+        Some(k) if lg2_nearest(len) < k => Err(Reason::BelowMinK),
+        Some(k) => Ok(k),
+    }
 }
 
 /// G1 MSM `sum scalars[i] * bases[i]` (equal lengths): the hook
 /// `GpuHooks::msm_g1`. `None`: declined.
 ///
 /// An MSM on a registered SRS table ([`register_srs`]) is taken from the
-/// size class `msm_table`, any other from `msm_one_shot` ([`thresholds`],
-/// [`msm_admission`]); the shorter one-shot MSM declines `below-min-k`
-/// before any device work. The count of non-zero scalars (the effective
-/// size, 1 when all are zero) is held, with the default thresholds, to
-/// `2^12 + n/5` (table) or `max(2^msm_one_shot, n/3)`
-/// (one-shot), and with an explicit threshold to `2^min_k`, with the same
-/// decline.
+/// size class `msm_table` ([`thresholds`], [`msm_admission`]). An MSM whose
+/// bases no registered table serves declines `unregistered-bases` with the
+/// default thresholds (the stock CPU MSM then runs it; see "MSMs without a
+/// registered table" in the crate text); with an explicit threshold it takes
+/// the one-shot path from the class `msm_one_shot`. The count of non-zero
+/// scalars (the effective size, 1 when all are zero) is held, with the
+/// default thresholds, to `2^12 + n/5` (table), and with an explicit
+/// threshold to `2^min_k` (either path), with the decline `below-min-k`.
+///
+/// The order of the checks: the lengths ([`msm_admission`]), the device,
+/// the registered table (lookup, identity comparison of every point, the
+/// table's G1 check) and the one-shot admission, all on public facts; then
+/// the effective size and the reduction of the scalars; then, on the
+/// one-shot path only, the G1 check of every base.
 pub fn msm_g1(scalars: &[Scalar], bases: &[G1AffineLimbs]) -> Option<G1JacobianLimbs> {
     guarded(Class::Msm, None, || msm_g1_body(scalars, bases))
 }
@@ -618,45 +684,46 @@ fn msm_g1_body(scalars: &[Scalar], bases: &[G1AffineLimbs]) -> Option<G1Jacobian
         account::decline(Class::Msm, r);
         return None;
     }
-    #[cfg(target_os = "macos")]
-    let tabled = msm::has_table(bases);
-    #[cfg(not(target_os = "macos"))]
-    let tabled = false;
-    if lg2_nearest(scalars.len()) < thresholds().msm_one_shot && !tabled {
-        account::decline(Class::Msm, Reason::BelowMinK);
-        return None;
-    }
     if !device() {
         account::decline(Class::Msm, Reason::NoDevice);
         return None;
     }
-    // the effective size (the non-zero scalars) against the need of the
-    // path (crate text, "Size thresholds"); only the decline is observable.
-    // After the device check: with no device every call declines
-    // `no-device`, and no scan is made for nothing.
     #[cfg(target_os = "macos")]
-    let one_shot_min = {
+    {
         let t = thresholds();
         let n = scalars.len();
-        let need = if tabled {
-            msm::effective_need(n, t.msm_table, true, t.explicit)
-        } else {
-            msm::effective_need(n, t.msm_one_shot, false, t.explicit)
+        // the path, from public facts only (the registry and the points),
+        // before any scalar is read: a table that serves the bases, or the
+        // one-shot path when an explicit threshold opens it
+        let (table, need) = match msm::lookup(bases, n) {
+            msm::Lookup::Table(tb) => (
+                Some(tb),
+                msm::effective_need(n, t.msm_table, true, t.explicit),
+            ),
+            msm::Lookup::NotInG1 => {
+                account::decline(Class::Msm, msm::BASES_REASON);
+                return None;
+            }
+            msm::Lookup::Unregistered => match one_shot_admits(n, &t) {
+                Ok(k) => (None, msm::effective_need(n, k, false, t.explicit)),
+                Err(r) => {
+                    account::decline(Class::Msm, r);
+                    return None;
+                }
+            },
         };
+        // the effective size (the non-zero scalars) against the need of the
+        // path (crate text, "Size thresholds"); only the decline is
+        // observable
         if !msm::effective_size_reaches(scalars, need) {
             account::decline(Class::Msm, Reason::BelowMinK);
             return None;
         }
-        // a table that turns out stale falls back to the one-shot need
-        msm::effective_need(n, t.msm_one_shot, false, t.explicit)
-    };
-    if !field::all_reduced(scalars) {
-        account::decline(Class::Msm, Reason::Unreduced);
-        return None;
-    }
-    #[cfg(target_os = "macos")]
-    {
-        let r = msm::msm_g1(scalars, bases, one_shot_min);
+        if !field::all_reduced(scalars) {
+            account::decline(Class::Msm, Reason::Unreduced);
+            return None;
+        }
+        let r = msm::msm_g1(scalars, bases, table);
         // a test panic after the backend used its scratch
         test_switch::hook_panic(Class::Msm);
         r

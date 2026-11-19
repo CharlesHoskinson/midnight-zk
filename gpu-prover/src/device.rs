@@ -131,9 +131,11 @@ pub struct DeviceInfo {
     /// The log2 size from which each kernel class goes to the device, by
     /// class, when the device layer has per-class thresholds (the Metal
     /// device: `fft`, `ifft`, `msm-table`, `msm-one-shot`, `quotient-ext`);
-    /// empty otherwise.
+    /// empty otherwise. `None` (JSON `null`): the class never goes to the
+    /// device (the Metal `msm-one-shot` with the default thresholds: an MSM
+    /// whose bases no registered table serves runs on the CPU).
     #[serde(skip_serializing_if = "BTreeMap::is_empty")]
-    pub size_thresholds: BTreeMap<String, u32>,
+    pub size_thresholds: BTreeMap<String, Option<u32>>,
 }
 
 /// Free and total device memory, bytes.

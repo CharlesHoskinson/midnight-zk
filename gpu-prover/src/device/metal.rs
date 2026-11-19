@@ -68,8 +68,10 @@
 //!   phase ran on the device (`DeviceCounters::device_ran`). The served MSM
 //!   count depends on the scalar values, so this binding reports instead
 //!   the MSM hook invocations of an admitted MSM phase that the device takes
-//!   by their length (`midnight_metal::msm_sized`: the length thresholds and
-//!   the table registration, no scalar read) in `msm_sized`. The served
+//!   by their length and bases (`midnight_metal::msm_sized`: the length
+//!   thresholds, the registered table that serves the bases after the
+//!   comparison of every point, or the one-shot path when an explicit
+//!   threshold opens it; no scalar read) in `msm_sized`. The served
 //!   `fft`, `ifft` and `quotient` calls depend on lengths and sizes only.
 //! - The device peak of a request: `midnight_metal::request_peak_bytes`, the
 //!   peak since `begin_request` of the bytes in use (buffers handed out, the
@@ -80,7 +82,19 @@
 //! - The quotient need is `midnight_metal::need_bytes` with the stride of
 //!   `midnight_metal::quotient_threads`.
 //! - The size thresholds are per class (`midnight_metal::thresholds`); the
-//!   device info reports them.
+//!   device info reports them, `msm-one-shot` as `None` (never) with the
+//!   default thresholds.
+//! - MSMs without a registered table: with the default thresholds an MSM
+//!   whose bases no registered table serves (never registered, or a table
+//!   the identity comparison found stale) declines `unregistered-bases`
+//!   before any scalar is read and before any G1 check of its bases, and the
+//!   stock CPU MSM runs it: the one-shot device path has to check every base
+//!   for G1 membership at every call, which costs more than the whole CPU
+//!   MSM (measured on Apple M4 Max: 187 ms for `2^16` points and 593 ms for
+//!   `2^18`, against about 25 ms and 78 ms for the CPU MSM). `msm_sized` is
+//!   then `false`. Only an explicit threshold (`MIDNIGHT_METAL_MIN_K`,
+//!   `midnight_metal::set_min_k`) opens the one-shot path, with its per-call
+//!   check unchanged.
 //! - `midnight-metal` counts forward and inverse transforms as separate
 //!   classes already, so the `ntt` class split of the CUDA binding is absent.
 
@@ -116,7 +130,8 @@ static SERVED_NS: [AtomicU64; 4] = [const { AtomicU64::new(0) }; 4];
 /// reason. Depends only on the circuit, not on the scalar values.
 static MSM_CALLS: AtomicU64 = AtomicU64::new(0);
 /// MSM hook invocations of an admitted MSM phase that the device takes by
-/// their length (`midnight_metal::msm_sized`), served or then declined, since
+/// their length and bases (`midnight_metal::msm_sized`), served or then
+/// declined, since
 /// the last reset. Depends only on the circuit and the tables, not on the
 /// scalar values.
 static MSM_SIZED: AtomicU64 = AtomicU64::new(0);
