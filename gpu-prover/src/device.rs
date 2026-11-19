@@ -195,20 +195,38 @@ pub struct Fallback {
 /// time; no field depends on a scalar value.
 #[derive(Clone, Debug, Default, PartialEq, Serialize)]
 pub struct DeviceCounters {
-    /// MSMs that ran on the device.
+    /// MSM count of the request. CUDA: the MSMs that ran on the device.
+    /// Metal: every MSM hook invocation, served on the device or declined to
+    /// the stock CPU MSM (a sparse MSM is declined, so the served count
+    /// depends on the scalar values and is not reported).
     pub msm_count: u64,
-    /// Seconds spent in device MSMs.
+    /// MSM seconds. CUDA: the wall time of the device MSMs. Metal: the wall
+    /// time inside every MSM hook invocation, served or declined.
     pub msm_seconds: f64,
-    /// Device calls by operation name.
+    /// MSM hook invocations of an admitted MSM phase that the device takes
+    /// by their length (thresholds and table registration, no scalar read),
+    /// served or then declined. Metal only (`midnight_metal::msm_sized`),
+    /// for [`DeviceCounters::device_ran`]; 0 for CUDA, whose served MSMs are
+    /// in `calls`.
+    pub msm_sized: u64,
+    /// Device calls by operation name: the calls the device served. CUDA:
+    /// `msm`, `fft`, `ifft`, `quotient`. Metal: `fft`, `ifft`, `quotient`
+    /// (no `msm`: see `msm_count`).
     pub calls: BTreeMap<String, u64>,
     /// Fallbacks to the CPU: declines of an admitted phase that the device
     /// should have taken.
     pub fallbacks: Vec<Fallback>,
     /// Every declined hook call by phase and reason, fallbacks included:
     /// also the size threshold (`below-min-k`), no device (`no-device`) and
-    /// the admission's decision (`not-admitted`).
+    /// the admission's decision (`not-admitted`). Metal: no `msm` row (the
+    /// MSM declines of `midnight-metal` depend on the scalar values or are
+    /// not shown to be independent of them; every MSM invocation is in
+    /// `msm_count`).
     pub declines: Vec<Fallback>,
-    /// Peak device bytes this process held during the request.
+    /// Peak device bytes this process held during the request: the peak,
+    /// since the request started on the device, of the bytes in use (buffers
+    /// handed out, resident MSM tables and key copies), without a pool of
+    /// idle buffers.
     pub peak_bytes: u64,
     /// Seconds per prover phase, by phase name.
     pub phase_seconds: BTreeMap<String, f64>,
@@ -218,6 +236,17 @@ impl DeviceCounters {
     /// Total fallback count.
     pub fn fallback_count(&self) -> u64 {
         self.fallbacks.iter().map(|f| f.count).sum()
+    }
+
+    /// Whether a call of an admitted phase ran on the device, for the
+    /// record's label, from counts that do not depend on the scalar values:
+    /// a served call in `calls` (CUDA: every class; Metal: `fft`, `ifft`,
+    /// `quotient`, whose service depends on lengths and sizes only), or an
+    /// MSM the device takes by its length (`msm_sized`, Metal). A call
+    /// declined below the size threshold, by a missing device or by the
+    /// admission does not count.
+    pub fn device_ran(&self) -> bool {
+        self.calls.values().sum::<u64>() > 0 || self.msm_sized > 0
     }
 }
 

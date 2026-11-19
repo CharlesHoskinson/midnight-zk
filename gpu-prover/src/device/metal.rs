@@ -44,10 +44,39 @@
 //!   memory of `mem` counts them as free (`midnight_metal::mem_info`).
 //! - The erasure report: `midnight_metal::end_request_report` zeroes every
 //!   per-request region and, with the request's check, reads each one back
-//!   from the host mapping (unified memory) and compares it with zero. The
-//!   quarantine and retry of the CUDA wipe layer have no counterpart: a region
-//!   that fails the check is zeroed again, released and reported, and the
-//!   request's erasure fails.
+//!   from the host mapping (unified memory) and compares it with zero; check
+//!   mode also reads back every idle buffer of the pool of zeroed buffers
+//!   (counted in the regions). The quarantine and retry of the CUDA wipe
+//!   layer have no counterpart: a region that fails the check, or an idle
+//!   pool buffer that reads back non-zero (or cannot be read back), is
+//!   zeroed again, read back again and released, never pooled; it is
+//!   reported (`nonzero_regions` or `check_failures`), and the request's
+//!   erasure fails. A zeroing that panicked since the last report (it was
+//!   completed on the calling thread and its buffer released) is reported
+//!   as `erasure_failures` and fails the erasure too. A hook called outside
+//!   a request wipes its scratch before it returns.
+//! - Witness independence of the record: the per-proof record reports ONE
+//!   MSM total (hook invocations, served on the device and declined to the
+//!   CPU together, which depends only on the circuit) and no MSM decline
+//!   reason. The MSM declines of `midnight-metal` (`below-min-k` of a sparse
+//!   MSM, `unreduced`, `memory`) depend on the scalar values or are not shown
+//!   to be independent of them, so they stay out of `DeviceCounters`; the
+//!   per-path split is `midnight_metal::stats()` and `declines()`, for local
+//!   benchmarks and debugging only. The MSM seconds are the wall time of all
+//!   MSM hook invocations, served or declined.
+//! - The label of the record: a proof is `gpu` when a call of an admitted
+//!   phase ran on the device (`DeviceCounters::device_ran`). The served MSM
+//!   count depends on the scalar values, so this binding reports instead
+//!   the MSM hook invocations of an admitted MSM phase that the device takes
+//!   by their length (`midnight_metal::msm_sized`: the length thresholds and
+//!   the table registration, no scalar read) in `msm_sized`. The served
+//!   `fft`, `ifft` and `quotient` calls depend on lengths and sizes only.
+//! - The device peak of a request: `midnight_metal::request_peak_bytes`, the
+//!   peak since `begin_request` of the bytes in use (buffers handed out, the
+//!   resident tables and key copies), without the idle pool of zeroed
+//!   buffers; the CUDA binding's peak is the same quantity (the crate's
+//!   live bytes, which include its tables and key copies, since
+//!   `begin_request`).
 //! - The quotient need is `midnight_metal::need_bytes` with the stride of
 //!   `midnight_metal::quotient_threads`.
 //! - The size thresholds are per class (`midnight_metal::thresholds`); the
@@ -80,8 +109,17 @@ const PHASES: [Phases; 4] = [Phases::MSM, Phases::FFT, Phases::IFFT, Phases::QUO
 /// the last reset.
 static NOT_ADMITTED: [AtomicU64; 4] = [const { AtomicU64::new(0) }; 4];
 /// Wall time in nanoseconds of the calls the device served, by class, since
-/// the last reset.
+/// the last reset. For `msm` (class 0) it is the time of every hook
+/// invocation, served or declined (see `msm`).
 static SERVED_NS: [AtomicU64; 4] = [const { AtomicU64::new(0) }; 4];
+/// MSM hook invocations since the last reset, served or declined for any
+/// reason. Depends only on the circuit, not on the scalar values.
+static MSM_CALLS: AtomicU64 = AtomicU64::new(0);
+/// MSM hook invocations of an admitted MSM phase that the device takes by
+/// their length (`midnight_metal::msm_sized`), served or then declined, since
+/// the last reset. Depends only on the circuit and the tables, not on the
+/// scalar values.
+static MSM_SIZED: AtomicU64 = AtomicU64::new(0);
 /// The request's cancel check ([`Device::set_gate`]).
 static GATE: std::sync::RwLock<Option<crate::service::Cancel>> = std::sync::RwLock::new(None);
 /// The gate withdrew the device phases.
@@ -114,12 +152,18 @@ fn timed(class: usize, t: Instant, served: bool) {
 }
 
 fn msm(scalars: &[Scalar], bases: &[G1AffineLimbs]) -> Option<G1JacobianLimbs> {
+    MSM_CALLS.fetch_add(1, Relaxed);
     if !admitted(Phases::MSM, 0) {
         return None;
     }
     let t = Instant::now();
+    if metal::msm_sized(scalars.len(), bases) {
+        MSM_SIZED.fetch_add(1, Relaxed);
+    }
     let r = metal::msm_g1(scalars, bases);
-    timed(0, t, r.is_some());
+    // the time of every invocation, so that the figure does not tell a
+    // served MSM from a declined one
+    timed(0, t, true);
     r
 }
 
@@ -250,8 +294,9 @@ mod sys {
 }
 
 /// The erasure report of a request from `midnight_metal::end_request_report`;
-/// `Err` when it did not confirm the erasure (a region read back non-zero or
-/// could not be read back).
+/// `Err` when it did not confirm the erasure: a region (a per-request buffer
+/// or, in check mode, an idle buffer of the pool) read back non-zero or
+/// could not be read back, or a zeroing panicked (`erasure_failures`).
 fn wipe_result(r: Result<metal::WipeStats, metal::WipeStats>) -> Result<WipeReport, String> {
     let (w, ok) = match r {
         Ok(w) => (w, true),
@@ -263,15 +308,23 @@ fn wipe_result(r: Result<metal::WipeStats, metal::WipeStats>) -> Result<WipeRepo
         checked: w.checked,
         nonzero_regions: w.nonzero_regions,
         check_failures: w.check_failures,
-        erasure_failures: 0,
+        erasure_failures: w.erasure_failures,
     };
-    if ok && report.nonzero_regions == 0 && report.check_failures == 0 {
+    if ok
+        && report.nonzero_regions == 0
+        && report.check_failures == 0
+        && report.erasure_failures == 0
+    {
         return Ok(report);
     }
     Err(format!(
-        "the device erasure was not confirmed ({} non-zero regions, {} failed checks, of {} \
-         regions)",
-        report.nonzero_regions, report.check_failures, report.regions
+        "the device erasure was not confirmed ({} non-zero regions, {} failed checks, {} \
+         failed erasures, of {} regions, {} of them idle pool buffers)",
+        report.nonzero_regions,
+        report.check_failures,
+        report.erasure_failures,
+        report.regions,
+        w.pool_regions
     ))
 }
 
@@ -416,6 +469,7 @@ impl Device for MetalDevice {
             return Phases::NONE;
         }
         CONTEXT.store(true, Relaxed);
+        // resets the request's peak to the bytes in use now
         metal::begin_request();
         self.state().admitted = phases;
         ADMITTED.store(phases.bits(), Relaxed);
@@ -468,8 +522,9 @@ impl Device for MetalDevice {
     fn counters(&self) -> DeviceCounters {
         let s = self.state();
         let st = metal::stats();
+        // no `msm` entry: the served count depends on the scalar values (a
+        // sparse MSM is declined); the MSM total is `msm_count`
         let calls: BTreeMap<String, u64> = [
-            ("msm", st.msm.served),
             ("fft", st.fft.served),
             ("ifft", st.ifft.served),
             ("quotient", st.quotient.served),
@@ -478,8 +533,11 @@ impl Device for MetalDevice {
         .filter(|(_, n)| *n > 0)
         .map(|(k, n)| (k.to_string(), n))
         .collect();
+        // MSM declines are not broken out (see the module text); the other
+        // classes' reasons depend on lengths and sizes only
         let mut declines: Vec<Fallback> = metal::declines()
             .into_iter()
+            .filter(|(class, _, _)| *class != "msm")
             .map(|(class, reason, count)| Fallback {
                 phase: class.to_string(),
                 reason: reason.to_string(),
@@ -489,8 +547,14 @@ impl Device for MetalDevice {
         // the hook layer's own declines (before it calls the hook); its
         // `hook` reason mirrors a decline counted above, so it is left out:
         // each declined call is counted once
+        // MSM calls that never reached the hook, counted into the MSM total
+        let mut msm_count = MSM_CALLS.load(Relaxed);
         for (class, reason, count) in hooks::hook_declines() {
-            if reason != "hook" {
+            if class == "msm" {
+                if reason != "hook" {
+                    msm_count += count;
+                }
+            } else if reason != "hook" {
                 declines.push(Fallback {
                     phase: class.to_string(),
                     reason: reason.to_string(),
@@ -498,7 +562,7 @@ impl Device for MetalDevice {
                 });
             }
         }
-        for (i, c) in CLASSES.iter().enumerate() {
+        for (i, c) in CLASSES.iter().enumerate().skip(1) {
             let n = NOT_ADMITTED[i].load(Relaxed);
             if n > 0 {
                 declines.push(Fallback {
@@ -529,8 +593,10 @@ impl Device for MetalDevice {
             .map(|(i, c)| (c.to_string(), seconds(i)))
             .collect();
         DeviceCounters {
-            msm_count: st.msm.served,
+            // every MSM hook invocation, on the device or declined to the CPU
+            msm_count,
             msm_seconds: seconds(0),
+            msm_sized: MSM_SIZED.load(Relaxed),
             calls,
             fallbacks,
             declines,
@@ -539,7 +605,7 @@ impl Device for MetalDevice {
             peak_bytes: if s.admitted.is_empty() {
                 0
             } else {
-                metal::device_bytes().1
+                metal::request_peak_bytes()
             },
             phase_seconds,
         }
@@ -548,7 +614,7 @@ impl Device for MetalDevice {
     fn reset_counters(&self) {
         metal::reset_stats();
         hooks::reset_hook_declines();
-        for c in NOT_ADMITTED.iter().chain(SERVED_NS.iter()) {
+        for c in NOT_ADMITTED.iter().chain(SERVED_NS.iter()).chain([&MSM_CALLS, &MSM_SIZED]) {
             c.store(0, Relaxed);
         }
         self.state().admitted = Phases::NONE;
@@ -570,10 +636,11 @@ mod tests {
         }
     }
 
-    /// A declined call is counted once, by phase and reason, and a size
-    /// decline is not a fallback.
+    /// An MSM call is counted once in the total whether the device serves it
+    /// or not; the other classes' declines are counted by phase and reason,
+    /// and a size decline is not a fallback.
     #[test]
-    fn a_below_min_k_msm_is_one_decline_by_reason() {
+    fn a_declined_msm_is_counted_in_the_total_and_other_declines_by_reason() {
         let _g = SERIAL.lock().unwrap_or_else(|e| e.into_inner());
         let d = device();
         d.reset_counters();
@@ -592,7 +659,10 @@ mod tests {
                 .map(|f| f.count)
                 .sum::<u64>()
         };
-        assert_eq!(row("msm", "below-min-k"), 1, "{:?}", c.declines);
+        // the MSM decline is in the total, not broken out by reason
+        assert_eq!(c.msm_count, 1);
+        assert!(c.declines.iter().all(|f| f.phase != "msm"), "{:?}", c.declines);
+        assert!(!c.calls.contains_key("msm"));
         assert_eq!(row("fft", "not-admitted"), 1, "{:?}", c.declines);
         assert_eq!(row("ifft", "not-admitted"), 1, "{:?}", c.declines);
         assert_eq!(c.fallback_count(), 0);
@@ -666,6 +736,30 @@ mod tests {
         }))
         .unwrap_err();
         assert!(e.contains("2 failed checks"), "{e}");
+        // a zeroing that panicked is an erasure failure, reported as such
+        let e = wipe_result(Err(metal::WipeStats {
+            erasure_failures: 1,
+            ..w
+        }))
+        .unwrap_err();
+        assert!(
+            e.contains("0 non-zero regions, 0 failed checks, 1 failed erasures"),
+            "{e}"
+        );
+        // and is counted even if the crate's result were `Ok`
+        let e = wipe_result(Ok(metal::WipeStats {
+            erasure_failures: 1,
+            ..w
+        }))
+        .unwrap_err();
+        assert!(e.contains("1 failed erasures"), "{e}");
+        let r = wipe_result(Ok(metal::WipeStats {
+            pool_regions: 2,
+            pool_bytes: 200,
+            ..w
+        }))
+        .unwrap();
+        assert_eq!(r.erasure_failures, 0);
     }
 
     /// `keep` turns on the crate's keep setting.

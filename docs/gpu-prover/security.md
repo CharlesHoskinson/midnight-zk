@@ -186,6 +186,22 @@ Scope of the zero-knowledge rule (a named assumption):
 - Proving on a machine that the user does not own is outside this assumption
   and needs a separate analysis.
 
+The Metal backend and the record (the one-total rule). `midnight-metal`
+declines a sparse MSM, one with few non-zero scalars, and the stock CPU MSM
+of `midnight-proofs` runs it instead; how many MSMs it serves therefore
+depends on the witness. The proof record does not show that split: it
+reports one MSM total, every MSM hook invocation whether the device served
+it or declined it (`msm.count`), and the wall time of all of them
+(`msm.seconds`); it has no served MSM count in `device_calls` and no MSM row
+in `declines` or `fallbacks`. The `gpu` or `cpu` label is decided from
+witness-independent facts only: the admitted phases, the served `fft`,
+`ifft` and `quotient` calls (which depend on sizes only), and the MSM calls
+that the device takes by their length and table, before any scalar is read.
+The per-path split stays inside the process (`midnight_metal::stats` and
+`declines`, for local benchmarks and debugging). The time of a proof still
+depends on the sparsity, as the CPU MSM time does: timing is out of scope
+(below).
+
 Out of scope:
 
 - an attacker with root on the host or with control of the NVIDIA driver,

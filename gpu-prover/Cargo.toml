@@ -60,6 +60,9 @@ sha2 = { workspace = true }
 
 [dev-dependencies]
 midnight-gpu = { version = "0.1.0", path = "../gpu", features = ["test-fault"] }
+# the erasure check's test switches (`ctx::set_plant_nonzero`), for the tests
+# only: a build of the daemon never gets `test-support`
+midnight-metal = { version = "0.1.0", path = "../metal", features = ["test-support"] }
 rand_chacha = { workspace = true }
 tempfile = "3"
 
