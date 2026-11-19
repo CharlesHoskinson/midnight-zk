@@ -658,6 +658,53 @@ pub trait FloorPlanner {
     ) -> Result<(), Error> {
         Self::synthesize(cs, circuit, config, constants)
     }
+
+    /// With the feature `prover-par` (see `crate::par::layout`): the
+    /// synthesis of the stock prover for a key without a layout
+    /// ([`synthesize_with_cached_regions`] with `None`), also returning the
+    /// measured layout of the synthesis when the planner supports it and
+    /// the layout can be checked by [`synthesize_checking_layout`]. `None`
+    /// otherwise: the default, which only runs that synthesis.
+    ///
+    /// [`synthesize_with_cached_regions`]: Self::synthesize_with_cached_regions
+    /// [`synthesize_checking_layout`]: Self::synthesize_checking_layout
+    #[cfg(feature = "prover-par")]
+    #[doc(hidden)]
+    fn synthesize_measuring_layout<F: Field, CS: Assignment<F> + SyncDeps, C: Circuit<F>>(
+        cs: &mut CS,
+        circuit: &C,
+        config: C::Config,
+        constants: Vec<Column<Fixed>>,
+    ) -> Result<Option<crate::circuit::layouter::MeasuredLayout>, Error> {
+        Self::synthesize_with_cached_regions(cs, circuit, config, constants, None)?;
+        Ok(None)
+    }
+
+    /// With the feature `prover-par` (see `crate::par::layout`): synthesizes
+    /// `circuit` into `cs` with the region starts of `layout` (from
+    /// [`synthesize_measuring_layout`]), without the shape pass, checking
+    /// that every region the circuit opens has the measured shape of
+    /// `layout` at its index and that it opens as many regions.
+    ///
+    /// Returns `true` when the synthesis succeeded and matched `layout`:
+    /// then `cs` holds the assignment of the stock synthesis. Returns
+    /// `false` otherwise (any mismatch, or any error of the synthesis):
+    /// then `cs` holds a partial assignment that must be discarded. Never
+    /// panics on a mismatch. The default returns `false` without touching
+    /// `cs`.
+    ///
+    /// [`synthesize_measuring_layout`]: Self::synthesize_measuring_layout
+    #[cfg(feature = "prover-par")]
+    #[doc(hidden)]
+    fn synthesize_checking_layout<F: Field, CS: Assignment<F> + SyncDeps, C: Circuit<F>>(
+        _cs: &mut CS,
+        _circuit: &C,
+        _config: C::Config,
+        _constants: Vec<Column<Fixed>>,
+        _layout: &crate::circuit::layouter::MeasuredLayout,
+    ) -> bool {
+        false
+    }
 }
 
 /// This is a trait that circuits provide implementations for so that the

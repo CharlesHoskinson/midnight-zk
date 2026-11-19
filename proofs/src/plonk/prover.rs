@@ -596,11 +596,16 @@ where
         pk.region_starts.as_deref(),
     )?;
     // With the feature `prover-par`, a key without a layout from keygen
-    // (read from bytes) takes the layout its first proof computes, and
-    // later proofs skip the shape pass as with a key from keygen.
+    // (read from bytes) takes the layout its first proof measures, and
+    // later proofs whose circuit matches it skip the shape pass as with a
+    // key from keygen. A proof whose circuit does not match it starts over
+    // from an empty witness with the stock synthesis.
     #[cfg(feature = "prover-par")]
     crate::par::layout::synthesize(
         &mut witness,
+        |witness| {
+            witness.advice = vec![domain.empty_lagrange_rational(); meta.num_advice_columns];
+        },
         circuit,
         config,
         meta.constants.clone(),

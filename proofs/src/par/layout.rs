@@ -17,70 +17,129 @@
 //! (`ProvingKey::region_starts`) and the prover hands them to the floor
 //! planner, which then skips its shape pass. A key read from bytes holds no
 //! layout, so the stock prover runs the shape pass on every proof. Here the
-//! first proof made with such a key captures the layout of its own
+//! first proof made with such a key measures the layout of its own
 //! synthesis, which runs the shape pass anyway, into the key
-//! (`ProvingKey::region_starts_cache`), and later proofs with the key reuse
-//! it, as they would reuse the layout of keygen.
+//! (`ProvingKey::region_starts_cache`): for each region, in synthesis order,
+//! its start, its columns, its row count and the number of global constants
+//! it assigns ([`MeasuredLayout`]).
 //!
-//! The reuse rests on the invariant of
-//! [`FloorPlanner::synthesize_with_cached_regions`]: every synthesis of the
-//! circuit of a key makes the same sequence of `assign_region` calls, with
-//! the same columns and row counts. The prover of a key from `keygen_pk`
-//! already relies on it (the layout comes from the keygen circuit and is
-//! applied to every proving circuit). Under it the captured layout is the
-//! layout the shape pass of any later proof would compute, so the
-//! witness, and the proof, do not change.
+//! A later proof with the key places its regions at those starts without the
+//! shape pass, and checks each region as it is assigned
+//! ([`FloorPlanner::synthesize_checking_layout`]): the assignment of the
+//! region is measured as the shape pass measures it, and the region must
+//! have the measured columns, row count and constants of the layout at its
+//! index, and the start the shape pass would give it after the regions
+//! before it; the circuit must open as many regions as the layout. The start
+//! of a region in the shape pass depends only on those quantities of the
+//! regions before it, so a proof that passes the check has the stock
+//! witness, and the stock proof.
+//!
+//! A proof whose circuit does not pass the check (a circuit of another
+//! shape: more or fewer regions, regions of other sizes or columns), or
+//! whose synthesis fails in any way during the check, discards its witness
+//! and synthesizes again on an empty witness with the stock shape pass: it
+//! makes the proof, or returns the error, that the stock prover makes. It
+//! never panics on a mismatch, and it leaves the stored layout as it is, so
+//! later proofs that match the stored layout keep skipping the shape pass.
+//!
+//! What the check cannot see is a region closure that touches other cells
+//! when it runs in the shape pass (with unknown values, and on its first
+//! call) than when it runs in the assignment: the shape pass would then
+//! place the region by cells that the assignment does not touch. A circuit
+//! doing so in its first proof is caught there (its assignment is measured
+//! too, and its layout is not stored); the same holds for every later proof
+//! of a circuit whose cells do not depend on witness values or on the
+//! closure's own state across its calls, which the upstream reuse of the
+//! keygen layout already requires.
 //!
 //! Two proofs that start at once with a key without a layout both run the
-//! shape pass and capture equal layouts; the first to finish stores its
-//! own, the other is dropped. A proof that fails during synthesis stores
-//! nothing. Each key holds its own layout, so keys of circuits of
-//! different shapes never share one.
+//! shape pass and measure layouts; the first to finish stores its own, the
+//! other is dropped. A proof that fails during synthesis stores nothing.
+//! Each key holds its own layout, so keys of circuits of different shapes
+//! never share one. Planners other than [`SimpleFloorPlanner`] measure no
+//! layout (the default of [`FloorPlanner::synthesize_measuring_layout`]), so
+//! their proofs run the stock synthesis every time.
+//!
+//! [`SimpleFloorPlanner`]: crate::circuit::SimpleFloorPlanner
 
 use std::sync::OnceLock;
 
 use ff::Field;
 
 use crate::{
-    circuit::{RegionStart, layouter::SyncDeps},
+    circuit::{RegionStart, layouter::MeasuredLayout, layouter::SyncDeps},
     plonk::{Assignment, Circuit, Column, Error, Fixed, FloorPlanner},
 };
 
+#[cfg(test)]
+thread_local! {
+    /// The proofs of this thread that did not pass the check of the stored
+    /// layout and synthesized again (tests only).
+    static RETRIES: std::cell::Cell<usize> = const { std::cell::Cell::new(0) };
+}
+
+/// The number of proofs made on this thread since the last call that did
+/// not pass the check of the stored layout and synthesized again with the
+/// shape pass, clearing the count (tests only).
+#[cfg(test)]
+pub(crate) fn take_retries() -> usize {
+    RETRIES.with(|r| r.replace(0))
+}
+
 /// Synthesizes `circuit` into `cs` as the stock prover does with the
-/// cached layout `keygen` (`ProvingKey::region_starts`), or, when `keygen`
-/// is `None`, with the layout in `cache`; when both are empty, runs the
-/// shape pass and stores the layout it captures in `cache`.
+/// layout `keygen` (`ProvingKey::region_starts`). When `keygen` is `None`:
+/// with the layout in `cache` if the circuit matches it, and otherwise
+/// (after `reset` empties `cs`) with the stock shape pass; when `cache` is
+/// empty, with the stock shape pass, storing the layout it measures in
+/// `cache`.
 pub(crate) fn synthesize<F, CS, C>(
     cs: &mut CS,
+    reset: impl FnOnce(&mut CS),
     circuit: &C,
     config: C::Config,
     constants: Vec<Column<Fixed>>,
     keygen: Option<&[RegionStart]>,
-    cache: &OnceLock<Vec<RegionStart>>,
+    cache: &OnceLock<MeasuredLayout>,
 ) -> Result<(), Error>
 where
     F: Field,
     CS: Assignment<F> + SyncDeps,
     C: Circuit<F>,
 {
-    if let Some(cached) = keygen.or_else(|| cache.get().map(Vec::as_slice)) {
+    if keygen.is_some() {
+        // The upstream path, as the stock prover takes it.
         return C::FloorPlanner::synthesize_with_cached_regions(
-            cs,
-            circuit,
-            config,
-            constants,
-            Some(cached),
+            cs, circuit, config, constants, keygen,
         );
     }
-    // The capturing synthesis is the plain synthesis of the planner, which
-    // also records each region start it computes (`None` when the planner
-    // does not capture, as for the default of the trait).
-    if let Some(captured) =
-        C::FloorPlanner::synthesize_capturing_regions(cs, circuit, config, constants)?
+    if let Some(layout) = cache.get() {
+        if C::FloorPlanner::synthesize_checking_layout(
+            cs,
+            circuit,
+            config.clone(),
+            constants.clone(),
+            layout,
+        ) {
+            return Ok(());
+        }
+        #[cfg(test)]
+        RETRIES.with(|r| r.set(r.get() + 1));
+        // The partial witness is discarded; the stock synthesis of a key
+        // without a layout runs on an empty one.
+        reset(cs);
+        return C::FloorPlanner::synthesize_with_cached_regions(
+            cs, circuit, config, constants, None,
+        );
+    }
+    // The measuring synthesis is the stock synthesis of a key without a
+    // layout, which also records the layout it computes (`None` when the
+    // planner does not measure, as for the default of the trait).
+    if let Some(measured) =
+        C::FloorPlanner::synthesize_measuring_layout(cs, circuit, config, constants)?
     {
-        // Another proof with this key may have stored its layout first:
-        // both are the layout of the same circuit, so either one serves.
-        let _ = cache.set(captured);
+        // Another proof with this key may have stored its layout first: the
+        // proofs after it are checked against that one.
+        let _ = cache.set(measured);
     }
     Ok(())
 }
@@ -126,12 +185,18 @@ mod tests {
         // the key from keygen never fills the cache: it has its own layout
         assert!(pk.region_starts_cache.get().is_none());
         let first = prove_seeded(&params, &read, &chain, 1);
-        assert_eq!(read.region_starts_cache.get(), Some(&keygen_layout));
+        assert_eq!(
+            read.region_starts_cache.get().map(|l| l.starts()),
+            Some(keygen_layout)
+        );
+        super::take_retries();
         let second = prove_seeded(&params, &read, &chain, 1);
         let third = prove_seeded(&params, &read, &chain, 1);
         let other_seed = prove_seeded(&params, &read, &chain, 2);
         let other_seed_ref = prove_seeded(&params, &pk, &chain, 2);
         crate::plonk::prover::test_blinding::set(None);
+        // the later proofs reused the layout, without the shape pass
+        assert_eq!(super::take_retries(), 0);
 
         assert_eq!(first, reference);
         assert_eq!(second, reference);
@@ -179,7 +244,10 @@ mod tests {
         });
         crate::plonk::prover::test_blinding::set(None);
 
-        assert_eq!(read.region_starts_cache.get(), pk.region_starts.as_ref());
+        assert_eq!(
+            read.region_starts_cache.get().map(|l| l.starts()),
+            pk.region_starts
+        );
         for proof in proofs.iter().chain(later.iter()) {
             assert_eq!(*proof, reference);
         }
@@ -217,12 +285,12 @@ mod tests {
         }
         crate::plonk::prover::test_blinding::set(None);
         assert_eq!(
-            read_short.region_starts_cache.get(),
-            pk_short.region_starts.as_ref()
+            read_short.region_starts_cache.get().map(|l| l.starts()),
+            pk_short.region_starts
         );
         assert_eq!(
-            read_long.region_starts_cache.get(),
-            pk_long.region_starts.as_ref()
+            read_long.region_starts_cache.get().map(|l| l.starts()),
+            pk_long.region_starts
         );
     }
 

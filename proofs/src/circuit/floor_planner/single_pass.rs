@@ -2,6 +2,8 @@ use std::{cmp, collections::HashMap, fmt, marker::PhantomData};
 
 use ff::Field;
 
+#[cfg(feature = "prover-par")]
+use crate::circuit::layouter::{MeasuredLayout, MeasuredRegion};
 use crate::{
     circuit::{
         Cell, Layouter, Region, RegionIndex, RegionStart, Table, Value,
@@ -66,6 +68,39 @@ impl FloorPlanner for SimpleFloorPlanner {
             }
         }
     }
+
+    #[cfg(feature = "prover-par")]
+    fn synthesize_measuring_layout<F: Field, CS: Assignment<F> + SyncDeps, C: Circuit<F>>(
+        cs: &mut CS,
+        circuit: &C,
+        config: C::Config,
+        constants: Vec<Column<Fixed>>,
+    ) -> Result<Option<MeasuredLayout>, Error> {
+        let mut probe = ProbeState::default();
+        let layouter = SingleChipLayouter::new_probing(cs, constants, None, &mut probe)?;
+        circuit.synthesize(config, layouter)?;
+        // A circuit whose regions touch other cells in the assignment than
+        // in the shape pass would make a later check against this layout
+        // compare unlike measures: such a layout is not returned.
+        Ok((!probe.mismatch).then_some(probe.layout))
+    }
+
+    #[cfg(feature = "prover-par")]
+    fn synthesize_checking_layout<F: Field, CS: Assignment<F> + SyncDeps, C: Circuit<F>>(
+        cs: &mut CS,
+        circuit: &C,
+        config: C::Config,
+        constants: Vec<Column<Fixed>>,
+        layout: &MeasuredLayout,
+    ) -> bool {
+        let mut probe = ProbeState::default();
+        let Ok(layouter) = SingleChipLayouter::new_probing(cs, constants, Some(layout), &mut probe)
+        else {
+            return false;
+        };
+        let result = circuit.synthesize(config, layouter);
+        result.is_ok() && !probe.mismatch && probe.regions == layout.regions.len()
+    }
 }
 
 /// A [`Layouter`] for a single-chip circuit.
@@ -85,7 +120,39 @@ pub struct SingleChipLayouter<'a, F: Field, CS: Assignment<F> + 'a> {
     /// so the caller can read the layout back after `circuit.synthesize`
     /// has consumed the layouter. Used by `synthesize_capturing_regions`.
     region_sink: Option<&'a mut Vec<RegionStart>>,
+    /// With the feature `prover-par`: when `Some`, the regions are measured
+    /// (see `assign_region_probed`).
+    #[cfg(feature = "prover-par")]
+    probe: Option<Probe<'a>>,
     _marker: PhantomData<F>,
+}
+
+/// With the feature `prover-par`: how a [`SingleChipLayouter`] measures its
+/// regions. Without `expected`, it runs the stock shape pass and records the
+/// layout it computes ([`FloorPlanner::synthesize_measuring_layout`]); with
+/// `expected`, it places the regions at the starts of that layout without
+/// the shape pass and checks each region against it
+/// ([`FloorPlanner::synthesize_checking_layout`]).
+#[cfg(feature = "prover-par")]
+struct Probe<'a> {
+    expected: Option<&'a MeasuredLayout>,
+    state: &'a mut ProbeState,
+}
+
+/// What a probing synthesis found (see [`Probe`]).
+#[cfg(feature = "prover-par")]
+#[derive(Default)]
+struct ProbeState {
+    /// The measured layout (without an expected layout).
+    layout: MeasuredLayout,
+    /// The index of each column set in `layout.column_sets`.
+    column_sets: HashMap<Vec<RegionColumn>, usize>,
+    /// The number of regions opened.
+    regions: usize,
+    /// Checking: a region differed from the expected layout or failed, so
+    /// the assignment is not the stock one. Measuring: a region touched
+    /// other cells in its assignment than in the shape pass.
+    mismatch: bool,
 }
 
 impl<'a, F: Field, CS: Assignment<F> + 'a> fmt::Debug for SingleChipLayouter<'a, F, CS> {
@@ -108,6 +175,8 @@ impl<'a, F: Field, CS: Assignment<F>> SingleChipLayouter<'a, F, CS> {
             table_columns: vec![],
             cached_region_starts: None,
             region_sink: None,
+            #[cfg(feature = "prover-par")]
+            probe: None,
             _marker: PhantomData,
         })
     }
@@ -127,6 +196,8 @@ impl<'a, F: Field, CS: Assignment<F>> SingleChipLayouter<'a, F, CS> {
             table_columns: vec![],
             cached_region_starts: Some(cached_regions),
             region_sink: None,
+            #[cfg(feature = "prover-par")]
+            probe: None,
             _marker: PhantomData,
         })
     }
@@ -148,6 +219,8 @@ impl<'a, F: Field, CS: Assignment<F>> SingleChipLayouter<'a, F, CS> {
             table_columns: vec![],
             cached_region_starts: None,
             region_sink: Some(sink),
+            #[cfg(feature = "prover-par")]
+            probe: None,
             _marker: PhantomData,
         })
     }
@@ -160,6 +233,13 @@ impl<'a, F: Field, CS: Assignment<F> + 'a + SyncDeps> SingleChipLayouter<'a, F, 
         N: Fn() -> NR,
         NR: Into<String>,
     {
+        #[cfg(feature = "prover-par")]
+        if let Some(mut probe) = self.probe.take() {
+            let result = self.assign_region_probed(&mut probe, name, assignment);
+            self.probe = Some(probe);
+            return result;
+        }
+
         let region_index = self.regions.len();
 
         if let Some(ref cached) = self.cached_region_starts {
@@ -235,6 +315,341 @@ impl<'a, F: Field, CS: Assignment<F> + 'a + SyncDeps> SingleChipLayouter<'a, F, 
         }
 
         Ok(result)
+    }
+}
+
+#[cfg(feature = "prover-par")]
+impl<'a, F: Field, CS: Assignment<F> + 'a + SyncDeps> SingleChipLayouter<'a, F, CS> {
+    /// A layouter that measures its regions (see [`Probe`]): without
+    /// `expected`, it runs the stock shape pass and records the layout in
+    /// `state`; with `expected`, it places the regions at its starts and
+    /// checks them.
+    fn new_probing(
+        cs: &'a mut CS,
+        constants: Vec<Column<Fixed>>,
+        expected: Option<&'a MeasuredLayout>,
+        state: &'a mut ProbeState,
+    ) -> Result<Self, Error> {
+        Ok(SingleChipLayouter {
+            cs,
+            constants,
+            regions: vec![],
+            columns: HashMap::default(),
+            table_columns: vec![],
+            cached_region_starts: None,
+            region_sink: None,
+            probe: Some(Probe { expected, state }),
+            _marker: PhantomData,
+        })
+    }
+
+    /// The error a checking synthesis returns to the circuit for a region
+    /// that differs from the expected layout. The prover never surfaces it:
+    /// it discards the assignment and synthesizes again with the shape
+    /// pass.
+    fn layout_mismatch() -> Error {
+        Error::Synthesis("the region differs from the cached layout".into())
+    }
+
+    /// `assign_region` of a probing layouter (see [`Probe`]).
+    ///
+    /// Measuring: the stock `assign_region` (shape pass, then assignment),
+    /// recording each region's start, shape and number of constants; the
+    /// assignment is also measured, and a region whose assignment touches
+    /// other cells than its shape pass marks the layout as not reusable.
+    ///
+    /// Checking: the region is placed at the start of the expected layout
+    /// at its index and assigned once, measured as the shape pass measures
+    /// (the same `RegionShape` sees the same calls). The region must have
+    /// the expected columns, row count and number of constants, and the
+    /// start the stock shape pass computes from the regions before it (the
+    /// first free rows of `self.columns`, kept as that pass keeps them) must
+    /// be the expected start. Otherwise, or on any error, the synthesis is
+    /// marked as differing and every later region fails at once: the caller
+    /// discards the assignment. A region past the expected ones is a
+    /// mismatch, not a panic.
+    fn assign_region_probed<A, AR, N, NR>(
+        &mut self,
+        probe: &mut Probe<'a>,
+        name: N,
+        mut assignment: A,
+    ) -> Result<AR, Error>
+    where
+        A: FnMut(Region<'_, F>) -> Result<AR, Error>,
+        N: Fn() -> NR,
+        NR: Into<String>,
+    {
+        let region_index = self.regions.len();
+        let state = &mut *probe.state;
+
+        let (result, constants_to_assign) = match probe.expected {
+            Some(expected) => {
+                if state.mismatch {
+                    return Err(Self::layout_mismatch());
+                }
+                state.regions += 1;
+                let Some(entry) = expected.regions.get(region_index) else {
+                    state.mismatch = true;
+                    return Err(Self::layout_mismatch());
+                };
+                let start = entry.start;
+                self.regions.push(start);
+
+                let assigned = self.assign_measured(region_index, name, &mut assignment);
+                let (result, measured, constants_to_assign) = match assigned {
+                    Ok(assigned) => assigned,
+                    Err(e) => {
+                        state.mismatch = true;
+                        return Err(e);
+                    }
+                };
+                let stock_start = (measured.columns.iter())
+                    .map(|column| self.columns.get(column).copied().unwrap_or(0))
+                    .max()
+                    .unwrap_or(0);
+                if stock_start != *start
+                    || !expected.matches(entry, &measured, constants_to_assign.len())
+                {
+                    state.mismatch = true;
+                    return Err(Self::layout_mismatch());
+                }
+                for column in measured.columns {
+                    self.columns.insert(column, *start + measured.row_count);
+                }
+                (result, constants_to_assign)
+            }
+            None => {
+                // The stock shape pass.
+                let mut shape = RegionShape::new(region_index.into());
+                {
+                    let region: &mut dyn RegionLayouter<F> = &mut shape;
+                    assignment(region.into())?;
+                }
+
+                let mut region_start = 0;
+                for column in &shape.columns {
+                    region_start =
+                        cmp::max(region_start, self.columns.get(column).cloned().unwrap_or(0));
+                }
+                self.regions.push(region_start.into());
+
+                for column in shape.columns.iter() {
+                    self.columns.insert(*column, region_start + shape.row_count);
+                }
+
+                let (result, measured, constants_to_assign) =
+                    self.assign_measured(region_index, name, &mut assignment)?;
+
+                state.regions += 1;
+                if !measured.same_shape(&shape) {
+                    state.mismatch = true;
+                }
+                let columns = shape.sorted_columns();
+                let next = state.layout.column_sets.len();
+                let index = *state.column_sets.entry(columns).or_insert_with_key(|columns| {
+                    state.layout.column_sets.push(columns.clone());
+                    next
+                });
+                state.layout.regions.push(MeasuredRegion {
+                    start: region_start.into(),
+                    columns: index,
+                    row_count: shape.row_count,
+                    constants: constants_to_assign.len(),
+                });
+                (result, constants_to_assign)
+            }
+        };
+
+        // Assign constants, as the stock `assign_region_impl` does.
+        if self.constants.is_empty() {
+            if !constants_to_assign.is_empty() {
+                return Err(Error::NotEnoughColumnsForConstants);
+            }
+        } else {
+            let constants_column = self.constants[0];
+            let next_constant_row =
+                self.columns.entry(Column::<Any>::from(constants_column).into()).or_default();
+            for (constant, advice) in constants_to_assign {
+                self.cs.assign_fixed(
+                    || format!("Constant({:?})", constant.evaluate()),
+                    constants_column,
+                    *next_constant_row,
+                    || Value::known(constant),
+                )?;
+                self.cs.copy(
+                    constants_column.into(),
+                    *next_constant_row,
+                    advice.column,
+                    *self.regions[*advice.region_index] + advice.row_offset,
+                )?;
+                *next_constant_row += 1;
+            }
+        }
+
+        Ok(result)
+    }
+
+    /// The assignment of the region `region_index` at its start in
+    /// `self.regions`, as in the stock `assign_region_impl`, measured as the
+    /// shape pass measures. Returns the closure's result, the measured
+    /// shape and the constants to assign.
+    #[allow(clippy::type_complexity)]
+    fn assign_measured<A, AR, N, NR>(
+        &mut self,
+        region_index: usize,
+        name: N,
+        assignment: &mut A,
+    ) -> Result<(AR, RegionShape, Vec<(Rational<F>, Cell)>), Error>
+    where
+        A: FnMut(Region<'_, F>) -> Result<AR, Error>,
+        N: Fn() -> NR,
+        NR: Into<String>,
+    {
+        self.cs.enter_region(name);
+        let mut region = SingleChipLayouterRegion::new(self, region_index.into());
+        let mut measuring = Measuring {
+            inner: &mut region,
+            shape: RegionShape::new(region_index.into()),
+        };
+        let result = {
+            let region: &mut dyn RegionLayouter<F> = &mut measuring;
+            assignment(region.into())
+        };
+        let measured = measuring.shape;
+        let result = result?;
+        let constants_to_assign = region.constants;
+        self.cs.exit_region();
+        Ok((result, measured, constants_to_assign))
+    }
+}
+
+/// With the feature `prover-par`: a region that forwards every call to
+/// `inner` and also passes it to `shape`, which records the columns and the
+/// row count as in the shape pass.
+#[cfg(feature = "prover-par")]
+struct Measuring<'r, F: Field> {
+    inner: &'r mut dyn RegionLayouter<F>,
+    shape: RegionShape,
+}
+
+#[cfg(feature = "prover-par")]
+impl<F: Field> fmt::Debug for Measuring<'_, F> {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.debug_struct("Measuring")
+            .field("inner", &self.inner)
+            .field("shape", &self.shape)
+            .finish()
+    }
+}
+
+#[cfg(feature = "prover-par")]
+impl<F: Field> RegionLayouter<F> for Measuring<'_, F> {
+    fn enable_selector<'v>(
+        &'v mut self,
+        annotation: &'v (dyn Fn() -> String + 'v),
+        selector: &Selector,
+        offset: usize,
+    ) -> Result<(), Error> {
+        RegionLayouter::<F>::enable_selector(&mut self.shape, annotation, selector, offset)?;
+        self.inner.enable_selector(annotation, selector, offset)
+    }
+
+    fn name_column<'v>(
+        &'v mut self,
+        annotation: &'v (dyn Fn() -> String + 'v),
+        column: Column<Any>,
+    ) {
+        RegionLayouter::<F>::name_column(&mut self.shape, annotation, column);
+        self.inner.name_column(annotation, column)
+    }
+
+    fn assign_advice<'v>(
+        &'v mut self,
+        annotation: &'v (dyn Fn() -> String + 'v),
+        column: Column<Advice>,
+        offset: usize,
+        to: &'v mut (dyn FnMut() -> Value<Rational<F>> + 'v),
+    ) -> Result<Cell, Error> {
+        RegionLayouter::<F>::assign_advice(
+            &mut self.shape,
+            annotation,
+            column,
+            offset,
+            &mut Value::unknown,
+        )?;
+        self.inner.assign_advice(annotation, column, offset, to)
+    }
+
+    fn assign_advice_from_constant<'v>(
+        &'v mut self,
+        annotation: &'v (dyn Fn() -> String + 'v),
+        column: Column<Advice>,
+        offset: usize,
+        constant: Rational<F>,
+    ) -> Result<Cell, Error> {
+        RegionLayouter::<F>::assign_advice_from_constant(
+            &mut self.shape,
+            annotation,
+            column,
+            offset,
+            constant,
+        )?;
+        self.inner.assign_advice_from_constant(annotation, column, offset, constant)
+    }
+
+    fn assign_advice_from_instance<'v>(
+        &mut self,
+        annotation: &'v (dyn Fn() -> String + 'v),
+        instance: Column<Instance>,
+        row: usize,
+        advice: Column<Advice>,
+        offset: usize,
+    ) -> Result<(Cell, Value<F>), Error> {
+        RegionLayouter::<F>::assign_advice_from_instance(
+            &mut self.shape,
+            annotation,
+            instance,
+            row,
+            advice,
+            offset,
+        )?;
+        self.inner
+            .assign_advice_from_instance(annotation, instance, row, advice, offset)
+    }
+
+    fn instance_value(
+        &mut self,
+        instance: Column<Instance>,
+        row: usize,
+    ) -> Result<Value<F>, Error> {
+        self.inner.instance_value(instance, row)
+    }
+
+    fn assign_fixed<'v>(
+        &'v mut self,
+        annotation: &'v (dyn Fn() -> String + 'v),
+        column: Column<Fixed>,
+        offset: usize,
+        to: &'v mut (dyn FnMut() -> Value<Rational<F>> + 'v),
+    ) -> Result<Cell, Error> {
+        RegionLayouter::<F>::assign_fixed(
+            &mut self.shape,
+            annotation,
+            column,
+            offset,
+            &mut Value::unknown,
+        )?;
+        self.inner.assign_fixed(annotation, column, offset, to)
+    }
+
+    fn constrain_constant(&mut self, cell: Cell, constant: Rational<F>) -> Result<(), Error> {
+        RegionLayouter::<F>::constrain_constant(&mut self.shape, cell, constant)?;
+        self.inner.constrain_constant(cell, constant)
+    }
+
+    fn constrain_equal(&mut self, left: Cell, right: Cell) -> Result<(), Error> {
+        RegionLayouter::<F>::constrain_equal(&mut self.shape, left, right)?;
+        self.inner.constrain_equal(left, right)
     }
 }
 
@@ -712,5 +1127,117 @@ mod tests {
             Some(&starts),
         )
         .unwrap();
+    }
+
+    /// The measured layout has the starts of the stock shape pass, and a
+    /// check against it passes for the same circuit and fails, without a
+    /// panic, against a layout with fewer or more regions or with other
+    /// shapes or starts.
+    #[cfg(feature = "prover-par")]
+    #[test]
+    fn checking_layout_mismatch_is_not_a_panic() {
+        let circuit = TwoRegionCircuit;
+        let mut cs = crate::plonk::ConstraintSystem::<Fq>::default();
+        let config = TwoRegionCircuit::configure(&mut cs);
+        let constants = cs.constants.clone();
+
+        let starts = SimpleFloorPlanner::synthesize_capturing_regions(
+            &mut NullCs,
+            &circuit,
+            config,
+            constants.clone(),
+        )
+        .unwrap()
+        .unwrap();
+        let layout = SimpleFloorPlanner::synthesize_measuring_layout(
+            &mut NullCs,
+            &circuit,
+            config,
+            constants.clone(),
+        )
+        .unwrap()
+        .expect("the simple planner measures");
+        assert_eq!(layout.starts(), starts);
+        assert_eq!(layout.regions[0].row_count, 2);
+        assert_eq!(layout.regions[1].row_count, 1);
+
+        let check = |layout: &crate::circuit::layouter::MeasuredLayout| {
+            SimpleFloorPlanner::synthesize_checking_layout(
+                &mut NullCs,
+                &circuit,
+                config,
+                constants.clone(),
+                layout,
+            )
+        };
+        assert!(check(&layout));
+
+        let mut fewer = layout.clone();
+        fewer.regions.truncate(1);
+        assert!(!check(&fewer));
+        let mut more = layout.clone();
+        more.regions.push(more.regions[1].clone());
+        assert!(!check(&more));
+        let mut rows = layout.clone();
+        rows.regions[0].row_count = 3;
+        assert!(!check(&rows));
+        let mut columns = layout.clone();
+        columns.regions[1].columns = columns.regions[0].columns;
+        assert!(!check(&columns));
+        let mut start = layout.clone();
+        start.regions[1].start = 5.into();
+        assert!(!check(&start));
+        assert!(!check(&Default::default()));
+        let mut constants_count = layout;
+        constants_count.regions[0].constants = 1;
+        assert!(!check(&constants_count));
+    }
+
+    /// A region whose closure touches other cells on its second call (the
+    /// assignment) than on its first (the shape pass) yields no layout to
+    /// reuse.
+    #[cfg(feature = "prover-par")]
+    #[test]
+    fn measuring_skips_regions_unlike_their_shape_pass() {
+        struct Fickle;
+        impl Circuit<Fq> for Fickle {
+            type Config = Column<Advice>;
+            type FloorPlanner = SimpleFloorPlanner;
+            #[cfg(feature = "circuit-params")]
+            type Params = ();
+            fn without_witnesses(&self) -> Self {
+                Fickle
+            }
+            fn configure(meta: &mut crate::plonk::ConstraintSystem<Fq>) -> Self::Config {
+                meta.advice_column()
+            }
+            fn synthesize(
+                &self,
+                config: Self::Config,
+                mut layouter: impl Layouter<Fq>,
+            ) -> Result<(), Error> {
+                let mut calls = 0;
+                layouter.assign_region(
+                    || "fickle",
+                    |mut region| {
+                        calls += 1;
+                        for row in 0..calls {
+                            region.assign_advice(|| "a", config, row, || Value::known(Fq::ONE))?;
+                        }
+                        Ok(())
+                    },
+                )
+            }
+        }
+        let mut cs = crate::plonk::ConstraintSystem::<Fq>::default();
+        let config = Fickle::configure(&mut cs);
+        let measured = SimpleFloorPlanner::synthesize_measuring_layout(
+            &mut NullCs,
+            &Fickle,
+            config,
+            cs.constants.clone(),
+        )
+        .unwrap();
+        assert!(measured.is_none());
     }
 }

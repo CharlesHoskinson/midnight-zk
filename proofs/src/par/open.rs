@@ -95,6 +95,30 @@ pub(crate) const PAR_MIN_LEN: usize = 1 << 15;
 /// costs more than it balances.
 pub(crate) const SUM_PAR_MIN_LEN: usize = 1 << 19;
 
+/// Counts of the calls that took the parallel paths of this module (tests
+/// only), for the tests that must reach them.
+#[cfg(test)]
+pub(crate) mod reached {
+    use std::sync::atomic::{AtomicUsize, Ordering};
+
+    /// [`super::divide_by_roots`] divided in parallel blocks.
+    pub(crate) static DIVIDE_BY_ROOTS: AtomicUsize = AtomicUsize::new(0);
+    /// [`super::kate_division`] divided in parallel blocks.
+    pub(crate) static KATE_DIVISION: AtomicUsize = AtomicUsize::new(0);
+    /// [`super::poly_inner_product`] ran.
+    pub(crate) static POLY_INNER_PRODUCT: AtomicUsize = AtomicUsize::new(0);
+
+    pub(super) fn hit(counter: &AtomicUsize) {
+        counter.fetch_add(1, Ordering::Relaxed);
+    }
+
+    /// The counts of `divide_by_roots`, `kate_division` and
+    /// `poly_inner_product`, in that order.
+    pub(crate) fn counts() -> [usize; 3] {
+        [&DIVIDE_BY_ROOTS, &KATE_DIVISION, &POLY_INNER_PRODUCT].map(|c| c.load(Ordering::Relaxed))
+    }
+}
+
 /// The evaluation of each `(polynomial, point)` of `jobs`, in order: the
 /// values of [`crate::utils::arithmetic::eval_polynomial`].
 pub(crate) fn eval_many<F: Field>(jobs: &[(&[F], F)]) -> Vec<F> {
@@ -151,6 +175,8 @@ pub(crate) fn poly_inner_product<F: Field>(
     polys: &[&Polynomial<F, Coeff>],
     scalars: impl IntoIterator<Item = F>,
 ) -> Polynomial<F, Coeff> {
+    #[cfg(test)]
+    reached::hit(&reached::POLY_INNER_PRODUCT);
     let scalars: Vec<F> = scalars.into_iter().take(polys.len()).collect();
     let max_len = polys.iter().map(|p| p.len()).max().unwrap_or(0);
     let mut values: Vec<F> = (0..max_len).into_par_iter().map(|_| F::ZERO).collect();
@@ -207,7 +233,13 @@ pub(crate) fn divide_by_roots<F: Field>(poly: &[F], roots: &[F]) -> Vec<F> {
     // The history a block needs: its rows read up to `lags` rows above it.
     let lags = terms.iter().map(|(lag, _)| *lag).max().unwrap_or(0);
 
-    assert!(lags <= DIV_BLOCK, "more roots than rows in a block");
+    // A history longer than a block would reach past the block above: the
+    // stock division handles any number of roots, so it divides those.
+    if lags > DIV_BLOCK {
+        return crate::utils::arithmetic::divide_by_roots_seq(poly, roots);
+    }
+    #[cfg(test)]
+    reached::hit(&reached::DIVIDE_BY_ROOTS);
 
     // The input of row `p` (from the top): `a_{k+d}` with `k = m - 1 - p`.
     let input = |p: usize| poly[m - 1 - p + degree];
@@ -317,6 +349,8 @@ pub(crate) fn kate_division<F: Field>(a: &[F], b: F) -> Vec<F> {
     if a.len() < PAR_MIN_LEN {
         return crate::utils::arithmetic::kate_division(a, b);
     }
+    #[cfg(test)]
+    reached::hit(&reached::KATE_DIVISION);
     divide_by_roots(a, &[b])
 }
 
@@ -530,6 +564,41 @@ mod tests {
                 divide_by_roots(&poly, &roots),
                 stock_divide_by_roots(&poly, &roots)
             );
+        }
+    }
+
+    /// More roots than rows in a block (the history of a block would reach
+    /// past the block above): the stock division, at any length. The
+    /// roots are the `2^13`-th roots of `x^(2^13)` and one more root `y`,
+    /// so the product `(X^(2^13) - x^(2^13)) (X - y)` has four terms, the
+    /// lowest at lag `DIV_BLOCK + 1`.
+    #[test]
+    fn divide_by_roots_more_roots_than_a_block() {
+        let mut rng = ChaCha20Rng::seed_from_u64(0x3f);
+        let x = Fq::random(&mut rng);
+        let y = Fq::random(&mut rng);
+        let omega = Fq::ROOT_OF_UNITY.pow_vartime([1u64 << (Fq::S - 13)]);
+        assert_eq!(DIV_BLOCK, 1 << 13);
+        let mut roots: Vec<Fq> =
+            std::iter::successors(Some(x), |r| Some(*r * omega)).take(DIV_BLOCK).collect();
+        roots.push(y);
+        assert_eq!(roots.len(), DIV_BLOCK + 1);
+        for n in [DIV_BLOCK + 1 + 5, PAR_MIN_LEN + 3] {
+            let poly = random_poly(&mut rng, n);
+            let stock = stock_divide_by_roots(&poly, &roots);
+            assert_eq!(stock.len(), n - roots.len());
+            assert_eq!(
+                in_pool(4, || divide_by_roots(&poly, &roots)),
+                stock,
+                "n {n}"
+            );
+            if n >= PAR_MIN_LEN {
+                // the crate function dispatches here at this length
+                assert_eq!(
+                    crate::utils::arithmetic::divide_by_roots(&poly, &roots),
+                    stock
+                );
+            }
         }
     }
 

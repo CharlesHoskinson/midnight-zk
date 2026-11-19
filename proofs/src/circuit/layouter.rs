@@ -311,3 +311,74 @@ impl<F: Field> RegionLayouter<F> for RegionShape {
         Ok(())
     }
 }
+
+/// With the feature `prover-par`: one region of a layout measured during a
+/// synthesis (`crate::par::layout`), in synthesis order. Besides the start
+/// of the region it holds what determines that start in the shape pass of
+/// [`SimpleFloorPlanner`](super::SimpleFloorPlanner): the columns and the
+/// row count of the region, and the number of global constants it assigns
+/// (they advance the first free row of the constants column).
+#[cfg(feature = "prover-par")]
+#[doc(hidden)]
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct MeasuredRegion {
+    pub(crate) start: super::RegionStart,
+    /// The index of the region's columns in
+    /// [`MeasuredLayout::column_sets`].
+    pub(crate) columns: usize,
+    pub(crate) row_count: usize,
+    pub(crate) constants: usize,
+}
+
+/// With the feature `prover-par`: the regions of a synthesis, in synthesis
+/// order (see [`MeasuredRegion`]). The column sets of the regions are kept
+/// once each: the regions of a circuit mostly repeat a few sets.
+#[cfg(feature = "prover-par")]
+#[doc(hidden)]
+#[derive(Clone, Debug, Default, PartialEq, Eq)]
+pub struct MeasuredLayout {
+    /// The distinct column sets of the regions, each sorted.
+    pub(crate) column_sets: Vec<Vec<RegionColumn>>,
+    pub(crate) regions: Vec<MeasuredRegion>,
+}
+
+#[cfg(feature = "prover-par")]
+impl MeasuredLayout {
+    /// The region starts, in synthesis order.
+    #[cfg(test)]
+    pub(crate) fn starts(&self) -> Vec<super::RegionStart> {
+        self.regions.iter().map(|r| r.start).collect()
+    }
+
+    /// Whether `region` has the columns, the row count and the number of
+    /// constants of `measured`.
+    pub(crate) fn matches(
+        &self,
+        region: &MeasuredRegion,
+        measured: &RegionShape,
+        constants: usize,
+    ) -> bool {
+        let Some(columns) = self.column_sets.get(region.columns) else {
+            return false;
+        };
+        region.row_count == measured.row_count
+            && region.constants == constants
+            && columns.len() == measured.columns.len()
+            && columns.iter().all(|c| measured.columns.contains(c))
+    }
+}
+
+#[cfg(feature = "prover-par")]
+impl RegionShape {
+    /// The columns of the shape, sorted.
+    pub(crate) fn sorted_columns(&self) -> Vec<RegionColumn> {
+        let mut columns: Vec<RegionColumn> = self.columns.iter().copied().collect();
+        columns.sort();
+        columns
+    }
+
+    /// Whether `other` has the same columns and row count.
+    pub(crate) fn same_shape(&self, other: &RegionShape) -> bool {
+        self.row_count == other.row_count && self.columns == other.columns
+    }
+}

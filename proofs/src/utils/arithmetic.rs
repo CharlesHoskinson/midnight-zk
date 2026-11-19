@@ -172,6 +172,13 @@ pub fn divide_by_roots<F: Field>(poly: &[F], roots: &[F]) -> Vec<F> {
     if poly.len() >= crate::par::open::PAR_MIN_LEN {
         return crate::par::open::divide_by_roots(poly, roots);
     }
+    divide_by_roots_seq(poly, roots)
+}
+
+/// The body of [`divide_by_roots`], on the calling thread: the stock code.
+/// With the feature `prover-par` it is also the fallback of
+/// `crate::par::open::divide_by_roots` for more roots than it handles.
+pub(crate) fn divide_by_roots_seq<F: Field>(poly: &[F], roots: &[F]) -> Vec<F> {
     let mut vanishing = vec![F::ONE];
     for root in roots {
         let mut next = vec![F::ZERO; vanishing.len() + 1];

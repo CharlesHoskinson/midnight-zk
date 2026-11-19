@@ -357,10 +357,11 @@ pub struct ProvingKey<F: PrimeField, PCS: PolynomialCommitmentScheme<F>> {
     /// in that case the prover falls back to running the shape pass itself.
     pub(crate) region_starts: Option<Vec<crate::circuit::RegionStart>>,
     /// With the feature `prover-par`: when `region_starts` is `None` (a key
-    /// read from bytes), the layout captured by the first proof made with
-    /// this key, reused by the proofs after it; see `crate::par::layout`.
+    /// read from bytes), the layout measured by the first proof made with
+    /// this key, which the proofs after it reuse when their circuit matches
+    /// it; see `crate::par::layout`.
     #[cfg(feature = "prover-par")]
-    pub(crate) region_starts_cache: std::sync::OnceLock<Vec<crate::circuit::RegionStart>>,
+    pub(crate) region_starts_cache: std::sync::OnceLock<crate::circuit::layouter::MeasuredLayout>,
 }
 
 /// The fixed polynomials of a proving key, derived from `fixed_values`, the

@@ -40,45 +40,128 @@ use std::{
 
 use ff::PrimeField;
 
-/// From this many bytes on, [`zero_bytes`] spreads the zeroing over the
-/// threads of the current rayon pool.
+/// From this many bytes on, [`zero_bytes`] spreads the zeroing over
+/// several threads, each taking at least this many bytes.
 const PAR_ZERO_BYTES: usize = 1 << 20;
 
-/// Bytes per zeroing task.
+/// The parts of the range are cut at multiples of this many bytes.
 const ZERO_TASK_BYTES: usize = 1 << 18;
+
+/// The most threads [`zero_bytes`] zeroes a range with (the calling thread
+/// included): the zeroing is bound by memory bandwidth, which a few cores
+/// saturate.
+const MAX_ZERO_THREADS: usize = 8;
+
+/// A pointer into the range of a [`zero_bytes`] call, sent to the threads
+/// that zero its parts. The pointer keeps its provenance (it is never cast
+/// to an integer and back).
+#[derive(Clone, Copy)]
+struct SendPtr(*mut u8);
+
+// SAFETY: a `SendPtr` is only sent to the scoped threads of one
+// `zero_bytes` call, which write disjoint parts of a range the caller
+// guarantees writable and are joined before the call returns.
+unsafe impl Send for SendPtr {}
 
 /// Zeroes `bytes` bytes at `ptr` with volatile writes that the compiler
 /// cannot remove.
 ///
 /// The writes are 8-byte words where the address is aligned (single bytes
-/// at the unaligned ends), and a range of at least [`PAR_ZERO_BYTES`] is cut
-/// into tasks run on the threads of the current rayon pool. Every write is
-/// volatile and followed by a compiler fence on its thread, and this
-/// function returns only once every task has finished (the join of the
-/// pool orders their writes before the return), so the whole range is
-/// zero when it returns, as with one thread.
+/// at the unaligned ends). A range of at least [`PAR_ZERO_BYTES`] is cut
+/// into contiguous parts, one per thread, of at least [`PAR_ZERO_BYTES`]
+/// each, cut at multiples of [`ZERO_TASK_BYTES`]; the calling thread zeroes
+/// the first part and threads of its own (scoped OS threads, at most
+/// [`MAX_ZERO_THREADS`] in all, never the rayon pool) zero the others. Every
+/// write is volatile and followed by a compiler fence on its thread, and
+/// this function returns only once every thread has been joined (the join
+/// orders their writes before the return), so the whole range is zero when
+/// it returns, as with one thread. A part whose thread cannot be spawned is
+/// zeroed on the calling thread; no part is skipped and nothing panics.
+///
+/// The parallel zeroing does not use the rayon pool: this runs in `Drop`,
+/// where the dropping thread may hold a lock. Waiting on pool tasks would
+/// let the dropping thread, a pool worker, run other pending pool tasks
+/// (work stealing) that may take the same lock, and would let the zeroing
+/// wait for workers that are themselves blocked on that lock. The threads
+/// here run only the zeroing and take no lock.
 ///
 /// # Safety
 /// `ptr` must be valid for writes of `bytes` bytes.
 pub(crate) unsafe fn zero_bytes(ptr: *mut u8, bytes: usize) {
-    if bytes >= PAR_ZERO_BYTES {
-        use rayon::iter::{IntoParallelIterator, ParallelIterator};
-        // The address crosses threads as an integer: each task writes only
-        // its own disjoint part of the range.
-        let addr = ptr as usize;
-        (0..bytes.div_ceil(ZERO_TASK_BYTES)).into_par_iter().for_each(|task| {
-            let start = task * ZERO_TASK_BYTES;
-            let len = ZERO_TASK_BYTES.min(bytes - start);
-            // SAFETY: `start + len <= bytes`, so the part lies within the
-            // range the caller guarantees writable, and no other task
-            // writes it.
-            unsafe { zero_bytes_here((addr + start) as *mut u8, len) };
+    let threads = zero_threads(bytes);
+    if threads > 1 {
+        // `threads` parts of `per_thread` bytes (the last one shorter),
+        // each a multiple of `ZERO_TASK_BYTES` but the last.
+        let per_thread = bytes.div_ceil(threads).div_ceil(ZERO_TASK_BYTES) * ZERO_TASK_BYTES;
+        let base = SendPtr(ptr);
+        std::thread::scope(|scope| {
+            let mut own = Vec::new();
+            for part in 1..threads {
+                let start = part * per_thread;
+                if start >= bytes {
+                    break;
+                }
+                let len = per_thread.min(bytes - start);
+                let spawned = spawn_allowed()
+                    && std::thread::Builder::new()
+                        .name("zero-bytes".into())
+                        .stack_size(64 << 10)
+                        .spawn_scoped(scope, move || {
+                            let base = base;
+                            // SAFETY: `start + len <= bytes`, so the part
+                            // lies within the range the caller guarantees
+                            // writable, and no other thread writes it.
+                            unsafe { zero_bytes_here(base.0.add(start), len) };
+                        })
+                        .is_ok();
+                if !spawned {
+                    own.push((start, len));
+                }
+            }
+            // SAFETY: `per_thread.min(bytes)` bytes from the start of the
+            // range, written by no other thread.
+            unsafe { zero_bytes_here(ptr, per_thread.min(bytes)) };
+            for (start, len) in own {
+                // SAFETY: a part within the range whose thread was not
+                // spawned, written by no other thread.
+                unsafe { zero_bytes_here(ptr.add(start), len) };
+            }
+            // The scope joins every spawned thread here.
         });
     } else {
         // SAFETY: as guaranteed by the caller.
         unsafe { zero_bytes_here(ptr, bytes) };
     }
     compiler_fence(Ordering::SeqCst);
+}
+
+/// The number of threads (the calling one included) that zero `bytes`
+/// bytes: one per [`PAR_ZERO_BYTES`], at most the available parallelism
+/// and [`MAX_ZERO_THREADS`].
+fn zero_threads(bytes: usize) -> usize {
+    if bytes < PAR_ZERO_BYTES {
+        return 1;
+    }
+    static AVAILABLE: std::sync::OnceLock<usize> = std::sync::OnceLock::new();
+    let available =
+        *AVAILABLE.get_or_init(|| std::thread::available_parallelism().map_or(1, |n| n.get()));
+    (bytes / PAR_ZERO_BYTES).clamp(1, available.min(MAX_ZERO_THREADS))
+}
+
+#[cfg(test)]
+thread_local! {
+    /// Tests only: when set, [`zero_bytes`] behaves as if no thread could
+    /// be spawned.
+    static NO_SPAWN: std::cell::Cell<bool> = const { std::cell::Cell::new(false) };
+}
+
+/// Whether [`zero_bytes`] may spawn its threads (always, but in tests that
+/// simulate a failed spawn).
+fn spawn_allowed() -> bool {
+    #[cfg(test)]
+    return !NO_SPAWN.with(|n| n.get());
+    #[cfg(not(test))]
+    true
 }
 
 /// [`zero_bytes`] on the calling thread.
@@ -485,6 +568,54 @@ mod tests {
                 }
             }
         }
+    }
+
+    /// When no thread can be spawned, the calling thread zeroes every part.
+    #[test]
+    fn zero_bytes_without_threads() {
+        for bytes in [
+            super::PAR_ZERO_BYTES,
+            2 * super::PAR_ZERO_BYTES + 3,
+            9 * super::PAR_ZERO_BYTES + super::ZERO_TASK_BYTES + 7,
+        ] {
+            let mut buf = vec![0xffu8; bytes + 2];
+            super::NO_SPAWN.with(|n| n.set(true));
+            // SAFETY: `1 + bytes <= buf.len()`.
+            unsafe { zero_bytes(buf.as_mut_ptr().add(1), bytes) };
+            super::NO_SPAWN.with(|n| n.set(false));
+            assert_eq!(buf[0], 0xff);
+            assert_eq!(buf[bytes + 1], 0xff);
+            assert!(buf[1..=bytes].iter().all(|b| *b == 0), "bytes {bytes}");
+        }
+    }
+
+    /// An erasure from a pool worker that holds a lock, with a task of the
+    /// same pool that takes that lock queued behind it, completes, and the
+    /// task runs once the lock is released. (Whether an erasure on the pool
+    /// would run the task while waiting depends on scheduling, so this
+    /// exercises the case rather than proving its absence; the erasure takes
+    /// no pool thread by construction, see `zero_bytes`.)
+    #[test]
+    fn zero_bytes_under_a_lock_does_not_run_pool_tasks() {
+        use std::sync::{Mutex, mpsc};
+
+        static LOCK: Mutex<()> = Mutex::new(());
+        let bytes = 4 * super::PAR_ZERO_BYTES + 5;
+        let mut buf = vec![0xffu8; bytes];
+        let (done_tx, done_rx) = mpsc::channel();
+        let pool = rayon::ThreadPoolBuilder::new().num_threads(1).build().unwrap();
+        pool.install(|| {
+            let guard = LOCK.lock().unwrap();
+            rayon::spawn(move || {
+                let _guard = LOCK.lock().unwrap();
+                done_tx.send(()).unwrap();
+            });
+            // SAFETY: the whole buffer.
+            unsafe { zero_bytes(buf.as_mut_ptr(), bytes) };
+            drop(guard);
+        });
+        done_rx.recv().unwrap();
+        assert!(buf.iter().all(|b| *b == 0));
     }
 
     /// From inside a pool of one thread too (no other worker to run the
