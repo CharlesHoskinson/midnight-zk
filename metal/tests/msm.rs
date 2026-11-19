@@ -17,7 +17,8 @@
 //!
 //! The differential runs sizes `2^14 ..= 2^20` in a release build (`cargo
 //! test --release`) and `2^14 ..= 2^16` in a debug build, where the CPU
-//! reference and the point generation are slow. The measurements are
+//! reference and the point generation are slow; a release build also runs
+//! one `2^23` MSM (several command buffers). The measurements are
 //! `#[ignore]`d: `cargo test --release --test msm -- --ignored --nocapture`.
 
 #![cfg(target_os = "macos")]
@@ -430,13 +431,42 @@ fn msm_matches_cpu() {
     );
 }
 
+/// One size above the measured table, where the command-buffer bound splits
+/// the MSM into five chunks: once, in a release build only (the CPU
+/// reference and the 2^23 points are slow in a debug build).
+#[test]
+fn msm_above_the_table_matches_cpu() {
+    let _g = serial();
+    if cfg!(debug_assertions) {
+        eprintln!("skipped in a debug build");
+        return;
+    }
+    require_device();
+    assert!(midnight_metal::set_min_k(14));
+    let n = 1usize << 23;
+    let bases = random_points(n, 23);
+    let t = Instant::now();
+    check("2^23 random", &random_scalars(n, 23), &bases);
+    eprintln!("2^23: {:.1?}", t.elapsed());
+}
+
 #[test]
 fn msm_odd_lengths() {
     let _g = serial();
     require_device();
     assert!(midnight_metal::set_min_k(0));
     let all = points_cache();
-    for n in [1usize, 2, 31, 33, 193, 1000, (1 << 14) + 5, 3 << 14, (1 << 18) + 5] {
+    for n in [
+        1usize,
+        2,
+        31,
+        33,
+        193,
+        1000,
+        (1 << 14) + 5,
+        3 << 14,
+        (1 << 18) + 5,
+    ] {
         let s = random_scalars(n, n as u64);
         check("odd length", &s, &all[..n]);
     }

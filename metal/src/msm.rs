@@ -27,11 +27,11 @@
 //!
 //! # Algorithm
 //!
-//! For `n` points, `wbits` is sppark's choice (`lg2(1.5 n) - 8`, clamped to
-//! `[10, 18]`), with `nwins = ceil(255 / wbits)` windows and `2^(wbits-1)`
-//! buckets per window (signed digits). sppark's batch count splits the
-//! points into `batch` chunks of `stride` points; each chunk is one command
-//! buffer:
+//! For `n` points, the window width `wbits` and the chunk count come from a
+//! table measured on this hardware (`MEASURED`, see `plan`), with `nwins =
+//! ceil(255 / wbits)` windows and `2^(wbits-1)` buckets per window (signed
+//! digits). The points are split into `batch` chunks of `stride` points;
+//! each chunk is one command buffer:
 //!
 //! 1. `msm_digits` (sppark `breakdown`): each scalar out of Montgomery form,
 //!    made "positive" (`abs`), Booth-encoded into `nwins` signed digits.
@@ -94,11 +94,15 @@
 //!   give the same points).
 //! - The host sums are Jacobian (`blst_p1`), each XYZZ record converted as
 //!   `(X ZZ, Y ZZZ, ZZ)`; sppark's host code adds in XYZZ and Jacobian.
-//! - The window size follows the MSM length on both paths; sppark's cached
-//!   context takes it from the table length.
-//! - The chunk count is at least `n * nwins / CHUNK_ADDS`, so that one
-//!   command buffer stays near 0.5 s of GPU time (from `2^23` points; up to
-//!   `2^22` sppark's count is unchanged).
+//! - The plan (window width and chunk count) is a table measured on Apple
+//!   M4 Max (`MEASURED`) instead of sppark's formula (`lg2(1.5 n) - 8`
+//!   clamped to `[10, 18]`, and `2^(lg2(1.5 n) - wbits) / 64` chunks), which
+//!   gives too few bucket threads to fill this GPU. It follows the MSM
+//!   length on both paths (sppark's cached context takes it from the table
+//!   length).
+//! - A chunk holds at most `CHUNK_ADDS / nwins` points, so that one command
+//!   buffer stays near or below 0.5 s of GPU time (sppark has no such
+//!   bound).
 //! - The mask is added on the device in `msm_digits` (each element computed
 //!   from its index); the CUDA crate builds `r` and `s + r` on the host.
 //! - Every chunk's buffers are per-request scratch (zeroed and released by
@@ -155,7 +159,8 @@ const MODE_MASKED: u32 = 1;
 const MODE_MASK: u32 = 2;
 
 // ---------------------------------------------------------------------------
-// The plan of one MSM (sppark `msm_t` constructor and `invoke`).
+// The plan of one MSM (sppark's `msm_t` constructor and `invoke` choose it
+// by formula; here a measured table).
 
 #[derive(Clone, Copy, Debug)]
 struct Plan {
@@ -184,24 +189,62 @@ const fn lg2(mut n: usize) -> u32 {
     r
 }
 
+/// The plan table: `(log2 n, wbits, chunks before the command-buffer
+/// bound)`.
+///
+/// Measured on Apple M4 Max (40-core GPU, 128 GB, macOS), 2026-11-18, release
+/// build: the registered-table path (one MSM pass) over random scalars and
+/// random points, for `wbits` in 10..=16 (sizes up to 2^18) or 12..=17
+/// (2^19 to 2^22) and chunk counts {1, 2, 4} (more where the command-buffer
+/// bound applies), each configuration
+/// checked against `msm_pippenger` and timed as the minimum of 4 calls,
+/// sizes with close candidates repeated two or three times and the minimum
+/// over the runs taken; the one-shot path was timed on the leading
+/// candidates and agreed. Other processes shared the machine. Minimum wall
+/// time per call (ms), best and runner-up:
+///
+/// | n    | best (wbits, chunks) | ms    | runner-up | ms    | sppark (wbits, chunks) |
+/// |------|----------------------|-------|-----------|-------|------------------------|
+/// | 2^14 | 11, 1                | 6.75  | 10, 1     | 7.34  | 10, 1                  |
+/// | 2^15 | 11, 1                | 9.57  | 12, 1     | 9.10* | 10, 1                  |
+/// | 2^16 | 13, 1                | 13.57 | 12, 1     | 14.12 | 10, 1                  |
+/// | 2^17 | 13, 1                | 21.47 | 12, 1     | 23.13 | 10, 2                  |
+/// | 2^18 | 13, 1                | 34.13 | 12, 1     | 39.15 | 10, 4                  |
+/// | 2^19 | 13, 1                | 57.92 | 14, 1     | 62.55 | 11, 4                  |
+/// | 2^20 | 13, 1                | 105.3 | 15, 1     | 108.6 | 12, 4                  |
+/// | 2^21 | 16, 1                | 204.0 | 13, 1     | 212.5 | 13, 4                  |
+/// | 2^22 | 14, 1 (3: the bound) | 412.5 | 13, 4     | 417.2 | 14, 4                  |
+///
+/// (*) At 2^15 one table run favoured 12 by 0.5 ms and the other two runs
+/// and the one-shot path favoured 11; 11 is kept.
+///
+/// Outside the table: below `2^14` the `2^14` entry; from `2^23` the
+/// `2^22` entry, where the command-buffer bound makes every chunk at most
+/// `CHUNK_ADDS / nwins` points, the chunk size measured at `2^22`. A length
+/// that is not a power of two takes the entry of its floor log2.
+const MEASURED: [(u32, u32, usize); 9] = [
+    (14, 11, 1),
+    (15, 11, 1),
+    (16, 13, 1),
+    (17, 13, 1),
+    (18, 13, 1),
+    (19, 13, 1),
+    (20, 13, 1),
+    (21, 16, 1),
+    (22, 14, 1),
+];
+
+/// `(wbits, chunks)` of `MEASURED` for `n` points.
+fn measured(n: usize) -> (u32, usize) {
+    let (lo, hi) = (MEASURED[0].0, MEASURED[MEASURED.len() - 1].0);
+    let k = lg2(n).clamp(lo, hi);
+    let e = MEASURED[(k - lo) as usize];
+    (e.1, e.2)
+}
+
 fn plan(n: usize) -> Plan {
-    // msm_t::msm_t
-    let npoints = (n + 31) & !31;
-    let mut wbits: u32 = 17;
-    if npoints > 192 {
-        wbits = (lg2(npoints + npoints / 2) - 8).min(18);
-        if wbits < 10 {
-            wbits = 10;
-        }
-    } else if npoints > 0 {
-        wbits = 10;
-    }
+    let (wbits, batch) = measured(n);
     let nwins = (NBITS - 1) / wbits + 1;
-    // msm_t::invoke
-    let lg_npoints = lg2(n + n / 2);
-    let mut batch = 1usize << (lg_npoints.max(wbits) - wbits);
-    batch >>= 6;
-    let batch = batch.max(1);
     // the time budget of one command buffer: at most CHUNK_ADDS bucket
     // additions per chunk (this port; sppark has no such bound)
     let max_stride = (CHUNK_ADDS / nwins as usize) & !31;
@@ -1090,29 +1133,45 @@ mod tests {
     use super::*;
 
     #[test]
-    fn plan_follows_sppark() {
+    fn plan_follows_measured_table() {
+        // (log2 n, wbits, nwins, chunks after the command-buffer bound)
         for (k, wbits, nwins, batch) in [
-            (14, 10, 26, 1),
-            (16, 10, 26, 1),
-            (17, 10, 26, 2),
-            (18, 10, 26, 4),
-            (20, 12, 22, 4),
-            (22, 14, 19, 4),
+            (14, 11, 24, 1),
+            (15, 11, 24, 1),
+            (16, 13, 20, 1),
+            (17, 13, 20, 1),
+            (18, 13, 20, 1),
+            (19, 13, 20, 1),
+            (20, 13, 20, 1),
+            (21, 16, 16, 1),
+            (22, 14, 19, 3),
         ] {
             let p = plan(1 << k);
             assert_eq!((p.wbits, p.nwins, p.batch), (wbits, nwins, batch), "2^{k}");
             assert_eq!(p.top, NBITS - wbits * (nwins - 1));
-            assert_eq!(p.stride * p.batch, 1 << k);
+            assert!(p.stride * p.batch >= 1 << k, "2^{k}");
         }
-        // above 2^22 the command-buffer bound adds chunks
-        for k in 14..=crate::MAX_MSM_LOG {
-            let p = plan(1 << k);
-            assert!(p.stride * p.nwins as usize <= CHUNK_ADDS, "2^{k}");
-            assert!(
-                p.stride * p.batch >= 1 << k && p.stride.is_multiple_of(32),
-                "2^{k}"
-            );
+        // outside the table: the end entries; a non-power of two: its floor
+        assert_eq!(plan(1).wbits, 11);
+        assert_eq!(plan(1000).wbits, 11);
+        assert_eq!(plan((1 << 21) - 1).wbits, 13);
+        assert_eq!(plan((1 << 21) + 5).wbits, 16);
+        // the command-buffer bound up to 2^28
+        for k in 0..=crate::MAX_MSM_LOG {
+            for n in [1usize << k, (1usize << k) + 33] {
+                let p = plan(n);
+                assert!(p.stride * p.nwins as usize <= CHUNK_ADDS, "{n}");
+                assert!(
+                    p.stride * p.batch >= n && p.stride * (p.batch - 1) < n,
+                    "{n}"
+                );
+                assert!(p.stride.is_multiple_of(32), "{n}");
+                if k >= 22 {
+                    assert_eq!(p.wbits, 14, "{n}");
+                }
+            }
         }
-        assert_eq!(plan(1 << 24).batch, 8);
+        assert_eq!(plan(1 << 23).batch, 5);
+        assert_eq!(plan(1 << 28).batch, 153);
     }
 }
