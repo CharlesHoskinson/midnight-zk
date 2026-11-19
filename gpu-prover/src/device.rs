@@ -128,6 +128,12 @@ pub struct DeviceInfo {
     pub driver_version: String,
     /// Total device memory, bytes.
     pub total_bytes: u64,
+    /// The log2 size from which each kernel class goes to the device, by
+    /// class, when the device layer has per-class thresholds (the Metal
+    /// device: `fft`, `ifft`, `msm-table`, `msm-one-shot`, `quotient-ext`);
+    /// empty otherwise.
+    #[serde(skip_serializing_if = "BTreeMap::is_empty")]
+    pub size_thresholds: BTreeMap<String, u32>,
 }
 
 /// Free and total device memory, bytes.
@@ -660,6 +666,7 @@ mod cuda {
                 runtime_version: version(i.runtime_version),
                 driver_version: version(i.driver_version),
                 total_bytes: i.total_bytes,
+                size_thresholds: BTreeMap::new(),
             })
         }
 

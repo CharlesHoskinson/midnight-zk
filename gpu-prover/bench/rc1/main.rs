@@ -178,7 +178,7 @@ fn run(chain: &Chain, smoke: bool) -> Result<()> {
         batch.proofs.push(hex::encode(proof));
         rows.push((prove_s, metrics));
     }
-    // the CUDA handles release their registrations here; the Metal handle is empty
+    // the device handles release their registrations here
     #[cfg(rc1_device)]
     #[allow(clippy::drop_non_drop)]
     drop(handles);

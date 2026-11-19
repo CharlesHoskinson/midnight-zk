@@ -17,7 +17,8 @@
 //! # Entry points
 //!
 //! [`crate::fft`] / [`crate::ifft`] have admitted the call (`a.len() ==
-//! 2^log_n`, `1 <= log_n <= MAX_LOG_N`, `log_n >= min_k`, a usable device,
+//! 2^log_n`, `1 <= log_n <= MAX_LOG_N`, `log_n` at least the class's
+//! threshold of [`crate::thresholds`], a usable device,
 //! `a`, `omega` and the divisor reduced) before they call [`fft`] /
 //! [`ifft`]. Those take only the standard `2^log_n`-th root of unity of `Fr`
 //! (`ROOT_OF_UNITY` squared `32 - log_n` times, as `EvaluationDomain`

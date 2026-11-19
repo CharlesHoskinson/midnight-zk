@@ -53,7 +53,7 @@ impl Class {
 pub(crate) enum Reason {
     /// Stub build, no usable device, or `MIDNIGHT_METAL=off`.
     NoDevice,
-    /// The size is below `2^min_k`.
+    /// The size is below the class's threshold (`crate::thresholds`).
     BelowMinK,
     /// A length, root, job layout or version the device does not take.
     Shape,
@@ -64,8 +64,6 @@ pub(crate) enum Reason {
     Memory,
     /// A pipeline, encoder or command buffer failed.
     DeviceError,
-    /// The kernel is not written yet.
-    NotImplemented,
 }
 
 impl Reason {
@@ -77,7 +75,6 @@ impl Reason {
             Reason::Unreduced => "unreduced",
             Reason::Memory => "memory",
             Reason::DeviceError => "device-error",
-            Reason::NotImplemented => "not-implemented",
         }
     }
 

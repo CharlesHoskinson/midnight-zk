@@ -114,7 +114,10 @@ pub mod device {
     use midnight_metal as metal;
     use midnight_proofs::{
         gpu::{self as hooks, adapter},
-        poly::{Coeff, LagrangeCoeff, kzg::params::ParamsKZG},
+        poly::{
+            Coeff, LagrangeCoeff, LagrangeDeltaCoeff, LagrangeDoubleDeltaCoeff,
+            kzg::params::ParamsKZG,
+        },
     };
 
     use super::Metrics;
@@ -127,17 +130,41 @@ pub mod device {
         Ok((info.name.clone(), info.recommended_max_working_set))
     }
 
-    /// The SRS registrations, dropped when the benchmark ends (the CUDA
-    /// `install` also returns a key registration; `midnight-metal` has none).
-    pub struct Handles(#[allow(dead_code)] [metal::SrsHandle; 2]);
+    /// The SRS and proving-key registrations, dropped when the benchmark
+    /// ends.
+    pub struct Handles(
+        #[allow(dead_code)] [metal::SrsHandle; 4],
+        #[allow(dead_code)] metal::KeyHandle,
+    );
 
-    /// Registers the SRS bases and installs the hooks.
-    pub fn install(params: &ParamsKZG<Bls12>, _pk: &Key) -> Result<Handles> {
+    /// Registers the SRS bases and the proving key's resident polynomials,
+    /// and installs the hooks. The KZG prover commits from four SRS vectors
+    /// (the CUDA `install` registers the first two): the delta bases (phase
+    /// 1: the advice columns) and the double-delta bases (phase 2: the
+    /// permutation products) as well, so every commitment finds its table.
+    pub fn install(params: &ParamsKZG<Bls12>, pk: &Key) -> Result<Handles> {
         if !metal::device() {
             return Err("Metal device unavailable".into());
         }
-        let srs = [params.bases::<Coeff>(), params.bases::<LagrangeCoeff>()]
-            .map(|p| metal::register_srs(adapter::affine(p)));
+        let srs = [
+            params.bases::<Coeff>(),
+            params.bases::<LagrangeCoeff>(),
+            params.bases::<LagrangeDeltaCoeff>(),
+            params.bases::<LagrangeDoubleDeltaCoeff>(),
+        ]
+        .map(|p| metal::register_srs(adapter::affine(p)));
+        let polys = pk.gpu_resident_polys().ok_or("unsupported quotient shape")?;
+        let key =
+            metal::register_key(&polys.iter().map(|p| adapter::scalars(p)).collect::<Vec<_>>());
+        eprintln!(
+            "metal size thresholds (log2): {:?}{}",
+            metal::thresholds().named(),
+            if metal::thresholds().explicit {
+                " (explicit)"
+            } else {
+                " (measured defaults)"
+            }
+        );
         if !hooks::install(hooks::GpuHooks {
             msm_g1: Some(metal::msm_g1),
             fft: Some(metal::fft),
@@ -146,29 +173,35 @@ pub mod device {
         }) {
             return Err("hooks already installed".into());
         }
-        Ok(Handles(srs))
+        Ok(Handles(srs, key))
     }
 
-    pub struct Baseline;
+    /// `msm_counts` when the proof started.
+    pub struct Baseline((u64, u64, u64));
 
     pub fn begin() -> Baseline {
         metal::begin_request();
         metal::reset_stats();
         hooks::reset_hook_declines();
-        Baseline
+        Baseline(metal::msm_counts())
     }
 
     /// The counters of one proof. Unified memory has no host-device copies, so
     /// the transfer and staging counters are 0.
-    pub fn finish(_before: Baseline) -> Result<Metrics> {
+    pub fn finish(before: Baseline) -> Result<Metrics> {
         let stats = metal::stats();
         let hook_declines = hooks::hook_declines();
         let declines = metal::declines();
         let peak_bytes = metal::device_bytes().1;
         let (cached, one_shot, uploads) = metal::msm_counts();
+        let (c0, o0, u0) = before.0;
         eprintln!(
-            "metal msm_counts (since process start): table {cached}, one-shot {one_shot}, \
-             uploads {uploads}; stale {}",
+            "metal msm_counts of the proof: table {}, one-shot {}, uploads {}; since process \
+             start: table {cached}, one-shot {one_shot}, uploads {uploads}; stale {}; declines \
+             {declines:?}",
+            cached - c0,
+            one_shot - o0,
+            uploads - u0,
             metal::srs_stale()
         );
         if !metal::end_request() {

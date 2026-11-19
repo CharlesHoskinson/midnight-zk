@@ -21,9 +21,12 @@
 //! curve formulas in `shaders/include/g1.h`.
 //!
 //! [`crate::msm_g1`] has admitted the call (equal non-zero lengths up to
-//! `2^MAX_MSM_LOG`, at least `2^min_k`, a usable device, every scalar
-//! reduced) before it calls [`msm_g1`]. That function ends with exactly one
-//! of `account::served` or `account::decline`.
+//! `2^MAX_MSM_LOG`, at least `2^msm_table` of [`crate::thresholds`], and at
+//! least `2^msm_one_shot` unless a registered table serves the bases, a
+//! usable device, every scalar reduced) before it calls [`msm_g1`]. That
+//! function ends with exactly one of `account::served` or `account::decline`
+//! (`below-min-k` when the table it counted on turned out stale and the call
+//! is below the one-shot threshold).
 //!
 //! # Algorithm
 //!
@@ -70,7 +73,20 @@
 //! use the caller's slice is compared with the table: every point in a
 //! debug build, eight sampled points in a release build. A slice that fails
 //! the check drops its table and takes the one-shot path. The table holds
-//! public points only; it lives until the handle is dropped.
+//! public points only; it lives until the handle is dropped
+//! ([`SrsHandle::device_bytes`] says how many bytes it holds on the device).
+//!
+//! A table serves the registered slice and its prefixes, by address: the
+//! caller has to register the very slice the prover passes. The KZG prover of
+//! `midnight-proofs` commits from four SRS vectors of `ParamsKZG`, each a
+//! prefix: `bases::<Coeff>()` (the quotient limbs, the multi-open),
+//! `bases::<LagrangeCoeff>()` (committed instances, and the fixed columns at
+//! key generation), `bases::<LagrangeDeltaCoeff>()` (the advice
+//! columns and LogUp multiplicities, phase 1) and
+//! `bases::<LagrangeDoubleDeltaCoeff>()` (permutation products, LogUp
+//! helpers and aggregators, trash, phase 2); a registrant registers all four.
+//! Every other MSM base slice of the prover (the residue bases of an
+//! interleaved commitment, a copy) takes the one-shot path.
 //!
 //! # Where the port departs from sppark
 //!
@@ -353,6 +369,19 @@ impl SrsHandle {
         self.key.1 == 0
     }
 
+    /// Bytes this table holds in device memory now: its points once the
+    /// first MSM on it uploaded them, 0 before that and after the table was
+    /// dropped as stale. The host copy of a registration that was not
+    /// uploaded yet is not counted.
+    pub fn device_bytes(&self) -> u64 {
+        tables()
+            .as_ref()
+            .and_then(|t| t.get(&self.key))
+            .filter(|e| e.id == self.id)
+            .and_then(|e| e.dev.as_ref())
+            .map_or(0, |b| b.len_bytes() as u64)
+    }
+
     /// Whether `bases` is the registered slice with the registered content
     /// (every point compared).
     pub fn verify(&self, bases: &[G1AffineLimbs]) -> bool {
@@ -434,12 +463,30 @@ fn table_for(
 // ---------------------------------------------------------------------------
 // Entry points.
 
-/// `sum scalars[i] * bases[i]`, or `None` (declined).
-pub(crate) fn msm_g1(scalars: &[Scalar], bases: &[G1AffineLimbs]) -> Option<G1JacobianLimbs> {
-    match dispatch(scalars, bases, None) {
-        Ok((r, ns)) => {
+/// Whether a registered table would serve an MSM on `bases` (the registered
+/// slice or a prefix of it, by address and length; the content is compared
+/// when the MSM runs).
+pub(crate) fn has_table(bases: &[G1AffineLimbs]) -> bool {
+    let key = (bases.as_ptr() as usize, bases.len());
+    tables().as_ref().is_some_and(|t| table_for(t, key, bases.len()).is_some())
+}
+
+/// `sum scalars[i] * bases[i]`, or `None` (declined). Without a table that
+/// serves `bases` (none registered, or the registered one no longer matches),
+/// an MSM shorter than `one_shot_min` declines `below-min-k`.
+pub(crate) fn msm_g1(
+    scalars: &[Scalar],
+    bases: &[G1AffineLimbs],
+    one_shot_min: usize,
+) -> Option<G1JacobianLimbs> {
+    match dispatch(scalars, bases, one_shot_min, None) {
+        Ok(Some((r, ns))) => {
             account::served(Class::Msm, ns);
             Some(r)
+        }
+        Ok(None) => {
+            account::decline(Class::Msm, Reason::BelowMinK);
+            None
         }
         Err(e) => {
             account::decline(Class::Msm, Reason::of(&e));
@@ -502,16 +549,19 @@ pub fn msm_g1_stages(
         return None;
     }
     let mut st = MsmStages::default();
-    let (r, _) = dispatch(scalars, bases, Some(&mut st)).ok()?;
+    let (r, _) = dispatch(scalars, bases, 0, Some(&mut st)).ok()??;
     Some((r, st))
 }
 
-/// The table or one-shot path, then the masked MSM.
+/// The table or one-shot path, then the masked MSM. `Ok(None)`: no table
+/// serves `bases` and the MSM is shorter than `one_shot_min` (no device
+/// work was done).
 fn dispatch(
     scalars: &[Scalar],
     bases: &[G1AffineLimbs],
+    one_shot_min: usize,
     mut prof: Option<&mut MsmStages>,
-) -> Result<(G1JacobianLimbs, u64), Error> {
+) -> Result<Option<(G1JacobianLimbs, u64)>, Error> {
     let n = scalars.len();
     let key = (bases.as_ptr() as usize, bases.len());
     let mut guard = tables();
@@ -539,13 +589,16 @@ fn dispatch(
                 p.table = true;
             }
             let points = dev.as_ref().unwrap();
-            return masked(&mut s, Points::Table(points), scalars, Some(masks), prof);
+            return masked(&mut s, Points::Table(points), scalars, Some(masks), prof).map(Some);
         }
     }
     drop(guard);
+    if n < one_shot_min {
+        return Ok(None);
+    }
     ONE_SHOT.fetch_add(1, Relaxed);
     let mut s = ctx::lock()?;
-    masked(&mut s, Points::Host(bases), scalars, None, prof)
+    masked(&mut s, Points::Host(bases), scalars, None, prof).map(Some)
 }
 
 enum Points<'a> {

@@ -465,10 +465,21 @@ fn errors_are_values() {
         .unwrap();
 }
 
+/// The tests that change the thresholds, hold buffers across a session or
+/// compare the byte count: one at a time.
+fn serial() -> std::sync::MutexGuard<'static, ()> {
+    static LOCK: std::sync::Mutex<()> = std::sync::Mutex::new(());
+    LOCK.lock().unwrap_or_else(|e| e.into_inner())
+}
+
 #[test]
 fn request_buffers_and_byte_accounting() {
+    let _g = serial();
     require_device();
+    assert!(crate::end_request());
     let mut s = ctx::lock().unwrap();
+    // what stays for the life of the process (the NTT twiddles once a
+    // transform ran) or of a handle
     let (before, _) = crate::device_bytes();
     {
         let b = s.scratch("test-scratch", 1 << 20).unwrap();
@@ -493,39 +504,291 @@ fn request_buffers_and_byte_accounting() {
     let s = ctx::lock().unwrap();
     assert!(s.get_scratch("test-scratch").is_none());
     assert_eq!(s.scratch_bytes(), 0);
-    assert_eq!(crate::device_bytes().0, 0);
+    assert_eq!(crate::device_bytes().0, before);
 }
 
+// --- the entry points against the stock CPU code ------------------------------
+
+mod stock {
+    use ff::{Field, PrimeField};
+    use group::{Curve, Group};
+    use midnight_curves::{
+        Fq, G1Affine, G1Projective,
+        fft::{best_fft_with_twiddles, compute_twiddles},
+    };
+    use rand_chacha::ChaCha20Rng;
+    use rand_core::SeedableRng;
+
+    /// The standard `2^log_n`-th root of unity (as `EvaluationDomain`
+    /// derives it).
+    pub fn root(log_n: u32) -> Fq {
+        let mut w = Fq::ROOT_OF_UNITY;
+        for _ in log_n..Fq::S {
+            w = w.square();
+        }
+        w
+    }
+
+    pub fn scalars(n: usize, seed: u64) -> Vec<Fq> {
+        let mut rng = ChaCha20Rng::seed_from_u64(seed);
+        (0..n).map(|_| Fq::random(&mut rng)).collect()
+    }
+
+    pub fn points(n: usize, seed: u64) -> Vec<G1Affine> {
+        let mut rng = ChaCha20Rng::seed_from_u64(seed);
+        let step = G1Projective::random(&mut rng);
+        let mut p = G1Projective::random(&mut rng);
+        let proj: Vec<G1Projective> = (0..n)
+            .map(|_| {
+                p += step;
+                p
+            })
+            .collect();
+        let mut out = vec![G1Affine::default(); n];
+        G1Projective::batch_normalize(&proj, &mut out);
+        out
+    }
+
+    /// The stock forward transform (`best_fft_with_twiddles`, as the domain
+    /// calls it).
+    pub fn fft(a: &mut [Fq], omega: Fq, log_n: u32) {
+        best_fft_with_twiddles(a, &compute_twiddles(&omega, log_n), log_n);
+    }
+
+    /// The stock inverse transform: the transform, then the divisor.
+    pub fn ifft(a: &mut [Fq], omega_inv: Fq, log_n: u32, divisor: Fq) {
+        fft(a, omega_inv, log_n);
+        a.iter_mut().for_each(|x| *x *= divisor);
+    }
+
+    pub fn msm(s: &[Fq], b: &[G1Affine]) -> G1Affine {
+        midnight_curves::msm::msm_pippenger(s, b).to_affine()
+    }
+}
+
+fn decline_count(class: &str, reason: &str) -> u64 {
+    crate::declines()
+        .iter()
+        .filter(|d| d.0 == class && d.1 == reason)
+        .map(|d| d.2)
+        .sum()
+}
+
+/// The quotient hook of [`entry_points_serve_small_calls`]: before the real
+/// call, a copy of the job with an unreduced challenge must decline
+/// `unreduced` and leave the output unchanged.
+unsafe fn checked_quotient(job: *const std::ffi::c_void, out: &mut [Scalar]) -> bool {
+    use midnight_proofs::gpu::abi::QuotientJobAbi;
+    // SAFETY: the prover's job, within its call.
+    let mut bad: QuotientJobAbi = unsafe { *(job as *const QuotientJobAbi) };
+    bad.y = [u64::MAX; 4];
+    let sentinel = vec![[0x5eedu64; 4]; out.len()];
+    let mut o = sentinel.clone();
+    let before = decline_count("quotient", "unreduced");
+    // SAFETY: the job's tables, within the prover's call.
+    let ok = unsafe { crate::quotient(&bad as *const QuotientJobAbi as *const _, &mut o) };
+    assert!(!ok && o == sentinel, "an unreduced job declines, out unchanged");
+    assert_eq!(decline_count("quotient", "unreduced") - before, 1);
+    // SAFETY: the caller's job.
+    unsafe { crate::quotient(job, out) }
+}
+
+/// Each entry point serves a small valid call with the stock CPU value, and
+/// declines a call of a wrong shape or with an unreduced input, leaving the
+/// caller's buffer unchanged.
 #[test]
-fn entry_points_decline_not_implemented() {
+fn entry_points_serve_small_calls() {
+    use group::Curve;
+    use midnight_curves::Fq;
+    use midnight_proofs::gpu::{
+        self as hooks, GpuHooks,
+        adapter::{affine, from_jacobian, scalar, scalars, scalars_mut},
+        test_switches::{QUOTIENT_CHECK, RandomCircuit},
+    };
+    use std::sync::atomic::Ordering::Relaxed;
+    let _g = serial();
     require_device();
     assert!(crate::set_min_k(1));
-    let n = 1 << 4;
-    let mut a = vec![fr_one_mont(); n];
-    let orig = a.clone();
-    assert!(!crate::fft(&mut a, fr_one_mont(), 4));
-    assert!(!crate::ifft(&mut a, fr_one_mont(), 4, fr_one_mont()));
+    let log_n = 4;
+    let n = 1usize << log_n;
+    let w = stock::root(log_n);
+    let wi = ff::Field::invert(&w).unwrap();
+    let div = ff::Field::invert(&Fq::from(n as u64)).unwrap();
+    let input = stock::scalars(n, 1);
+
+    // fft
+    let served = crate::stats();
+    let mut want = input.clone();
+    stock::fft(&mut want, w, log_n);
+    let mut got = input.clone();
+    assert!(crate::fft(scalars_mut(&mut got), scalar(w), log_n));
+    assert_eq!(got, want, "fft");
+    // ifft
+    let mut want = input.clone();
+    stock::ifft(&mut want, wi, log_n, div);
+    let mut got = input.clone();
+    assert!(crate::ifft(scalars_mut(&mut got), scalar(wi), log_n, scalar(div)));
+    assert_eq!(got, want, "ifft");
+    // msm (one-shot: no table registered)
+    let points = stock::points(n, 2);
+    let r = crate::msm_g1(scalars(&input), affine(&points)).expect("the msm is served");
+    assert_eq!(from_jacobian(r).to_affine(), stock::msm(&input, &points), "msm");
+    let now = crate::stats();
+    assert_eq!(now.fft.served - served.fft.served, 1);
+    assert_eq!(now.ifft.served - served.ifft.served, 1);
+    assert_eq!(now.msm.served - served.msm.served, 1);
+
+    // quotient: a real job of a proof, with the hook layer's check mode
+    // comparing the device quotient with the stock CPU one
+    static INSTALL: std::sync::Once = std::sync::Once::new();
+    INSTALL.call_once(|| {
+        assert!(hooks::install(GpuHooks {
+            msm_g1: None,
+            fft: None,
+            ifft: None,
+            quotient: Some(checked_quotient),
+        }));
+    });
+    let (checks, diffs) = (hooks::quotient_checks(), hooks::quotient_check_diffs());
+    let q = crate::stats().quotient.served;
+    QUOTIENT_CHECK.store(true, Relaxed);
+    let (_, verified) = RandomCircuit::new(8, true, 7).prove();
+    QUOTIENT_CHECK.store(false, Relaxed);
+    assert!(verified, "the proof with the device quotient verifies");
+    assert_eq!(crate::stats().quotient.served - q, 1, "{:?}", crate::declines());
+    assert_eq!(hooks::quotient_checks() - checks, 1);
+    assert_eq!(hooks::quotient_check_diffs(), diffs, "the stock quotient");
+
+    // declines leave the buffer unchanged
+    let orig = scalars(&input).to_vec();
+    let mut a = orig.clone();
+    let shape = decline_count("fft", "shape");
+    assert!(!crate::fft(&mut a[..n - 1], scalar(w), log_n));
+    assert_eq!(decline_count("fft", "shape") - shape, 1);
+    let mut bad = orig.clone();
+    bad[3] = FR_MODULUS;
+    let kept = bad.clone();
+    let unreduced = decline_count("fft", "unreduced");
+    assert!(!crate::fft(&mut bad, scalar(w), log_n));
+    assert_eq!(bad, kept);
+    assert_eq!(decline_count("fft", "unreduced") - unreduced, 1);
+    // a root other than the standard one
+    assert!(!crate::fft(&mut a, scalar(w * w), log_n));
+    let unreduced = decline_count("ifft", "unreduced");
+    assert!(!crate::ifft(&mut a, scalar(wi), log_n, FR_MODULUS));
+    assert_eq!(decline_count("ifft", "unreduced") - unreduced, 1);
     assert_eq!(a, orig);
-    assert!(crate::msm_g1(&a, &vec![[0u64; 12]; n]).is_none());
+    let shape = decline_count("msm", "shape");
+    assert!(crate::msm_g1(&orig[..n - 1], affine(&points)).is_none());
+    assert_eq!(decline_count("msm", "shape") - shape, 1);
+    let unreduced = decline_count("msm", "unreduced");
+    assert!(crate::msm_g1(&kept, affine(&points)).is_none());
+    assert_eq!(decline_count("msm", "unreduced") - unreduced, 1);
+    let shape = decline_count("quotient", "shape");
     // SAFETY: a null job is declined before use.
     assert!(!unsafe { crate::quotient(std::ptr::null(), &mut a) });
-    let d = crate::declines();
-    for class in ["fft", "ifft", "msm"] {
-        assert!(
-            d.iter().any(|(c, r, k)| *c == class && *r == "not-implemented" && *k > 0),
-            "{d:?}"
-        );
-    }
-    assert!(d.iter().any(|(c, r, _)| *c == "quotient" && *r == "shape"));
-    // shapes and unreduced inputs are declined before the kernel module
-    assert!(!crate::fft(&mut a[..15], fr_one_mont(), 4));
-    let mut bad = orig;
-    bad[3] = FR_MODULUS;
-    assert!(!crate::fft(&mut bad, fr_one_mont(), 4));
-    let d = crate::declines();
-    assert!(d.iter().any(|(c, r, _)| *c == "fft" && *r == "shape"));
-    assert!(d.iter().any(|(c, r, _)| *c == "fft" && *r == "unreduced"));
+    assert_eq!(decline_count("quotient", "shape") - shape, 1);
+    assert_eq!(a, orig);
     assert!(!crate::set_min_k(crate::MAX_LOG_N + 1));
+    crate::reset_min_k();
+    assert!(crate::end_request());
+}
+
+/// Without an explicit threshold each class takes its measured default; an
+/// explicit one applies to every class; an MSM below the one-shot threshold
+/// is served from a registered table and declines without one.
+#[test]
+fn per_class_thresholds() {
+    use group::Curve;
+    use midnight_proofs::gpu::adapter::{affine, from_jacobian, scalar, scalars, scalars_mut};
+    let _g = serial();
+    require_device();
+    crate::reset_min_k();
+    if std::env::var_os("MIDNIGHT_METAL_MIN_K").is_some() {
+        eprintln!("MIDNIGHT_METAL_MIN_K is set: the defaults are not in force; skipped");
+        return;
+    }
+    assert_eq!(crate::thresholds(), crate::DEFAULT_THRESHOLDS);
+    assert_eq!(crate::min_k(), 14);
+    let d = crate::DEFAULT_THRESHOLDS;
+    assert_eq!(
+        (d.fft, d.ifft, d.msm_table, d.msm_one_shot, d.quotient),
+        (15, 15, 14, 18, 14)
+    );
+
+    // a transform below its threshold declines, unchanged
+    let log_n = 14;
+    let input = stock::scalars(1 << log_n, 3);
+    let mut a = input.clone();
+    let below = decline_count("fft", "below-min-k");
+    assert!(!crate::fft(scalars_mut(&mut a), scalar(stock::root(log_n)), log_n));
+    assert_eq!(a, input);
+    assert_eq!(decline_count("fft", "below-min-k") - below, 1);
+
+    // 2^14 terms: a one-shot MSM declines before any device work; the same
+    // MSM on a prefix of a registered table is served from it
+    let points = stock::points(3 << 13, 4);
+    let m = 1 << 14;
+    let (cached, one_shot, uploads) = crate::msm_counts();
+    let below = decline_count("msm", "below-min-k");
+    assert!(crate::msm_g1(scalars(&input), affine(&points[..m])).is_none());
+    assert_eq!(decline_count("msm", "below-min-k") - below, 1);
+    assert_eq!(crate::msm_counts().1, one_shot, "no one-shot device MSM");
+    let h = crate::register_srs(affine(&points));
+    assert_eq!(h.device_bytes(), 0, "a registration is host memory");
+    let r = crate::msm_g1(scalars(&input), affine(&points[..m])).expect("served from the table");
+    assert_eq!(from_jacobian(r).to_affine(), stock::msm(&input, &points[..m]));
+    let (cached2, one_shot2, uploads2) = crate::msm_counts();
+    assert_eq!((cached2 - cached, one_shot2 - one_shot, uploads2 - uploads), (1, 0, 1));
+    assert_eq!(h.device_bytes(), (points.len() * 96) as u64);
+    // below the table threshold even a table does not take it
+    let half = 1 << 13;
+    assert!(crate::msm_g1(scalars(&input[..half]), affine(&points[..half])).is_none());
+    drop(h);
+
+    // an explicit threshold applies to every class
+    assert!(crate::set_min_k(10));
+    assert_eq!(crate::thresholds(), crate::Thresholds::all(10));
+    assert_eq!(crate::min_k(), 10);
+    let mut a = input;
+    assert!(crate::fft(scalars_mut(&mut a), scalar(stock::root(log_n)), log_n));
+    crate::reset_min_k();
+    assert_eq!(crate::thresholds(), crate::DEFAULT_THRESHOLDS);
+    assert!(crate::end_request());
+}
+
+/// The read-back check of the erasure: a clean request reads back zero; a
+/// non-zero byte planted after the zeroing is found and fails the report.
+#[test]
+fn erase_report_reads_back_every_region() {
+    let _g = serial();
+    require_device();
+    assert!(crate::end_request());
+    let fill = |n: usize| {
+        let mut s = ctx::lock().unwrap();
+        for (i, key) in ["test-erase-a", "test-erase-b"].into_iter().enumerate() {
+            s.scratch(key, n << i).unwrap().as_mut_slice::<u8>().fill(0x5c);
+        }
+    };
+    fill(4096 + 3);
+    let w = crate::end_request_report(true).expect("every region reads back zero");
+    assert_eq!((w.regions, w.checked_regions), (2, 2));
+    assert_eq!(w.bytes, 3 * (4096 + 3) as u64);
+    assert!(w.checked && w.nonzero_regions == 0 && w.check_failures == 0);
+    // without the check nothing is read back
+    fill(64);
+    let w = crate::end_request_report(false).unwrap();
+    assert_eq!((w.regions, w.checked, w.checked_regions), (2, false, 0));
+    // a planted non-zero byte
+    fill(64);
+    ctx::set_plant_nonzero(true);
+    let r = crate::end_request_report(true);
+    ctx::set_plant_nonzero(false);
+    let w = r.expect_err("a non-zero region fails the report");
+    assert_eq!((w.regions, w.nonzero_regions, w.check_failures), (2, 1, 0));
+    // the region was released all the same
+    assert_eq!(ctx::lock().unwrap().scratch_bytes(), 0);
+    assert!(crate::end_request());
 }
 
 #[test]

@@ -67,8 +67,9 @@
 //!
 //! - [`Buffer`]: owned by the caller, zeroed when dropped.
 //! - Per-request buffers ([`Session::scratch`]): kept by the context under a
-//!   key until [`end_request`], which zeroes and releases each one. A kernel
-//!   uses them for scratch it wants to reuse across calls of one request.
+//!   key until [`end_request_report`], which zeroes each one, with its check
+//!   reads it back from the host mapping, and releases it. A kernel uses them
+//!   for scratch it wants to reuse across calls of one request.
 
 use std::{
     collections::HashMap,
@@ -77,7 +78,7 @@ use std::{
     ptr::NonNull,
     sync::{
         Mutex, MutexGuard, OnceLock,
-        atomic::{AtomicU64, Ordering::Relaxed},
+        atomic::{AtomicBool, AtomicU64, Ordering::Relaxed},
     },
 };
 
@@ -88,7 +89,7 @@ use objc2_metal::{
     MTLBuffer, MTLCommandBuffer, MTLCommandBufferStatus, MTLCommandEncoder, MTLCommandQueue,
     MTLCompileOptions, MTLComputeCommandEncoder, MTLComputePipelineState,
     MTLCreateSystemDefaultDevice, MTLDevice, MTLGPUFamily, MTLLanguageVersion, MTLLibrary,
-    MTLResourceOptions, MTLSize,
+    MTLResource, MTLResourceOptions, MTLSize, MTLStorageMode,
 };
 
 use crate::MetalInfo;
@@ -733,18 +734,76 @@ impl Session {
     }
 }
 
-/// Zeroes and releases every per-request buffer, after any device work in
-/// progress (it takes the device). `true` when done; there is nothing that
-/// can fail short of a poisoned lock, which is recovered.
-pub fn end_request() -> bool {
+/// Test switch of [`end_request_report`]: write one non-zero byte into the
+/// first region after its zeroing, so that a test sees a failed check.
+static PLANT_NONZERO: AtomicBool = AtomicBool::new(false);
+
+/// Makes every later [`end_request_report`] write a non-zero byte into its
+/// first region after the zeroing (`true`), or stops it (`false`): a test
+/// switch for the read-back check, not for use outside tests.
+#[doc(hidden)]
+pub fn set_plant_nonzero(on: bool) {
+    PLANT_NONZERO.store(on, Relaxed);
+}
+
+/// Whether the first `bytes` bytes of `b` read zero, read word by word with
+/// volatile loads from the host mapping.
+fn reads_zero(b: &Buffer) -> bool {
+    let p = b.ptr();
+    let words = b.bytes / 8;
+    // SAFETY: `contents` is valid for `bytes` bytes and 8-byte aligned (page
+    // aligned); the reads stay inside it.
+    unsafe {
+        (0..words).all(|i| std::ptr::read_volatile(p.cast::<u64>().add(i)) == 0)
+            && (words * 8..b.bytes).all(|i| std::ptr::read_volatile(p.add(i)) == 0)
+    }
+}
+
+/// Zeroes every per-request buffer after any device work in progress (it
+/// takes the device), with `check` reads it back from the host mapping and
+/// compares it with zero, and releases it. On unified memory a shared buffer
+/// is the memory the GPU used, so the read-back sees what the device would
+/// read. `Err`: a region read back non-zero (it is zeroed again before its
+/// release) or could not be read from the host. There is no quarantine and
+/// no retry: a failed region is still released, and the failure is reported.
+pub fn end_request_report(check: bool) -> Result<crate::WipeStats, crate::WipeStats> {
+    let mut w = crate::WipeStats {
+        checked: check,
+        ..crate::WipeStats::default()
+    };
     let mut state = STATE.lock().unwrap_or_else(|e| e.into_inner());
     if let Some(st) = state.as_mut() {
-        for (_, mut b) in st.scratch.drain() {
+        let plant = PLANT_NONZERO.load(Relaxed);
+        for (i, (_, mut b)) in st.scratch.drain().enumerate() {
             b.zero();
+            w.regions += 1;
+            w.bytes += b.bytes as u64;
+            if plant && i == 0 && b.bytes > 0 {
+                let mid = b.bytes / 2;
+                b.as_mut_slice::<u8>()[mid] = 0xa5;
+            }
+            if check {
+                w.checked_regions += 1;
+                if b.raw.storageMode() != MTLStorageMode::Shared {
+                    w.check_failures += 1;
+                } else if !reads_zero(&b) {
+                    w.nonzero_regions += 1;
+                }
+            }
+            // zeroed again on drop
             drop(b);
         }
     }
-    true
+    if w.nonzero_regions == 0 && w.check_failures == 0 {
+        Ok(w)
+    } else {
+        Err(w)
+    }
+}
+
+/// [`end_request_report`] without the read-back. `true` when done.
+pub fn end_request() -> bool {
+    end_request_report(false).is_ok()
 }
 
 /// `(free, total)`: `total` is `recommendedMaxWorkingSetSize`, `free` is

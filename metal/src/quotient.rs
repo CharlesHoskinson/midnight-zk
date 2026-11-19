@@ -17,7 +17,8 @@
 //! [`crate::quotient`] has checked that `job` is not null and that a device
 //! is usable before it calls [`quotient`]. Everything else is this module's:
 //! the ABI version and layout of `midnight_proofs::gpu::abi::QuotientJobAbi`
-//! (a copy in [`abi`]), the size against `min_k`, the job's shape, the
+//! (a copy in [`abi`]), the extended size against the quotient threshold
+//! (`quotient` of [`crate::thresholds`]), the job's shape, the
 //! reduction of its scalars and the memory need. It ends with exactly one of
 //! `account::served` or `account::decline`, and writes `out` only with the
 //! complete result.
@@ -369,7 +370,7 @@ fn checked(j: &QuotientJobAbi, out_len: Option<usize>) -> Result<(), Reason> {
     if !cube_root_shift(j.zeta, j.zeta_out) {
         return Err(Reason::Shape);
     }
-    if j.ext_k < crate::min_k() {
+    if j.ext_k < crate::thresholds().quotient {
         return Err(Reason::BelowMinK);
     }
     let en = 1usize << j.ext_k;

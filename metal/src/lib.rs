@@ -65,10 +65,12 @@
 //!   [`end_request`]), command buffers with error reporting, byte accounting,
 //!   and what unified memory means for transfers.
 //! - `src/field.rs` ([`field`]): moduli and the reduction check.
-//! - `src/msm.rs`, `src/ntt.rs`, `src/quotient.rs`: one kernel family each,
-//!   compiled on macOS only (on other targets the entry points decline before
-//!   reaching them). Each holds one `pub(crate)` function called by the entry
-//!   point after admission; today each declines with `not-implemented`.
+//! - `src/msm.rs`, `src/ntt.rs`, `src/quotient.rs`: one kernel family each
+//!   (the MSM, the forward and inverse NTT, the quotient with its resident
+//!   proving-key copies), compiled on macOS only (on other targets the entry
+//!   points decline `no-device` before reaching them). The entry point calls
+//!   the module after admission; the module serves the call with the stock
+//!   value or declines with a counted reason (see [`declines`]).
 //! - `build.rs`: shader build (metallib with `xcrun metal`, else embedded
 //!   source compiled at first use).
 //! - `shaders/include/mont.h`: Montgomery arithmetic over N 32-bit limbs
@@ -97,17 +99,43 @@
 //! ## Environment
 //!
 //! - `MIDNIGHT_METAL=off`: use no device (every call declines `no-device`).
-//! - `MIDNIGHT_METAL_MIN_K` (default 14): the smallest log2 size sent to the
-//!   device; see [`set_min_k`].
+//! - `MIDNIGHT_METAL_MIN_K` (unset by default): one log2 size threshold for
+//!   every class, replacing the per-class defaults (see "Size thresholds").
 //! - `MIDNIGHT_METAL_SHADER_SOURCE=1` (run time): compile the embedded source
 //!   instead of loading the embedded metallib. At build time it skips the
 //!   toolchain.
 //!
+//! ## Size thresholds
+//!
+//! A call below its class's threshold declines `below-min-k` before any
+//! device work and the stock CPU code runs. Unless one threshold is set
+//! explicitly ([`set_min_k`] or `MIDNIGHT_METAL_MIN_K`, which then applies to
+//! every class; [`reset_min_k`] undoes [`set_min_k`]), each class has its own
+//! default ([`DEFAULT_THRESHOLDS`]), the measured break-even of the device
+//! against the stock CPU code:
+//!
+//! | Class | Threshold (log2) | Measured |
+//! |---|---|---|
+//! | `fft`, `ifft` | 15 (`log_n`) | the device wins from `2^15`, loses at `2^14` |
+//! | `msm` on a registered SRS table | 14 (length) | wins from `2^14` |
+//! | `msm` without a table (one-shot) | 18 (length) | wins from `2^18` |
+//! | `quotient` | 14 (`ext_k`) | wins from `ext_k = 14` |
+//!
+//! Measured on Apple M4 Max (40-core GPU, 128 GB), 2026-11-18, release
+//! builds, against the stock CPU code of `midnight-proofs` on the same
+//! machine. Other machines may break even elsewhere: set one threshold
+//! explicitly there. [`thresholds`] gives the effective values (for reports).
+//!
 //! ## Requests
 //!
-//! Call [`begin_request`] and [`end_request`] around each proof:
-//! [`end_request`] zeroes and releases the per-request buffers (which can
-//! hold witness values). Scoped buffers are zeroed when dropped.
+//! Call [`begin_request`] and [`end_request`] (or [`end_request_report`])
+//! around each proof: it zeroes and releases the per-request buffers (which
+//! can hold witness values), with [`end_request_report`]`(true)` reading each
+//! one back from the host mapping before its release and counting the
+//! regions that are not zero. Scoped buffers (owned by one call) are zeroed
+//! when dropped, at the end of that call; they are not in the report. A
+//! region that fails the check is zeroed again, released and reported: there
+//! is no quarantine and no retry, unlike the wipe layer of the CUDA crate.
 
 #![deny(missing_docs)]
 #![deny(missing_debug_implementations)]
@@ -245,32 +273,116 @@ pub fn library_source() -> Option<&'static str> {
     None
 }
 
-static MIN_K: AtomicU32 = AtomicU32::new(u32::MAX);
-
-/// The smallest log2 size sent to the device: [`set_min_k`], else
-/// `MIDNIGHT_METAL_MIN_K` (ignored above [`MAX_LOG_N`]), else 14.
-pub fn min_k() -> u32 {
-    let k = MIN_K.load(Relaxed);
-    if k != u32::MAX {
-        return k;
-    }
-    let k = std::env::var("MIDNIGHT_METAL_MIN_K")
-        .ok()
-        .and_then(|s| s.trim().parse().ok())
-        .filter(|k| *k <= MAX_LOG_N)
-        .unwrap_or(14);
-    let _ = MIN_K.compare_exchange(u32::MAX, k, Relaxed, Relaxed);
-    MIN_K.load(Relaxed)
+/// The log2 size from which each kernel class is sent to the device (see
+/// [`thresholds`] and the crate text, "Size thresholds").
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct Thresholds {
+    /// Forward FFTs: the transform size `log_n`.
+    pub fft: u32,
+    /// Inverse FFTs: the transform size `log_n`.
+    pub ifft: u32,
+    /// MSMs served from a registered SRS table: log2 of the length.
+    pub msm_table: u32,
+    /// MSMs with no registered table (one-shot): log2 of the length.
+    pub msm_one_shot: u32,
+    /// Quotients: the extended domain `ext_k`.
+    pub quotient: u32,
+    /// Whether one value was set explicitly ([`set_min_k`] or
+    /// `MIDNIGHT_METAL_MIN_K`) and applies to every class; `false`: the
+    /// measured per-class defaults ([`DEFAULT_THRESHOLDS`]).
+    pub explicit: bool,
 }
 
-/// Sets the smallest log2 size sent to the device. Returns `false` and keeps
-/// the old value when `k` is above [`MAX_LOG_N`] (no size would be admitted).
+impl Thresholds {
+    /// One value for every class (an explicit `min_k`).
+    pub const fn all(k: u32) -> Thresholds {
+        Thresholds {
+            fft: k,
+            ifft: k,
+            msm_table: k,
+            msm_one_shot: k,
+            quotient: k,
+            explicit: true,
+        }
+    }
+
+    /// `(class, log2 size)` pairs, for reports: `fft`, `ifft`, `msm-table`,
+    /// `msm-one-shot`, `quotient-ext`.
+    pub fn named(&self) -> [(&'static str, u32); 5] {
+        [
+            ("fft", self.fft),
+            ("ifft", self.ifft),
+            ("msm-table", self.msm_table),
+            ("msm-one-shot", self.msm_one_shot),
+            ("quotient-ext", self.quotient),
+        ]
+    }
+}
+
+/// The per-class break-evens measured on Apple M4 Max (40-core GPU, 128 GB),
+/// 2026-11-18, release build: the size from which the device call is faster
+/// than the stock CPU code (see the crate text, "Size thresholds").
+pub const DEFAULT_THRESHOLDS: Thresholds = Thresholds {
+    fft: 15,
+    ifft: 15,
+    msm_table: 14,
+    msm_one_shot: 18,
+    quotient: 14,
+    explicit: false,
+};
+
+/// [`MIN_K`]: not read yet (the environment is read at the next use).
+const MIN_K_UNREAD: u32 = u32::MAX;
+/// [`MIN_K`]: no explicit value (the per-class defaults apply).
+const MIN_K_DEFAULTS: u32 = u32::MAX - 1;
+static MIN_K: AtomicU32 = AtomicU32::new(MIN_K_UNREAD);
+
+/// The explicit threshold: [`set_min_k`], else `MIDNIGHT_METAL_MIN_K`
+/// (ignored above [`MAX_LOG_N`]); `None`: none was set.
+fn explicit_min_k() -> Option<u32> {
+    let mut k = MIN_K.load(Relaxed);
+    if k == MIN_K_UNREAD {
+        let env = std::env::var("MIDNIGHT_METAL_MIN_K")
+            .ok()
+            .and_then(|s| s.trim().parse().ok())
+            .filter(|k| *k <= MAX_LOG_N)
+            .unwrap_or(MIN_K_DEFAULTS);
+        let _ = MIN_K.compare_exchange(MIN_K_UNREAD, env, Relaxed, Relaxed);
+        k = MIN_K.load(Relaxed);
+    }
+    (k <= MAX_LOG_N).then_some(k)
+}
+
+/// The effective size threshold of each class: the explicit value
+/// ([`set_min_k`], else `MIDNIGHT_METAL_MIN_K`) for every class when one was
+/// set, else [`DEFAULT_THRESHOLDS`].
+pub fn thresholds() -> Thresholds {
+    explicit_min_k().map_or(DEFAULT_THRESHOLDS, Thresholds::all)
+}
+
+/// The explicit threshold when one was set ([`set_min_k`], else
+/// `MIDNIGHT_METAL_MIN_K`), else the smallest per-class default (14). The
+/// threshold of each class is [`thresholds`].
+pub fn min_k() -> u32 {
+    let t = thresholds();
+    t.fft.min(t.ifft).min(t.msm_table).min(t.msm_one_shot).min(t.quotient)
+}
+
+/// Sets one threshold for every class (log2 size; for a quotient, the
+/// extended domain). Returns `false` and keeps the old value when `k` is
+/// above [`MAX_LOG_N`] (no size would be admitted).
 pub fn set_min_k(k: u32) -> bool {
     if k > MAX_LOG_N {
         return false;
     }
     MIN_K.store(k, Relaxed);
     true
+}
+
+/// Undoes [`set_min_k`]: `MIDNIGHT_METAL_MIN_K` is read again at the next
+/// use, and without it the per-class defaults apply.
+pub fn reset_min_k() {
+    MIN_K.store(MIN_K_UNREAD, Relaxed);
 }
 
 /// Calls served by the device in one hook class since the last
@@ -308,11 +420,12 @@ pub fn stats() -> Stats {
 
 /// Every decline since the last [`reset_stats`]: `(class, reason, count)`.
 /// Classes: `msm`, `fft`, `ifft`, `quotient`. Reasons: `no-device` (another
-/// target, no usable device, `MIDNIGHT_METAL=off`), `below-min-k`, `shape`
-/// (a length, root, job layout or version the device does not take),
-/// `unreduced` (a scalar not below the modulus), `memory` (a buffer above
-/// `maxBufferLength`, a failed allocation or a budget), `device-error` (a
-/// pipeline, encoder or command buffer failed), `not-implemented`.
+/// target, no usable device, `MIDNIGHT_METAL=off`), `below-min-k` (below the
+/// class's threshold, see [`thresholds`]), `shape` (a length, root, job
+/// layout or version the device does not take), `unreduced` (a scalar not
+/// below the modulus), `memory` (a buffer above `maxBufferLength`, a failed
+/// allocation or a budget), `device-error` (a pipeline, encoder or command
+/// buffer failed).
 pub fn declines() -> Vec<(&'static str, &'static str, u64)> {
     account::declines()
 }
@@ -323,13 +436,15 @@ pub fn reset_stats() {
 }
 
 /// The admission of an MSM on its lengths: an empty input, unequal lengths
-/// or a length above `2^max_log` is `shape`; below `2^min_k()` is
-/// `below-min-k`.
+/// or a length above `2^max_log` is `shape`; below `2^msm_table` of
+/// [`thresholds`] (the lower of the two MSM thresholds) is `below-min-k`.
+/// [`msm_g1`] also declines `below-min-k` below `2^msm_one_shot` when no
+/// registered table serves the bases.
 pub fn msm_admission(scalars: usize, bases: usize, max_log: u32) -> Result<(), &'static str> {
     if scalars == 0 || scalars != bases || scalars > (1usize << max_log.min(62)) {
         return Err(Reason::Shape.name());
     }
-    if scalars < (1usize << min_k().min(40)) {
+    if scalars < (1usize << thresholds().msm_table.min(40)) {
         return Err(Reason::BelowMinK.name());
     }
     Ok(())
@@ -337,6 +452,10 @@ pub fn msm_admission(scalars: usize, bases: usize, max_log: u32) -> Result<(), &
 
 /// G1 MSM `sum scalars[i] * bases[i]` (equal lengths): the hook
 /// `GpuHooks::msm_g1`. `None`: declined.
+///
+/// An MSM on a registered SRS table ([`register_srs`]) is taken from
+/// `2^msm_table`, any other from `2^msm_one_shot` ([`thresholds`]); the
+/// shorter one-shot MSM declines `below-min-k` before any device work.
 pub fn msm_g1(scalars: &[Scalar], bases: &[G1AffineLimbs]) -> Option<G1JacobianLimbs> {
     if let Err(why) = msm_admission(scalars.len(), bases.len(), MAX_MSM_LOG) {
         let r = if why == Reason::Shape.name() {
@@ -345,6 +464,15 @@ pub fn msm_g1(scalars: &[Scalar], bases: &[G1AffineLimbs]) -> Option<G1JacobianL
             Reason::BelowMinK
         };
         account::decline(Class::Msm, r);
+        return None;
+    }
+    let one_shot_min = 1usize << thresholds().msm_one_shot.min(40);
+    #[cfg(target_os = "macos")]
+    let tabled = msm::has_table(bases);
+    #[cfg(not(target_os = "macos"))]
+    let tabled = false;
+    if scalars.len() < one_shot_min && !tabled {
+        account::decline(Class::Msm, Reason::BelowMinK);
         return None;
     }
     if !device() {
@@ -357,7 +485,7 @@ pub fn msm_g1(scalars: &[Scalar], bases: &[G1AffineLimbs]) -> Option<G1JacobianL
     }
     #[cfg(target_os = "macos")]
     {
-        msm::msm_g1(scalars, bases)
+        msm::msm_g1(scalars, bases, one_shot_min)
     }
     #[cfg(not(target_os = "macos"))]
     None
@@ -374,7 +502,9 @@ fn transform_admission(
     if log_n == 0 || log_n > MAX_LOG_N || a.len() != 1usize << log_n {
         return account::decline(class, Reason::Shape);
     }
-    if log_n < min_k() {
+    let t = thresholds();
+    let min = if class == Class::Ifft { t.ifft } else { t.fft };
+    if log_n < min {
         return account::decline(class, Reason::BelowMinK);
     }
     if !device() {
@@ -451,19 +581,50 @@ pub fn begin_request() {
     quotient::begin_request();
 }
 
+/// What [`end_request_report`] erased: the per-request buffers (regions) of
+/// the request, zeroed before their release, and with `check` read back.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub struct WipeStats {
+    /// Per-request regions zeroed and released.
+    pub regions: u64,
+    /// Their bytes.
+    pub bytes: u64,
+    /// Whether every region was read back after its zeroing.
+    pub checked: bool,
+    /// Regions read back (check mode).
+    pub checked_regions: u64,
+    /// Regions that read back non-zero after the zeroing (check mode).
+    pub nonzero_regions: u64,
+    /// Regions that could not be read back from the host (not in shared
+    /// storage), so no result came back (check mode).
+    pub check_failures: u64,
+}
+
 /// Ends a request (call it between proofs): waits for any device work in
-/// progress, then zeroes and releases every per-request buffer. `true` when
-/// every buffer was zeroed and released (always, on other targets or before
-/// the context exists).
-pub fn end_request() -> bool {
+/// progress, then zeroes every per-request buffer, with `check` reads each
+/// one back from the host and compares it with zero, and releases it; then
+/// frees the proving-key copies unless [`keep_resident`]. `Err`: a region
+/// read back non-zero or could not be read (the region is zeroed again and
+/// released: there is no quarantine). On other targets, or before the
+/// context exists, there is no region.
+pub fn end_request_report(check: bool) -> Result<WipeStats, WipeStats> {
     #[cfg(target_os = "macos")]
     {
-        let ok = ctx::end_request();
+        let r = ctx::end_request_report(check);
         quotient::end_request();
-        ok
+        r
     }
     #[cfg(not(target_os = "macos"))]
-    true
+    Ok(WipeStats {
+        checked: check,
+        ..WipeStats::default()
+    })
+}
+
+/// [`end_request_report`] without the read-back: `true` when every
+/// per-request buffer was zeroed and released.
+pub fn end_request() -> bool {
+    end_request_report(false).is_ok()
 }
 
 /// `(now, peak)` bytes this process holds in Metal buffers of this crate;
