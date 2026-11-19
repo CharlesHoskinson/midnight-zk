@@ -106,8 +106,9 @@ pub mod device {
     }
 }
 
-/// The Metal counterpart of the CUDA `device` module above, on `midnight-metal`.
-/// With `rc1-bench-cuda` also on, the CUDA module is the one built.
+/// The Metal counterpart of the CUDA `device` module above, on
+/// `midnight-metal`. With `rc1-bench-cuda` also on, the CUDA module is the one
+/// built.
 #[cfg(all(feature = "rc1-bench-metal", not(feature = "rc1-bench-cuda")))]
 pub mod device {
     use midnight_curves::Bls12;
@@ -130,19 +131,13 @@ pub mod device {
         Ok((info.name.clone(), info.recommended_max_working_set))
     }
 
-    /// The SRS and proving-key registrations, dropped when the benchmark
-    /// ends.
-    pub struct Handles(
-        #[allow(dead_code)] [metal::SrsHandle; 4],
-        #[allow(dead_code)] metal::KeyHandle,
-    );
-
-    /// Registers the SRS bases and the proving key's resident polynomials,
-    /// and installs the hooks. The KZG prover commits from four SRS vectors
-    /// (the CUDA `install` registers the first two): the delta bases (phase
-    /// 1: the advice columns) and the double-delta bases (phase 2: the
-    /// permutation products) as well, so every commitment finds its table.
-    pub fn install(params: &ParamsKZG<Bls12>, pk: &Key) -> Result<Handles> {
+    /// Registers the four SRS vectors the KZG prover commits from (every
+    /// commitment finds its table) and the proving key's resident polynomials,
+    /// and installs the hooks.
+    pub fn install(
+        params: &ParamsKZG<Bls12>,
+        pk: &Key,
+    ) -> Result<([metal::SrsHandle; 4], metal::KeyHandle)> {
         if !metal::device() {
             return Err("Metal device unavailable".into());
         }
@@ -156,21 +151,6 @@ pub mod device {
         let polys = pk.gpu_resident_polys().ok_or("unsupported quotient shape")?;
         let key =
             metal::register_key(&polys.iter().map(|p| adapter::scalars(p)).collect::<Vec<_>>());
-        eprintln!(
-            "metal size thresholds (log2): {}{}",
-            metal::thresholds()
-                .named()
-                .map(|(c, k)| match k {
-                    Some(k) => format!("{c} {k}"),
-                    None => format!("{c} never"),
-                })
-                .join(", "),
-            if metal::thresholds().explicit {
-                " (explicit)"
-            } else {
-                " (measured defaults)"
-            }
-        );
         if !hooks::install(hooks::GpuHooks {
             msm_g1: Some(metal::msm_g1),
             fft: Some(metal::fft),
@@ -179,37 +159,26 @@ pub mod device {
         }) {
             return Err("hooks already installed".into());
         }
-        Ok(Handles(srs, key))
+        Ok((srs, key))
     }
 
-    /// `msm_counts` when the proof started.
-    pub struct Baseline((u64, u64, u64));
+    /// Nothing to subtract: the crate's counters are reset at `begin`.
+    pub struct Baseline;
 
     pub fn begin() -> Baseline {
         metal::begin_request();
         metal::reset_stats();
         hooks::reset_hook_declines();
-        Baseline(metal::msm_counts())
+        Baseline
     }
 
     /// The counters of one proof. Unified memory has no host-device copies, so
     /// the transfer and staging counters are 0.
-    pub fn finish(before: Baseline) -> Result<Metrics> {
+    pub fn finish(_: Baseline) -> Result<Metrics> {
         let stats = metal::stats();
         let hook_declines = hooks::hook_declines();
         let declines = metal::declines();
         let peak_bytes = metal::device_bytes().1;
-        let (cached, one_shot, uploads) = metal::msm_counts();
-        let (c0, o0, u0) = before.0;
-        eprintln!(
-            "metal msm_counts of the proof: table {}, one-shot {}, uploads {}; since process \
-             start: table {cached}, one-shot {one_shot}, uploads {uploads}; stale {}; declines \
-             {declines:?}",
-            cached - c0,
-            one_shot - o0,
-            uploads - u0,
-            metal::srs_stale()
-        );
         if !metal::end_request() {
             return Err("device cleanup failed".into());
         }

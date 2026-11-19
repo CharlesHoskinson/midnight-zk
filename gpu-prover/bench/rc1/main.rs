@@ -39,16 +39,14 @@ fn number(name: &str, default: u32) -> Result<u32> {
     }
 }
 
-// Setup and key deserialization can raise load. Sample after both, adjacent to
-// proof 0.
-/// The one-minute load average: `/proc/loadavg` on Linux, `getloadavg` elsewhere.
+/// The one-minute load average, from `/proc/loadavg`.
 #[cfg(target_os = "linux")]
 fn one_minute_load() -> Result<f64> {
     let line = std::fs::read_to_string("/proc/loadavg")?;
     Ok(line.split_whitespace().next().ok_or("missing load average")?.parse::<f64>()?)
 }
 
-/// The one-minute load average: `/proc/loadavg` on Linux, `getloadavg` elsewhere.
+/// The one-minute load average, from `getloadavg` (no `/proc` on macOS).
 #[cfg(not(target_os = "linux"))]
 fn one_minute_load() -> Result<f64> {
     let mut avg = [0f64; 1];
@@ -59,6 +57,8 @@ fn one_minute_load() -> Result<f64> {
     Ok(avg[0])
 }
 
+// Setup and key deserialization can raise load. Sample after both, adjacent to
+// proof 0.
 /// Waits for a one-minute load below `RC1_MAX_LOAD` (default 2).
 fn await_quiet() -> Result<f64> {
     let max = match env::var("RC1_MAX_LOAD") {
@@ -143,11 +143,7 @@ fn run(chain: &Chain, smoke: bool) -> Result<()> {
     let (gpu_model, total_bytes) = metrics::device::info()?;
     #[cfg(not(rc1_device))]
     let (gpu_model, total_bytes) = ("NA".to_string(), 0u64);
-    let mode = if cfg!(rc1_device) {
-        "gpu"
-    } else {
-        "cpu"
-    };
+    let mode = if cfg!(rc1_device) { "gpu" } else { "cpu" };
     let load = if smoke {
         "NA".into()
     } else {
@@ -178,9 +174,7 @@ fn run(chain: &Chain, smoke: bool) -> Result<()> {
         batch.proofs.push(hex::encode(proof));
         rows.push((prove_s, metrics));
     }
-    // the device handles release their registrations here
     #[cfg(rc1_device)]
-    #[allow(clippy::drop_non_drop)]
     drop(handles);
     drop(pk);
     drop(params);

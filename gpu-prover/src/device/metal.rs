@@ -14,89 +14,86 @@
 //! The binding to `midnight-metal` and `midnight_proofs::gpu`: every call into
 //! those crates for the Apple GPU is in this module. Compiled only with the
 //! cfg `midnight_metal_linked`, which the build script sets with the `metal`
-//! feature. It mirrors the CUDA binding (module `cuda` of `device.rs`).
+//! feature. The layout follows the CUDA binding (module `cuda` of
+//! `device.rs`).
 //!
-//! The hooks are installed once per process. Each one is a thin wrapper that
-//! declines (the prover then runs the stock CPU code) when its phase is not
-//! admitted for the current request, so the admission ladder decides per
-//! request which phases reach the device.
+//! The hooks are installed once per process. Each one declines (the prover
+//! then runs the stock CPU code) when its phase is not admitted for the
+//! current request, so the admission ladder decides per request which phases
+//! reach the device.
 //!
-//! - Resident SRS tables: [`Device::prepare`] registers the four SRS vectors
-//!   the KZG prover commits from (`Coeff`, `LagrangeCoeff`,
-//!   `LagrangeDeltaCoeff`, `LagrangeDoubleDeltaCoeff`: phase 1 commits the
-//!   advice columns from the delta bases, phase 2 the permutation and LogUp
-//!   polynomials from the double-delta bases), so that every commitment of a
-//!   proof finds its table. The CUDA binding registers the first two only.
-//!   Unlike CUDA's, a table stays on the device from its first MSM until its
-//!   handle is dropped: [`Device::evict`] with `tables` drops the handles,
-//!   and [`Device::held`] reports the bytes each table holds on the device
-//!   (`SrsHandle::device_bytes`).
-//! - Resident proving-key copies: `prepare` registers the key's resident
-//!   polynomials (`ProvingKey::gpu_resident_polys`) with
-//!   `midnight_metal::register_key`; [`Device::set_keep`] sets
-//!   `set_keep_resident`; `evict` frees the copies (`evict_key_copies`) and
-//!   keeps the registration, which holds no device memory (the CUDA binding
-//!   drops it and registers the key again at the next `prepare`); `held`
-//!   reports `KeyHandle::resident_bytes`.
-//! - The pool of zeroed buffers: `midnight-metal` keeps its large buffers
-//!   between requests, zeroed (a new buffer delays the first command buffer
-//!   that uses it); `evict` releases them (`release_pool`), and the free
-//!   memory of `mem` counts them as free (`midnight_metal::mem_info`).
-//! - The erasure report: `midnight_metal::end_request_report` zeroes every
-//!   per-request region and, with the request's check, reads each one back
-//!   from the host mapping (unified memory) and compares it with zero; check
-//!   mode also reads back every idle buffer of the pool of zeroed buffers
-//!   (counted in the regions). The quarantine and retry of the CUDA wipe
-//!   layer have no counterpart: a region that fails the check, or an idle
-//!   pool buffer that reads back non-zero (or cannot be read back), is
-//!   zeroed again, read back again and released, never pooled; it is
-//!   reported (`nonzero_regions` or `check_failures`), and the request's
-//!   erasure fails. A zeroing that panicked since the last report (it was
-//!   completed on the calling thread and its buffer released) is reported
-//!   as `erasure_failures` and fails the erasure too. A hook called outside
-//!   a request wipes its scratch before it returns.
-//! - Witness independence of the record: the per-proof record reports ONE
-//!   MSM total (hook invocations, served on the device and declined to the
-//!   CPU together, which depends only on the circuit) and no MSM decline
-//!   reason. The MSM declines of `midnight-metal` (`below-min-k` of a sparse
-//!   MSM, `unreduced`, `memory`) depend on the scalar values or are not shown
-//!   to be independent of them, so they stay out of `DeviceCounters`; the
-//!   per-path split is `midnight_metal::stats()` and `declines()`, for local
-//!   benchmarks and debugging only. The MSM seconds are the wall time of all
-//!   MSM hook invocations, served or declined.
-//! - The label of the record: a proof is `gpu` when a call of an admitted
-//!   phase ran on the device (`DeviceCounters::device_ran`). The served MSM
-//!   count depends on the scalar values, so this binding reports instead
-//!   the MSM hook invocations of an admitted MSM phase that the device takes
-//!   by their length and bases (`midnight_metal::msm_sized`: the length
-//!   thresholds, the registered table that serves the bases after the
-//!   comparison of every point, or the one-shot path when an explicit
-//!   threshold opens it; no scalar read) in `msm_sized`. The served
-//!   `fft`, `ifft` and `quotient` calls depend on lengths and sizes only.
-//! - The device peak of a request: `midnight_metal::request_peak_bytes`, the
-//!   peak since `begin_request` of the bytes in use (buffers handed out, the
-//!   resident tables and key copies), without the idle pool of zeroed
-//!   buffers; the CUDA binding's peak is the same quantity (the crate's
-//!   live bytes, which include its tables and key copies, since
-//!   `begin_request`).
-//! - The quotient need is `midnight_metal::need_bytes` with the stride of
-//!   `midnight_metal::quotient_threads`.
-//! - The size thresholds are per class (`midnight_metal::thresholds`); the
-//!   device info reports them, `msm-one-shot` as `None` (never) with the
-//!   default thresholds.
-//! - MSMs without a registered table: with the default thresholds an MSM
-//!   whose bases no registered table serves (never registered, or a table
-//!   the identity comparison found stale) declines `unregistered-bases`
-//!   before any scalar is read and before any G1 check of its bases, and the
-//!   stock CPU MSM runs it: the one-shot device path has to check every base
-//!   for G1 membership at every call, which costs more than the whole CPU
-//!   MSM (measured on Apple M4 Max: 187 ms for `2^16` points and 593 ms for
-//!   `2^18`, against about 25 ms and 78 ms for the CPU MSM). `msm_sized` is
-//!   then `false`. Only an explicit threshold (`MIDNIGHT_METAL_MIN_K`,
-//!   `midnight_metal::set_min_k`) opens the one-shot path, with its per-call
-//!   check unchanged.
-//! - `midnight-metal` counts forward and inverse transforms as separate
-//!   classes already, so the `ntt` class split of the CUDA binding is absent.
+//! # Mapping to `midnight-metal`
+//!
+//! - `info`: `present` and `thresholds`, the size threshold of each kernel
+//!   class (`msm-one-shot` is `None`: with the default thresholds an MSM whose
+//!   bases no registered table serves runs on the CPU).
+//! - `mem`: `mem_info`, once this binding has made the device context; before
+//!   that no free memory is reported. The idle pool of zeroed buffers counts as
+//!   free.
+//! - `shape`: `need_bytes` with the stride of `quotient_threads`.
+//! - `prepare`: `register_srs` for the four SRS vectors the KZG prover commits
+//!   from (`Coeff`, `LagrangeCoeff`, `LagrangeDeltaCoeff` for the advice
+//!   columns, `LagrangeDoubleDeltaCoeff` for the permutation and LogUp
+//!   polynomials), and `register_key` for the resident polynomials of the
+//!   proving key.
+//! - `set_keep`: `set_keep_resident`. `held`: `SrsHandle::device_bytes` and
+//!   `KeyHandle::resident_bytes`.
+//! - `begin_request` / `end_request`: `begin_request` and `end_request_report`.
+//! - `evict`: `evict_key_copies`, `release_pool`, and with `tables` dropping
+//!   the SRS handles.
+//! - `counters`: `stats`, `declines`, `msm_sized` and `request_peak_bytes`.
+//!
+//! # Lifetimes
+//!
+//! - An SRS registration is host work. The first MSM on a table uploads it, and
+//!   it stays on the device until its handle is dropped (`evict` with
+//!   `tables`).
+//! - The key registration holds no device memory. The first device quotient
+//!   copies the polynomials to the device, and the copies stay between requests
+//!   only under `keep`. `evict` frees the copies and keeps the registration.
+//! - `midnight-metal` keeps its large buffers between requests, zeroed, in a
+//!   pool. `evict` releases the pool.
+//!
+//! # Counters
+//!
+//! `midnight-metal` declines a sparse MSM, so how many MSMs the device serves
+//! depends on the scalar values. The record therefore reports:
+//!
+//! - one MSM total, `msm_count` and `msm_seconds`: every MSM hook invocation
+//!   and the wall time inside them, served on the device or declined to the
+//!   stock CPU MSM, which depends on the circuit only. There is no `msm` entry
+//!   in `calls` and no MSM row in `declines`; the split by path is
+//!   `midnight_metal::stats` and `declines`, for local benchmarks and
+//!   debugging.
+//! - the label input `msm_sized`: the MSM invocations of an admitted phase that
+//!   the device takes by their length and bases, before any scalar is read
+//!   (`midnight_metal::msm_sized`). `DeviceCounters::device_ran` reads it
+//!   together with the served `fft`, `ifft` and `quotient` calls, which depend
+//!   on sizes only.
+//!
+//! With the default thresholds the device takes an MSM only when a registered
+//! table serves its bases. Any other MSM declines `unregistered-bases` before
+//! any scalar is read, because the one-shot device path checks every base for
+//! membership in G1 at each call, which costs more than the CPU MSM (see
+//! `docs/gpu-prover/security.md`, section 8). An explicit threshold
+//! (`MIDNIGHT_METAL_MIN_K`) opens the one-shot path.
+//!
+//! # Erasure
+//!
+//! `end_request_report` zeroes every per-request region. With the check it
+//! also reads each region back from the host mapping (unified memory) and
+//! every idle buffer of the pool, and compares it with zero. A region or pool
+//! buffer that reads back non-zero or cannot be read back is zeroed again and
+//! released, never pooled, and counts in `nonzero_regions` or
+//! `check_failures`. A zeroing that panicked is counted in `erasure_failures`.
+//! Any of the three fails the request's erasure. A hook called outside a
+//! request wipes its scratch before it returns.
+//!
+//! # Peak
+//!
+//! `peak_bytes` is `request_peak_bytes`: the peak since `begin_request` of the
+//! bytes in use (buffers handed out, resident tables and key copies), without
+//! the idle pool. It is 0 when no device phase was admitted.
 
 use std::{
     sync::{
@@ -106,6 +103,11 @@ use std::{
     time::Instant,
 };
 
+/// The tables, key copies and quotient figures of `midnight-metal`, which it
+/// exports on macOS only. Elsewhere no device is detected, so these stand-ins
+/// are never reached with a device.
+#[cfg(target_os = "macos")]
+use midnight_metal as sys;
 use midnight_metal::{self as metal, G1AffineLimbs, G1JacobianLimbs, Scalar};
 use midnight_proofs::{
     gpu::{self as hooks, GpuHooks, adapter},
@@ -113,28 +115,97 @@ use midnight_proofs::{
 };
 
 use super::*;
+#[cfg(not(target_os = "macos"))]
+mod sys {
+    use super::{G1AffineLimbs, Scalar};
+
+    pub struct SrsHandle;
+    pub struct KeyHandle;
+
+    impl SrsHandle {
+        pub fn device_bytes(&self) -> u64 {
+            0
+        }
+    }
+
+    impl KeyHandle {
+        pub fn resident_bytes(&self) -> u64 {
+            0
+        }
+    }
+
+    pub fn register_srs(_: &[G1AffineLimbs]) -> SrsHandle {
+        SrsHandle
+    }
+    pub fn register_key(_: &[&[Scalar]]) -> KeyHandle {
+        KeyHandle
+    }
+    pub fn set_keep_resident(_: bool) {}
+    pub fn evict_key_copies() -> u64 {
+        0
+    }
+    pub fn quotient_threads() -> u32 {
+        0
+    }
+    pub fn need_bytes(_: u32, _: usize, _: usize, _: u32) -> usize {
+        0
+    }
+}
 
 /// The phases admitted for the current request (bits of [`Phases`]).
 static ADMITTED: AtomicU32 = AtomicU32::new(0);
+/// Wall time in nanoseconds of the calls the device served, by class, since
+/// the last reset. For `msm` (class 0) it is the time of every hook
+/// invocation, served or declined.
+static SERVED_NS: [AtomicU64; 4] = [const { AtomicU64::new(0) }; 4];
 /// The decline and success classes of the crate contract.
 const CLASSES: [&str; 4] = ["msm", "fft", "ifft", "quotient"];
 const PHASES: [Phases; 4] = [Phases::MSM, Phases::FFT, Phases::IFFT, Phases::QUOTIENT];
 /// Hook calls declined because their phase was not admitted, by class, since
 /// the last reset.
 static NOT_ADMITTED: [AtomicU64; 4] = [const { AtomicU64::new(0) }; 4];
-/// Wall time in nanoseconds of the calls the device served, by class, since
-/// the last reset. For `msm` (class 0) it is the time of every hook
-/// invocation, served or declined (see `msm`).
-static SERVED_NS: [AtomicU64; 4] = [const { AtomicU64::new(0) }; 4];
 /// MSM hook invocations since the last reset, served or declined for any
-/// reason. Depends only on the circuit, not on the scalar values.
+/// reason.
 static MSM_CALLS: AtomicU64 = AtomicU64::new(0);
 /// MSM hook invocations of an admitted MSM phase that the device takes by
 /// their length and bases (`midnight_metal::msm_sized`), served or then
-/// declined, since
-/// the last reset. Depends only on the circuit and the tables, not on the
-/// scalar values.
+/// declined, since the last reset.
 static MSM_SIZED: AtomicU64 = AtomicU64::new(0);
+
+/// The erasure report of a request from `midnight_metal::end_request_report`;
+/// `Err` when it did not confirm the erasure: a region or pool buffer read
+/// back non-zero or could not be read back, or a zeroing panicked.
+fn wipe_result(r: Result<metal::WipeStats, metal::WipeStats>) -> Result<WipeReport, String> {
+    let (w, confirmed) = match r {
+        Ok(w) => (w, true),
+        Err(w) => (w, false),
+    };
+    let report = WipeReport {
+        regions: w.regions,
+        bytes: w.bytes,
+        checked: w.checked,
+        nonzero_regions: w.nonzero_regions,
+        check_failures: w.check_failures,
+        erasure_failures: w.erasure_failures,
+    };
+    if confirmed
+        && report.nonzero_regions == 0
+        && report.check_failures == 0
+        && report.erasure_failures == 0
+    {
+        return Ok(report);
+    }
+    Err(format!(
+        "the device erasure was not confirmed ({} non-zero regions, {} failed checks, {} \
+         failed erasures, of {} regions, {} of them idle pool buffers)",
+        report.nonzero_regions,
+        report.check_failures,
+        report.erasure_failures,
+        report.regions,
+        w.pool_regions
+    ))
+}
+
 /// The request's cancel check ([`Device::set_gate`]).
 static GATE: std::sync::RwLock<Option<crate::service::Cancel>> = std::sync::RwLock::new(None);
 /// The gate withdrew the device phases.
@@ -159,9 +230,9 @@ fn admitted(p: Phases, class: usize) -> bool {
     ok
 }
 
-/// Adds the time since `t` to the served time of `class` when `served`.
-fn timed(class: usize, t: Instant, served: bool) {
-    if served {
+/// Adds the time since `t` to the time of `class` when `counted`.
+fn timed(class: usize, t: Instant, counted: bool) {
+    if counted {
         SERVED_NS[class].fetch_add(t.elapsed().as_nanos() as u64, Relaxed);
     }
 }
@@ -176,8 +247,8 @@ fn msm(scalars: &[Scalar], bases: &[G1AffineLimbs]) -> Option<G1JacobianLimbs> {
         MSM_SIZED.fetch_add(1, Relaxed);
     }
     let r = metal::msm_g1(scalars, bases);
-    // the time of every invocation, so that the figure does not tell a
-    // served MSM from a declined one
+    // every invocation is timed, so that the figure does not tell a served MSM
+    // from a declined one
     timed(0, t, true);
     r
 }
@@ -236,127 +307,76 @@ fn is_fallback(reason: &str) -> bool {
     matches!(reason, "memory" | "device-error" | "shape" | "unreduced")
 }
 
-/// The calls into `midnight-metal` that it exports on macOS only (the
-/// resident tables and key copies, the quotient's figures). On other targets
-/// no device is detected, so these are never reached with a device; they
-/// hold nothing and report zero.
-#[cfg(target_os = "macos")]
-mod sys {
-    use midnight_metal as metal;
-
-    use super::{G1AffineLimbs, Scalar};
-
-    pub type SrsHandle = metal::SrsHandle;
-    pub type KeyHandle = metal::KeyHandle;
-
-    pub fn register_srs(points: &[G1AffineLimbs]) -> SrsHandle {
-        metal::register_srs(points)
+/// The declined hook calls by phase and reason, and the MSM calls the hook
+/// layer declined before they reached the hook (counted in the MSM total).
+/// MSM declines of `midnight-metal` are not broken out: the MSM total covers
+/// them.
+fn decline_rows() -> (Vec<Fallback>, u64) {
+    let row = |class: &str, reason: &str, count: u64| Fallback {
+        phase: class.to_string(),
+        reason: reason.to_string(),
+        count,
+    };
+    let mut rows: Vec<Fallback> = metal::declines()
+        .into_iter()
+        .filter(|(class, _, _)| *class != "msm")
+        .map(|(class, reason, count)| row(class, reason, count))
+        .collect();
+    let mut msm_unhooked = 0;
+    // the hook reason of the hook layer mirrors a decline counted above, so
+    // each declined call is counted once
+    for (class, reason, count) in hooks::hook_declines() {
+        if reason == "hook" {
+            continue;
+        }
+        if class == "msm" {
+            msm_unhooked += count;
+        } else {
+            rows.push(row(class, reason, count));
+        }
     }
-    pub fn table_bytes(h: &SrsHandle) -> u64 {
-        h.device_bytes()
+    for (i, class) in CLASSES.iter().enumerate().skip(1) {
+        let n = NOT_ADMITTED[i].load(Relaxed);
+        if n > 0 {
+            rows.push(row(class, "not-admitted", n));
+        }
     }
-    pub fn register_key(polys: &[&[Scalar]]) -> KeyHandle {
-        metal::register_key(polys)
-    }
-    pub fn key_bytes(h: &KeyHandle) -> u64 {
-        h.resident_bytes()
-    }
-    pub fn set_keep_resident(keep: bool) {
-        metal::set_keep_resident(keep)
-    }
-    pub fn evict_key_copies() -> u64 {
-        metal::evict_key_copies()
-    }
-    pub fn release_pool() -> u64 {
-        metal::release_pool()
-    }
-    pub fn grid_threads(ext_k: u32) -> u64 {
-        u64::from(metal::quotient_threads()).min(1u64 << ext_k)
-    }
-    pub fn need_bytes(ext_k: u32, proof_polys: usize, key_polys: usize, nslots: u32) -> u64 {
-        metal::need_bytes(ext_k, proof_polys, key_polys, nslots) as u64
-    }
+    (rows, msm_unhooked)
 }
 
-#[cfg(not(target_os = "macos"))]
-mod sys {
-    use super::{G1AffineLimbs, Scalar};
-
-    pub type SrsHandle = ();
-    pub type KeyHandle = ();
-
-    pub fn register_srs(_: &[G1AffineLimbs]) -> SrsHandle {}
-    pub fn table_bytes(_: &SrsHandle) -> u64 {
-        0
-    }
-    pub fn register_key(_: &[&[Scalar]]) -> KeyHandle {}
-    pub fn key_bytes(_: &KeyHandle) -> u64 {
-        0
-    }
-    pub fn set_keep_resident(_: bool) {}
-    pub fn evict_key_copies() -> u64 {
-        0
-    }
-    pub fn release_pool() -> u64 {
-        0
-    }
-    pub fn grid_threads(_: u32) -> u64 {
-        0
-    }
-    pub fn need_bytes(_: u32, _: usize, _: usize, _: u32) -> u64 {
-        0
-    }
-}
-
-/// The erasure report of a request from `midnight_metal::end_request_report`;
-/// `Err` when it did not confirm the erasure: a region (a per-request buffer
-/// or, in check mode, an idle buffer of the pool) read back non-zero or
-/// could not be read back, or a zeroing panicked (`erasure_failures`).
-fn wipe_result(r: Result<metal::WipeStats, metal::WipeStats>) -> Result<WipeReport, String> {
-    let (w, ok) = match r {
-        Ok(w) => (w, true),
-        Err(w) => (w, false),
-    };
-    let report = WipeReport {
-        regions: w.regions,
-        bytes: w.bytes,
-        checked: w.checked,
-        nonzero_regions: w.nonzero_regions,
-        check_failures: w.check_failures,
-        erasure_failures: w.erasure_failures,
-    };
-    if ok
-        && report.nonzero_regions == 0
-        && report.check_failures == 0
-        && report.erasure_failures == 0
-    {
-        return Ok(report);
-    }
-    Err(format!(
-        "the device erasure was not confirmed ({} non-zero regions, {} failed checks, {} \
-         failed erasures, of {} regions, {} of them idle pool buffers)",
-        report.nonzero_regions,
-        report.check_failures,
-        report.erasure_failures,
-        report.regions,
-        w.pool_regions
-    ))
+/// The declines of an admitted phase that the device should have taken
+/// (the quotient only when the key reaches its size threshold).
+fn fallback_rows(declines: &[Fallback], admitted: Phases, sized: bool) -> Vec<Fallback> {
+    declines
+        .iter()
+        .filter(|d| is_fallback(&d.reason))
+        .filter(|d| {
+            CLASSES.iter().position(|c| *c == d.phase).is_some_and(|i| {
+                let p = PHASES[i];
+                admitted.contains(p) && (p != Phases::QUOTIENT || sized)
+            })
+        })
+        .cloned()
+        .collect()
 }
 
 #[derive(Default)]
 struct State {
-    /// The registered SRS tables (the four SRS vectors of the params). The
-    /// registration is host work; the first MSM on a slice uploads its table,
-    /// which stays on the device until the handle is dropped.
+    /// The registered SRS tables (the four SRS vectors of the params).
     srs: Vec<sys::SrsHandle>,
-    /// The registered proving-key polynomials. The registration holds no
-    /// device memory; the first device quotient makes the copies, which stay
-    /// between requests only under `keep`.
+    /// The registered proving-key polynomials.
     key: Option<sys::KeyHandle>,
     admitted: Phases,
     /// The extended domain of the prepared key reaches the quotient's size
     /// threshold (`quotient` of `midnight_metal::thresholds`).
     sized: bool,
+}
+
+impl State {
+    /// The device bytes of the uploaded SRS tables.
+    fn table_bytes(&self) -> u64 {
+        self.srs.iter().map(sys::SrsHandle::device_bytes).sum()
+    }
 }
 
 /// The Metal device of this process (the system default device).
@@ -386,14 +406,8 @@ impl MetalDevice {
 impl Device for MetalDevice {
     fn info(&self) -> Option<DeviceInfo> {
         let i = metal::present()?;
-        // Fields with no Metal counterpart stay empty: `runtime_version` and
-        // `driver_version` (Metal has no such figures). `arch` is the Apple
-        // GPU family; `build_archs` names the shading language version the
-        // shaders are built for; `total_bytes` is the recommended working set
-        // of the device (unified memory has no dedicated total). The
-        // registry id, `unified_memory`, `max_buffer_length`,
-        // `max_threads_per_threadgroup` and `metal3` of `MetalInfo` have no
-        // field in `DeviceInfo`.
+        // Metal has no runtime or driver version; unified memory has no
+        // dedicated total, so `total_bytes` is the recommended working set
         Some(DeviceInfo {
             name: i.name.clone(),
             arch: format!("apple{}", i.apple_family),
@@ -427,14 +441,10 @@ impl Device for MetalDevice {
     }
 
     fn held(&self) -> Held {
-        // the bytes on the device now, as midnight-metal counts them: the key
-        // copies of the registered key (made by the first device quotient,
-        // kept between requests under `keep`), and each table uploaded by
-        // its first MSM
         let s = self.state();
         Held {
-            resident: s.key.as_ref().map_or(0, sys::key_bytes),
-            tables: s.srs.iter().map(sys::table_bytes).sum(),
+            resident: s.key.as_ref().map_or(0, sys::KeyHandle::resident_bytes),
+            tables: s.table_bytes(),
         }
     }
 
@@ -446,8 +456,8 @@ impl Device for MetalDevice {
             proof_cosets: q.proof_polys as u32,
             resident_polys: q.key_polys as u32,
             nslots: q.nslots,
-            grid_threads: sys::grid_threads(q.ext_k),
-            quotient_bytes: sys::need_bytes(q.ext_k, q.proof_polys, q.key_polys, q.nslots),
+            grid_threads: u64::from(sys::quotient_threads()).min(1u64 << q.ext_k),
+            quotient_bytes: sys::need_bytes(q.ext_k, q.proof_polys, q.key_polys, q.nslots) as u64,
         })
     }
 
@@ -511,17 +521,16 @@ impl Device for MetalDevice {
     }
 
     fn evict(&self, tables: bool) -> u64 {
-        // the key copies go, the key registration stays (it holds no device
-        // memory); a table is freed only by dropping its handle, which also
-        // drops the registration, so it goes with `tables` only; the pool of
-        // zeroed buffers goes too (after the key copies, which go back to it)
+        // the key copies and the pool of zeroed buffers go (the pool after the
+        // key copies, which go back to it); the key registration stays, as it
+        // holds no device memory; a table is freed by dropping its handle
         let mut s = self.state();
         let before = metal::device_bytes().0;
         sys::evict_key_copies();
-        sys::release_pool();
+        metal::release_pool();
         let mut freed = before.saturating_sub(metal::device_bytes().0);
         if tables {
-            freed += s.srs.iter().map(sys::table_bytes).sum::<u64>();
+            freed += s.table_bytes();
             s.srs.clear();
         }
         freed
@@ -529,17 +538,14 @@ impl Device for MetalDevice {
 
     fn end_request(&self, check: bool) -> Result<WipeReport, String> {
         ADMITTED.store(0, Relaxed);
-        // every per-request region is zeroed (and with `check` read back)
-        // before its release; the key copies go unless `keep`
         wipe_result(metal::end_request_report(check))
     }
 
     fn counters(&self) -> DeviceCounters {
         let s = self.state();
         let st = metal::stats();
-        // no `msm` entry: the served count depends on the scalar values (a
-        // sparse MSM is declined); the MSM total is `msm_count`
-        let calls: BTreeMap<String, u64> = [
+        // no `msm` entry: see the module text
+        let calls = [
             ("fft", st.fft.served),
             ("ifft", st.ifft.served),
             ("quotient", st.quotient.served),
@@ -548,75 +554,22 @@ impl Device for MetalDevice {
         .filter(|(_, n)| *n > 0)
         .map(|(k, n)| (k.to_string(), n))
         .collect();
-        // MSM declines are not broken out (see the module text); the other
-        // classes' reasons depend on lengths and sizes only
-        let mut declines: Vec<Fallback> = metal::declines()
-            .into_iter()
-            .filter(|(class, _, _)| *class != "msm")
-            .map(|(class, reason, count)| Fallback {
-                phase: class.to_string(),
-                reason: reason.to_string(),
-                count,
-            })
-            .collect();
-        // the hook layer's own declines (before it calls the hook); its
-        // `hook` reason mirrors a decline counted above, so it is left out:
-        // each declined call is counted once
-        // MSM calls that never reached the hook, counted into the MSM total
-        let mut msm_count = MSM_CALLS.load(Relaxed);
-        for (class, reason, count) in hooks::hook_declines() {
-            if class == "msm" {
-                if reason != "hook" {
-                    msm_count += count;
-                }
-            } else if reason != "hook" {
-                declines.push(Fallback {
-                    phase: class.to_string(),
-                    reason: reason.to_string(),
-                    count,
-                });
-            }
-        }
-        for (i, c) in CLASSES.iter().enumerate().skip(1) {
-            let n = NOT_ADMITTED[i].load(Relaxed);
-            if n > 0 {
-                declines.push(Fallback {
-                    phase: c.to_string(),
-                    reason: "not-admitted".into(),
-                    count: n,
-                });
-            }
-        }
-        // a fallback: a decline of an admitted phase for a reason other than
-        // size or a missing device
-        let fallbacks = declines
-            .iter()
-            .filter(|d| is_fallback(&d.reason))
-            .filter(|d| {
-                CLASSES.iter().position(|c| *c == d.phase).is_some_and(|i| {
-                    let p = PHASES[i];
-                    s.admitted.contains(p) && (p != Phases::QUOTIENT || s.sized)
-                })
-            })
-            .cloned()
-            .collect();
+        let (declines, msm_unhooked) = decline_rows();
         let seconds = |i: usize| SERVED_NS[i].load(Relaxed) as f64 * 1e-9;
-        let phase_seconds: BTreeMap<String, f64> = CLASSES
+        let phase_seconds = CLASSES
             .iter()
             .enumerate()
             .filter(|(i, _)| *i == 0 || SERVED_NS[*i].load(Relaxed) > 0)
             .map(|(i, c)| (c.to_string(), seconds(i)))
             .collect();
         DeviceCounters {
-            // every MSM hook invocation, on the device or declined to the CPU
-            msm_count,
+            msm_count: MSM_CALLS.load(Relaxed) + msm_unhooked,
             msm_seconds: seconds(0),
             msm_sized: MSM_SIZED.load(Relaxed),
             calls,
-            fallbacks,
+            fallbacks: fallback_rows(&declines, s.admitted, s.sized),
             declines,
-            // the device layer resets its peak only when a request starts on
-            // the device
+            // the peak is reset only when a request starts on the device
             peak_bytes: if s.admitted.is_empty() {
                 0
             } else {
@@ -676,7 +629,11 @@ mod tests {
         };
         // the MSM decline is in the total, not broken out by reason
         assert_eq!(c.msm_count, 1);
-        assert!(c.declines.iter().all(|f| f.phase != "msm"), "{:?}", c.declines);
+        assert!(
+            c.declines.iter().all(|f| f.phase != "msm"),
+            "{:?}",
+            c.declines
+        );
         assert!(!c.calls.contains_key("msm"));
         assert_eq!(row("fft", "not-admitted"), 1, "{:?}", c.declines);
         assert_eq!(row("ifft", "not-admitted"), 1, "{:?}", c.declines);
@@ -751,7 +708,7 @@ mod tests {
         }))
         .unwrap_err();
         assert!(e.contains("2 failed checks"), "{e}");
-        // a zeroing that panicked is an erasure failure, reported as such
+        // a zeroing that panicked is an erasure failure
         let e = wipe_result(Err(metal::WipeStats {
             erasure_failures: 1,
             ..w
@@ -761,7 +718,7 @@ mod tests {
             e.contains("0 non-zero regions, 0 failed checks, 1 failed erasures"),
             "{e}"
         );
-        // and is counted even if the crate's result were `Ok`
+        // also when the crate's result is `Ok`
         let e = wipe_result(Ok(metal::WipeStats {
             erasure_failures: 1,
             ..w
@@ -777,21 +734,9 @@ mod tests {
         assert_eq!(r.erasure_failures, 0);
     }
 
-    /// `keep` turns on the crate's keep setting.
-    #[cfg(target_os = "macos")]
-    #[test]
-    fn keep_sets_the_crate_policy() {
-        let _g = SERIAL.lock().unwrap_or_else(|e| e.into_inner());
-        let d = device();
-        d.set_keep(true);
-        assert!(metal::keep_resident());
-        d.set_keep(false);
-        assert!(!metal::keep_resident());
-    }
-
-    /// The registered tables and key hold no device memory until a device
-    /// call uploads them; `prepare` registers the four SRS vectors and the
-    /// key; the quotient need is the crate's own figure.
+    /// `prepare` registers the four SRS vectors and the key, which hold no
+    /// device memory until a device call uploads them; the shape carries the
+    /// crate's own quotient figures.
     #[cfg(all(target_os = "macos", feature = "test-seed"))]
     #[test]
     fn prepare_registers_and_held_counts_device_bytes_only() {

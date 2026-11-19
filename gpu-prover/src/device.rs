@@ -19,19 +19,18 @@
 //! implementations exist:
 //!
 //! - [`NoDevice`]: no device. Every phase runs on the CPU. Used by a build
-//!   without the `cuda` and `metal` features, by `device = "off"`, and when
-//!   the run-time detection finds no device.
+//!   without the `cuda` and `metal` features, by `device = "off"`, and when the
+//!   run-time detection finds no device.
 //! - `CudaDevice` (module `cuda`): the hooks of `midnight_proofs::gpu` backed
 //!   by `midnight-gpu`. It is compiled only when the build has the cfg
 //!   `midnight_gpu_linked`, which the build script sets with the `cuda`
 //!   feature.
 //! - `MetalDevice` (module `metal`, file `device/metal.rs`): the same hooks
-//!   backed by `midnight-metal`. It is compiled only when the build has the
-//!   cfg `midnight_metal_linked`, which the build script sets with the `metal`
+//!   backed by `midnight-metal`. It is compiled only when the build has the cfg
+//!   `midnight_metal_linked`, which the build script sets with the `metal`
 //!   feature. A build with both features tries CUDA first: the hooks of
-//!   `midnight_proofs::gpu` are installed once per process, so when a CUDA
-//!   device is detected the Metal binding cannot install and reports no device
-//!   (in practice no machine has both).
+//!   `midnight_proofs::gpu` are installed once per process, so after a CUDA
+//!   device is detected the Metal binding reports no device.
 //!
 //! Tests and embedders can implement [`Device`] themselves, for example to
 //! give the admission ladder a fake memory reading.
@@ -129,11 +128,9 @@ pub struct DeviceInfo {
     /// Total device memory, bytes.
     pub total_bytes: u64,
     /// The log2 size from which each kernel class goes to the device, by
-    /// class, when the device layer has per-class thresholds (the Metal
-    /// device: `fft`, `ifft`, `msm-table`, `msm-one-shot`, `quotient-ext`);
-    /// empty otherwise. `None` (JSON `null`): the class never goes to the
-    /// device (the Metal `msm-one-shot` with the default thresholds: an MSM
-    /// whose bases no registered table serves runs on the CPU).
+    /// class. Metal only (`fft`, `ifft`, `msm-table`, `msm-one-shot`,
+    /// `quotient-ext`); empty for CUDA. `None` (JSON `null`): the class never
+    /// goes to the device (`msm-one-shot` with the default thresholds).
     #[serde(skip_serializing_if = "BTreeMap::is_empty")]
     pub size_thresholds: BTreeMap<String, Option<u32>>,
 }
@@ -197,23 +194,20 @@ pub struct Fallback {
 /// time; no field depends on a scalar value.
 #[derive(Clone, Debug, Default, PartialEq, Serialize)]
 pub struct DeviceCounters {
-    /// MSM count of the request. CUDA: the MSMs that ran on the device.
-    /// Metal: every MSM hook invocation, served on the device or declined to
-    /// the stock CPU MSM (a sparse MSM is declined, so the served count
-    /// depends on the scalar values and is not reported).
+    /// MSM count. CUDA: the MSMs that ran on the device. Metal: every MSM
+    /// hook invocation, served or declined to the stock CPU MSM (the served
+    /// count depends on the scalar values and is not reported).
     pub msm_count: u64,
     /// MSM seconds. CUDA: the wall time of the device MSMs. Metal: the wall
-    /// time inside every MSM hook invocation, served or declined.
+    /// time of every MSM hook invocation.
     pub msm_seconds: f64,
-    /// MSM hook invocations of an admitted MSM phase that the device takes
-    /// by their length (thresholds and table registration, no scalar read),
-    /// served or then declined. Metal only (`midnight_metal::msm_sized`),
-    /// for [`DeviceCounters::device_ran`]; 0 for CUDA, whose served MSMs are
-    /// in `calls`.
+    /// Metal only (0 for CUDA, whose served MSMs are in `calls`): MSM hook
+    /// invocations of an admitted phase that the device takes by their
+    /// length and bases, without reading a scalar
+    /// (`midnight_metal::msm_sized`). Read by [`DeviceCounters::device_ran`].
     pub msm_sized: u64,
-    /// Device calls by operation name: the calls the device served. CUDA:
-    /// `msm`, `fft`, `ifft`, `quotient`. Metal: `fft`, `ifft`, `quotient`
-    /// (no `msm`: see `msm_count`).
+    /// Device calls served, by operation name: `msm`, `fft`, `ifft`,
+    /// `quotient` for CUDA; the same without `msm` for Metal.
     pub calls: BTreeMap<String, u64>,
     /// Fallbacks to the CPU: declines of an admitted phase that the device
     /// should have taken.
@@ -221,14 +215,11 @@ pub struct DeviceCounters {
     /// Every declined hook call by phase and reason, fallbacks included:
     /// also the size threshold (`below-min-k`), no device (`no-device`) and
     /// the admission's decision (`not-admitted`). Metal: no `msm` row (the
-    /// MSM declines of `midnight-metal` depend on the scalar values or are
-    /// not shown to be independent of them; every MSM invocation is in
-    /// `msm_count`).
+    /// MSM declines depend on the scalar values; see `msm_count`).
     pub declines: Vec<Fallback>,
-    /// Peak device bytes this process held during the request: the peak,
-    /// since the request started on the device, of the bytes in use (buffers
-    /// handed out, resident MSM tables and key copies), without a pool of
-    /// idle buffers.
+    /// Peak device bytes this process held during the request: buffers handed
+    /// out, resident MSM tables and key copies, without a pool of idle
+    /// buffers.
     pub peak_bytes: u64,
     /// Seconds per prover phase, by phase name.
     pub phase_seconds: BTreeMap<String, f64>,
@@ -241,12 +232,10 @@ impl DeviceCounters {
     }
 
     /// Whether a call of an admitted phase ran on the device, for the
-    /// record's label, from counts that do not depend on the scalar values:
-    /// a served call in `calls` (CUDA: every class; Metal: `fft`, `ifft`,
-    /// `quotient`, whose service depends on lengths and sizes only), or an
-    /// MSM the device takes by its length (`msm_sized`, Metal). A call
-    /// declined below the size threshold, by a missing device or by the
-    /// admission does not count.
+    /// record's label, from counts that do not depend on the scalar values: a
+    /// served call in `calls`, or an MSM the device takes by its length
+    /// (`msm_sized`). A call declined below the size threshold, by a missing
+    /// device or by the admission does not count.
     pub fn device_ran(&self) -> bool {
         self.calls.values().sum::<u64>() > 0 || self.msm_sized > 0
     }

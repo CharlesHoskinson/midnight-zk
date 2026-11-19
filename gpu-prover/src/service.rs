@@ -636,15 +636,15 @@ impl<R: ServedRelation> ProverService<R> {
             }
         };
 
-        // GPU-085 with GPU-012: no call ran on the device is `cpu`; a call
-        // that ran and a real fallback (shape, unreduced, memory, fault,
+        // GPU-085 with GPU-012: no call that ran on the device is `cpu`; a
+        // call that ran and a real fallback (shape, unreduced, memory, fault,
         // device-error, or a withdrawn request) is `gpu-degraded`; else
         // `gpu`. Expected declines (below the size threshold, no device) are
         // no fallback, and the admission alone never marks the label: its
         // reasons stay in `degraded_reasons` (GPU-023). Whether a call ran
         // is read from counts that do not depend on the witness
-        // (`DeviceCounters::device_ran`): with the Metal backend, a sparse
-        // MSM declined to the CPU counts as an MSM the device took by its
+        // (`DeviceCounters::device_ran`): with the Metal backend a sparse MSM
+        // declined to the CPU still counts as an MSM the device takes by its
         // length, so the label does not tell a sparse witness from a dense
         // one
         let ran = counters.device_ran();

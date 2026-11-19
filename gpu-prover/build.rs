@@ -25,11 +25,13 @@ fn main() {
         println!("cargo::rustc-cfg=midnight_gpu_linked");
     }
     println!("cargo::rustc-check-cfg=cfg(midnight_metal_linked)");
-    // the `metal` feature links `midnight-metal` and the hooks of midnight-proofs
+    // the `metal` feature links `midnight-metal` and the hooks of
+    // midnight-proofs
     if std::env::var_os("CARGO_FEATURE_METAL").is_some() {
         println!("cargo::rustc-cfg=midnight_metal_linked");
     }
-    // the rc1 benchmark runs in `gpu` mode when either device feature of it is on
+    // the rc1 benchmark runs in `gpu` mode when either device feature of it is
+    // on
     println!("cargo::rustc-check-cfg=cfg(rc1_device)");
     if std::env::var_os("CARGO_FEATURE_RC1_BENCH_CUDA").is_some()
         || std::env::var_os("CARGO_FEATURE_RC1_BENCH_METAL").is_some()
