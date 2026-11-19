@@ -988,6 +988,13 @@ fn bench_quotient() {
         let pk = keygen_pk(vk, &circuit).unwrap();
         let shape = hooks::quotient_shape(&pk).expect("a quotient job");
         let inst = circuit.instance();
+        // the key registered as the prover binding registers it; its copies
+        // stay between requests with QBENCH_KEEP=1
+        let polys = pk.gpu_resident_polys().expect("resident polynomials");
+        let key = metal::register_key(
+            &polys.iter().map(|p| hooks::adapter::scalars(p)).collect::<Vec<_>>(),
+        );
+        metal::set_keep_resident(std::env::var("QBENCH_KEEP").as_deref() == Ok("1"));
         for t in &threads {
             qt::set_threads(*t);
             DEV.lock().unwrap().clear();
@@ -1007,6 +1014,7 @@ fn bench_quotient() {
             let diffs = hooks::quotient_check_diffs();
             let mut stock = Vec::new();
             for _ in 0..proofs {
+                metal::begin_request();
                 let mut transcript = CircuitTranscript::<Blake2b256>::init();
                 create_proof::<Fq, Scheme, _, _>(
                     &params,
@@ -1053,25 +1061,37 @@ fn bench_quotient() {
                 peak as f64 / 1048576.0,
                 need as f64 / 1048576.0
             );
-            println!(
-                "|   stages ms: prepare {:.1}, keys {:.1} (overlapped), cosets {:.1} (gpu {:.1}), numerator {:.1} (gpu {:.1}, {} cb), divide {:.1} (gpu {:.1}), inverse {:.1} (gpu {:.1}), read-back {:.1}; proof polys {}, key polys {}, nslots {} |",
-                ms(st.prepare),
-                ms(st.keys),
-                ms(st.cosets),
-                ms(st.gpu_cosets),
-                ms(st.numerator),
-                ms(st.gpu_numerator),
-                st.numerator_runs,
-                ms(st.divide),
-                ms(st.gpu_divide),
-                ms(st.inverse),
-                ms(st.gpu_inverse),
-                ms(st.readback),
-                shape.proof_polys,
-                shape.key_polys,
-                shape.nslots
-            );
+            let stages = |what: &str, ns: u64, st: &metal::QuotientStages| {
+                println!(
+                    "|   {what} {:.1} ms; stages ms: prepare {:.1}, keys {:.1} (overlapped), cosets {:.1} (gpu {:.1}), numerator {:.1} (gpu {:.1}, {} cb), divide {:.1} (gpu {:.1}), inverse {:.1} (gpu {:.1}), read-back {:.1}; gpu {:.1}; proof polys {}, key polys {}, nslots {}, key copies made {} |",
+                    ms(ns),
+                    ms(st.prepare),
+                    ms(st.keys),
+                    ms(st.cosets),
+                    ms(st.gpu_cosets),
+                    ms(st.numerator),
+                    ms(st.gpu_numerator),
+                    st.numerator_runs,
+                    ms(st.divide),
+                    ms(st.gpu_divide),
+                    ms(st.inverse),
+                    ms(st.gpu_inverse),
+                    ms(st.readback),
+                    ms(st.gpu_cosets + st.gpu_numerator + st.gpu_divide + st.gpu_inverse),
+                    shape.proof_polys,
+                    shape.key_polys,
+                    shape.nslots,
+                    st.key_copies_made
+                );
+            };
+            stages("best call", dns, &st);
+            // the first call of each proof: the one a prover makes (keys
+            // checked and copied, per-request buffers new to the request)
+            let (fns, fst) = *dev.iter().step_by(3).min_by_key(|d| d.0).unwrap();
+            stages("first call of a request (best)", fns, &fst);
         }
         qt::set_threads(None);
+        metal::set_keep_resident(false);
+        drop(key);
     }
 }

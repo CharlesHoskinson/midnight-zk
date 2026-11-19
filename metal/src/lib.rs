@@ -26,7 +26,9 @@
 //! });
 //! ```
 //!
-//! This crate does not depend on midnight-curves or midnight-proofs.
+//! This crate does not depend on midnight-proofs. On macOS it depends on
+//! midnight-curves for the CPU share of a G1 MSM, which runs the stock
+//! `msm_pippenger` (see "Size thresholds").
 //!
 //! ## The hook contract
 //!
@@ -101,6 +103,10 @@
 //! - `MIDNIGHT_METAL=off`: use no device (every call declines `no-device`).
 //! - `MIDNIGHT_METAL_MIN_K` (unset by default): one log2 size threshold for
 //!   every class, replacing the per-class defaults (see "Size thresholds").
+//! - `MIDNIGHT_METAL_MSM_CPU_SHARE=off`: run every G1 MSM on the device
+//!   only. By default a measured share of the points of an MSM of `2^14` or
+//!   more goes to the stock CPU MSM, which runs at the same time as the
+//!   device (see the `msm` module text, "The CPU share").
 //! - `MIDNIGHT_METAL_SHADER_SOURCE=1` (run time): compile the embedded source
 //!   instead of loading the embedded metallib. At build time it skips the
 //!   toolchain.
@@ -126,16 +132,42 @@
 //! machine. Other machines may break even elsewhere: set one threshold
 //! explicitly there. [`thresholds`] gives the effective values (for reports).
 //!
+//! An MSM is compared twice: by its length against its threshold, and by its
+//! effective size, the count of its non-zero scalars (1 when all are zero),
+//! against `max(2^msm_table, n/5)` on a registered table and
+//! `max(2^msm_one_shot, n/3)` otherwise (`n` the length). A mostly-zero MSM
+//! (a permutation product or quotient limb with a handful of non-zero
+//! coefficients) costs the masked device MSM as much as a dense one of its
+//! length, while the stock CPU MSM, whose time follows the sparsity,
+//! finishes in about a millisecond; the fractions are the measured
+//! crossovers on Apple M4 Max, 2026-11-19 (`n/5.3` and `n/2.9` on `2^20`
+//! points, with the CPU share of the split active; measured under load, see
+//! the `msm` module). Below its need the MSM declines `below-min-k` before
+//! any device work. The count is not kept, logged, counted or returned: the
+//! ordinary `below-min-k` decline is the only observable. An explicit
+//! threshold replaces the need entirely (`2^min_k`, no fraction of `n`), so
+//! `set_min_k(0)` admits every MSM.
+//!
 //! ## Requests
 //!
 //! Call [`begin_request`] and [`end_request`] (or [`end_request_report`])
-//! around each proof: it zeroes and releases the per-request buffers (which
-//! can hold witness values), with [`end_request_report`]`(true)` reading each
-//! one back from the host mapping before its release and counting the
-//! regions that are not zero. Scoped buffers (owned by one call) are zeroed
-//! when dropped, at the end of that call; they are not in the report. A
-//! region that fails the check is zeroed again, released and reported: there
-//! is no quarantine and no retry, unlike the wipe layer of the CUDA crate.
+//! around each proof: it zeroes the per-request buffers (which can hold
+//! witness values), with [`end_request_report`]`(true)` reading each one back
+//! from the host mapping and counting the regions that are not zero. Scoped
+//! buffers (owned by one call) are zeroed when dropped, at the end of that
+//! call or on a background thread that [`end_request`] waits for; they are
+//! not in the report. A region that fails the check is zeroed again and
+//! reported: there is no quarantine and no retry, unlike the wipe layer of
+//! the CUDA crate.
+//!
+//! The large buffers, per-request and scoped, come from a pool of zeroed
+//! buffers and go back to it after their zeroing, instead of being released:
+//! a new buffer makes the first command buffer that uses it wait while its
+//! pages are mapped for the GPU (about 20 ms for 448 MiB on an M4 Max), a
+//! pooled one does not. Every buffer in the pool reads zero. The pool keeps
+//! at most `ctx::pool_limit` bytes (`MIDNIGHT_METAL_POOL_MIB`, default a
+//! quarter of `recommendedMaxWorkingSetSize`); [`release_pool`] releases it,
+//! and [`pool_bytes`] says what it holds.
 
 #![deny(missing_docs)]
 #![deny(missing_debug_implementations)]
@@ -455,7 +487,10 @@ pub fn msm_admission(scalars: usize, bases: usize, max_log: u32) -> Result<(), &
 ///
 /// An MSM on a registered SRS table ([`register_srs`]) is taken from
 /// `2^msm_table`, any other from `2^msm_one_shot` ([`thresholds`]); the
-/// shorter one-shot MSM declines `below-min-k` before any device work.
+/// shorter one-shot MSM declines `below-min-k` before any device work. The
+/// count of non-zero scalars (the effective size, 1 when all are zero) is
+/// held to the same threshold and, with the default thresholds, to `n/5`
+/// (table) or `n/3` (one-shot), with the same decline.
 pub fn msm_g1(scalars: &[Scalar], bases: &[G1AffineLimbs]) -> Option<G1JacobianLimbs> {
     if let Err(why) = msm_admission(scalars.len(), bases.len(), MAX_MSM_LOG) {
         let r = if why == Reason::Shape.name() {
@@ -479,6 +514,26 @@ pub fn msm_g1(scalars: &[Scalar], bases: &[G1AffineLimbs]) -> Option<G1JacobianL
         account::decline(Class::Msm, Reason::NoDevice);
         return None;
     }
+    // the effective size (the non-zero scalars) against the need of the
+    // path (crate text, "Size thresholds"); only the decline is observable.
+    // After the device check: with no device every call declines
+    // `no-device`, and no scan is made for nothing.
+    #[cfg(target_os = "macos")]
+    let one_shot_min = {
+        let t = thresholds();
+        let n = scalars.len();
+        let need = if tabled {
+            msm::effective_need(n, t.msm_table, true, t.explicit)
+        } else {
+            msm::effective_need(n, t.msm_one_shot, false, t.explicit)
+        };
+        if !msm::effective_size_reaches(scalars, need) {
+            account::decline(Class::Msm, Reason::BelowMinK);
+            return None;
+        }
+        // a table that turns out stale falls back to the one-shot need
+        msm::effective_need(n, t.msm_one_shot, false, t.explicit)
+    };
     if !field::all_reduced(scalars) {
         account::decline(Class::Msm, Reason::Unreduced);
         return None;
@@ -601,12 +656,13 @@ pub struct WipeStats {
 }
 
 /// Ends a request (call it between proofs): waits for any device work in
-/// progress, then zeroes every per-request buffer, with `check` reads each
-/// one back from the host and compares it with zero, and releases it; then
-/// frees the proving-key copies unless [`keep_resident`]. `Err`: a region
-/// read back non-zero or could not be read (the region is zeroed again and
-/// released: there is no quarantine). On other targets, or before the
-/// context exists, there is no region.
+/// progress and for the zeroing still running in the background, then
+/// zeroes every per-request buffer, with `check` reads each one back from
+/// the host and compares it with zero, and puts it back into the pool of
+/// zeroed buffers; then frees the proving-key copies unless
+/// [`keep_resident`]. `Err`: a region read back non-zero or could not be
+/// read (the region is zeroed again: there is no quarantine). On other
+/// targets, or before the context exists, there is no region.
 pub fn end_request_report(check: bool) -> Result<WipeStats, WipeStats> {
     #[cfg(target_os = "macos")]
     {
@@ -622,13 +678,37 @@ pub fn end_request_report(check: bool) -> Result<WipeStats, WipeStats> {
 }
 
 /// [`end_request_report`] without the read-back: `true` when every
-/// per-request buffer was zeroed and released.
+/// per-request buffer was zeroed and put back into the pool.
 pub fn end_request() -> bool {
     end_request_report(false).is_ok()
 }
 
-/// `(now, peak)` bytes this process holds in Metal buffers of this crate;
-/// the peak is since process start or the last [`begin_request`].
+/// Releases the pool of zeroed buffers (see "Requests" in the crate text),
+/// after the zeroing still running in the background has ended. Returns the
+/// bytes released.
+pub fn release_pool() -> u64 {
+    #[cfg(target_os = "macos")]
+    {
+        ctx::release_pool()
+    }
+    #[cfg(not(target_os = "macos"))]
+    0
+}
+
+/// Bytes of the idle, zeroed buffers in the pool (kept for the next
+/// request; part of [`device_bytes`]).
+pub fn pool_bytes() -> u64 {
+    #[cfg(target_os = "macos")]
+    {
+        ctx::pool_bytes()
+    }
+    #[cfg(not(target_os = "macos"))]
+    0
+}
+
+/// `(now, peak)` bytes this process holds in Metal buffers of this crate,
+/// the idle buffers of the pool included ([`pool_bytes`]); the peak is since
+/// process start or the last [`begin_request`].
 pub fn device_bytes() -> (u64, u64) {
     #[cfg(target_os = "macos")]
     {
@@ -644,7 +724,8 @@ pub fn device_bytes() -> (u64, u64) {
 /// the memory the GPU can use without hurting performance. `free` is `total`
 /// minus `MTLDevice.currentAllocatedSize` (everything this process has
 /// allocated on the device: buffers, the library, pipelines, driver
-/// structures), saturating at zero.
+/// structures), plus the idle buffers of the pool ([`pool_bytes`], reused
+/// before any new allocation), saturating at zero and at most `total`.
 ///
 /// On unified memory these are neither physical figures nor reservations:
 /// the GPU allocates from the same system memory as the CPU, other processes

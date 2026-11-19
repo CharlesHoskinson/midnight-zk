@@ -38,6 +38,10 @@
 //!   keeps the registration, which holds no device memory (the CUDA binding
 //!   drops it and registers the key again at the next `prepare`); `held`
 //!   reports `KeyHandle::resident_bytes`.
+//! - The pool of zeroed buffers: `midnight-metal` keeps its large buffers
+//!   between requests, zeroed (a new buffer delays the first command buffer
+//!   that uses it); `evict` releases them (`release_pool`), and the free
+//!   memory of `mem` counts them as free (`midnight_metal::mem_info`).
 //! - The erasure report: `midnight_metal::end_request_report` zeroes every
 //!   per-request region and, with the request's check, reads each one back
 //!   from the host mapping (unified memory) and compares it with zero. The
@@ -204,6 +208,9 @@ mod sys {
     pub fn evict_key_copies() -> u64 {
         metal::evict_key_copies()
     }
+    pub fn release_pool() -> u64 {
+        metal::release_pool()
+    }
     pub fn grid_threads(ext_k: u32) -> u64 {
         u64::from(metal::quotient_threads()).min(1u64 << ext_k)
     }
@@ -229,6 +236,9 @@ mod sys {
     }
     pub fn set_keep_resident(_: bool) {}
     pub fn evict_key_copies() -> u64 {
+        0
+    }
+    pub fn release_pool() -> u64 {
         0
     }
     pub fn grid_threads(_: u32) -> u64 {
@@ -434,9 +444,13 @@ impl Device for MetalDevice {
     fn evict(&self, tables: bool) -> u64 {
         // the key copies go, the key registration stays (it holds no device
         // memory); a table is freed only by dropping its handle, which also
-        // drops the registration, so it goes with `tables` only
+        // drops the registration, so it goes with `tables` only; the pool of
+        // zeroed buffers goes too (after the key copies, which go back to it)
         let mut s = self.state();
-        let mut freed = sys::evict_key_copies();
+        let before = metal::device_bytes().0;
+        sys::evict_key_copies();
+        sys::release_pool();
+        let mut freed = before.saturating_sub(metal::device_bytes().0);
         if tables {
             freed += s.srs.iter().map(sys::table_bytes).sum::<u64>();
             s.srs.clear();
@@ -621,7 +635,9 @@ mod tests {
         d.reset_counters();
         assert_eq!(d.counters().peak_bytes, 0);
         assert_eq!(d.held(), Held::default());
-        assert_eq!(d.evict(true), 0);
+        // nothing but the idle pool of zeroed buffers
+        let pooled = metal::pool_bytes();
+        assert_eq!(d.evict(true), pooled);
     }
 
     /// A failed read-back check fails the request's erasure report and is
@@ -687,7 +703,8 @@ mod tests {
             shape.grid_threads,
             u64::from(metal::quotient_threads()).min(1 << q.ext_k)
         );
-        assert_eq!(d.evict(true), 0);
+        let pooled = metal::pool_bytes();
+        assert_eq!(d.evict(true), pooled);
         assert!(d.state().srs.is_empty());
     }
 }

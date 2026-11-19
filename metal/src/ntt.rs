@@ -302,8 +302,9 @@ struct Job<'b> {
     dir: Dir,
     /// The first pass's input: `2^log_n` elements, or `n_src` with `coset`.
     src: &'b Buffer,
-    /// The result's buffer.
+    /// The result's buffer, and the byte offset of the result in it.
     dst: &'b Buffer,
+    dst_off: usize,
     /// Scratch of `2^log_n` elements (unused by one pass).
     tmp: &'b Buffer,
     /// The divisor folded into the last pass.
@@ -311,6 +312,13 @@ struct Job<'b> {
     /// `(n_src, [z1, z2])`: the first pass reads `src` as coeff_to_extended
     /// does (index `i < n_src` times `[1, z1, z2][i mod 3]`, zero beyond).
     coset: Option<(usize, [Scalar; 2])>,
+    /// `(t, log_tn)`: before the first pass, `src[i] *= t[i mod 2^log_tn]`
+    /// ([`encode_mul_periodic`], in the first command buffer; `src` is then
+    /// `dst` at offset 0).
+    pre_mul: Option<(&'b Buffer, u32)>,
+    /// After the last pass, `dst[i] *= [1, z1, z2][i mod 3]`
+    /// ([`encode_distribute_zeta`], in the last command buffer).
+    post_zeta: Option<[Scalar; 2]>,
 }
 
 fn check_len(b: &Buffer, elems: usize, what: &str) -> Result<(), Error> {
@@ -334,7 +342,21 @@ fn run_job(ctx: &Ctx, job: &Job<'_>) -> Result<u64, Error> {
     let n = 1usize << log_n;
     let radices = plan(log_n);
     let passes = radices.len();
-    check_len(job.dst, n, "data")?;
+    if !job.dst_off.is_multiple_of(SCALAR_BYTES)
+        || job.dst.len_bytes() < job.dst_off + n * SCALAR_BYTES
+        || (job.dst_off != 0
+            && (std::ptr::eq(job.src, job.dst) || job.pre_mul.is_some() || job.post_zeta.is_some()))
+    {
+        return Err(Error::Device(format!(
+            "ntt: the data buffer holds {} bytes, {} needed at offset {}",
+            job.dst.len_bytes(),
+            n * SCALAR_BYTES,
+            job.dst_off
+        )));
+    }
+    if job.pre_mul.is_some() && (!std::ptr::eq(job.src, job.dst) || job.coset.is_some()) {
+        return Err(Error::Device("ntt: a periodic factor on a copy".into()));
+    }
     if passes > 1 {
         check_len(job.tmp, n, "scratch")?;
     }
@@ -360,21 +382,23 @@ fn run_job(ctx: &Ctx, job: &Job<'_>) -> Result<u64, Error> {
     // the divisor, folded into the low table of the last pass (a scaled copy
     // made in the first command buffer)
     let scaled = match job.scale {
-        Some(_) => Some(ctx.alloc(SCALAR_BYTES << (UNIVERSAL_LOG - tables.hi_bits))?),
+        Some(_) => Some(ctx.alloc_pooled(SCALAR_BYTES << (UNIVERSAL_LOG - tables.hi_bits))?),
         None => None,
     };
 
-    // (input, output) of each pass: the passes before the last alternate
-    // between `tmp` and `dst` (never writing their own input); the last pass
-    // writes `dst`, in place when its input is `dst` already.
-    let io: Vec<(&Buffer, &Buffer)> = {
-        let mut cur = job.src;
+    // (input, output) of each pass, as (buffer, byte offset): the passes
+    // before the last alternate between `tmp` and `dst` (never writing their
+    // own input); the last pass writes `dst`, in place when its input is
+    // `dst` already.
+    type At<'x> = (&'x Buffer, usize);
+    let io: Vec<(At, At)> = {
+        let mut cur = (job.src, 0);
         (0..passes)
             .map(|q| {
                 let out = if q + 1 == passes || q % 2 == 1 {
-                    job.dst
+                    (job.dst, job.dst_off)
                 } else {
-                    job.tmp
+                    (job.tmp, 0)
                 };
                 let pair = (cur, out);
                 cur = out;
@@ -382,6 +406,7 @@ fn run_job(ctx: &Ctx, job: &Job<'_>) -> Result<u64, Error> {
             })
             .collect()
     };
+    let post_zeta = job.post_zeta;
 
     let mut params = Vec::with_capacity(passes);
     let mut log_p = 0u32;
@@ -432,8 +457,12 @@ fn run_job(ctx: &Ctx, job: &Job<'_>) -> Result<u64, Error> {
         }
         let lo = scaled.as_ref();
         let first = q == 0;
+        let last_cb = end == passes;
         ns += ctx
             .run(|cmd| {
+                if let (true, Some((t, log_tn))) = (first, job.pre_mul) {
+                    encode_mul_periodic(cmd, job.dst, n, t, log_tn)?;
+                }
                 if let (true, Some(b), Some(c)) = (first, lo, job.scale.as_ref()) {
                     cmd.dispatch(
                         "ntt_scale_copy",
@@ -447,10 +476,10 @@ fn run_job(ctx: &Ctx, job: &Job<'_>) -> Result<u64, Error> {
                         (true, Some(s)) => s,
                         _ => &tables.lo[d],
                     };
-                    let (src, dst) = io[i];
+                    let ((src, src_off), (dst, dst_off)) = io[i];
                     let args = [
-                        Arg::Buffer(src),
-                        Arg::Buffer(dst),
+                        Arg::BufferAt(src, src_off),
+                        Arg::BufferAt(dst, dst_off),
                         Arg::Buffer(hi),
                         Arg::Buffer(lo_tab),
                         Arg::value(p),
@@ -467,6 +496,10 @@ fn run_job(ctx: &Ctx, job: &Job<'_>) -> Result<u64, Error> {
                         &args,
                         &[SCALAR_BYTES << e_log],
                     )?;
+                }
+                if let (true, Some(z)) = (last_cb, post_zeta.as_ref()) {
+                    // the data is at offset 0 here (checked above)
+                    encode_distribute_zeta(cmd, job.dst, n, z)?;
                 }
                 Ok(())
             })?
@@ -504,9 +537,12 @@ pub(crate) fn ntt_dev(
             dir,
             src: a,
             dst: a,
+            dst_off: 0,
             tmp,
             scale: scale.copied(),
             coset: None,
+            pre_mul: None,
+            post_zeta: None,
         },
     )
 }
@@ -529,6 +565,23 @@ pub(crate) fn coeff_to_extended_dev(
     ext_k: u32,
     zeta: &[Scalar; 2],
 ) -> Result<u64, Error> {
+    coeff_to_extended_dev_at(ctx, src, dst, 0, tmp, k, ext_k, zeta)
+}
+
+/// [`coeff_to_extended_dev`] into `dst` from the byte offset `dst_off` (a
+/// multiple of 32): the result is `2^ext_k` elements there, so that a coset
+/// is written straight into its place in a larger buffer.
+#[allow(clippy::too_many_arguments)]
+pub(crate) fn coeff_to_extended_dev_at(
+    ctx: &Ctx,
+    src: &Buffer,
+    dst: &Buffer,
+    dst_off: usize,
+    tmp: &Buffer,
+    k: u32,
+    ext_k: u32,
+    zeta: &[Scalar; 2],
+) -> Result<u64, Error> {
     if k < 1 || k > ext_k || ext_k > MAX_LOG_N {
         return Err(Error::Device(format!(
             "coeff_to_extended: dimensions k {k}, ext_k {ext_k}"
@@ -546,9 +599,12 @@ pub(crate) fn coeff_to_extended_dev(
             dir: Dir::Forward,
             src,
             dst,
+            dst_off,
             tmp,
             scale: None,
             coset: Some((1usize << k, *zeta)),
+            pre_mul: None,
+            post_zeta: None,
         },
     )
 }
@@ -556,8 +612,9 @@ pub(crate) fn coeff_to_extended_dev(
 /// `extended_to_coeff` on the device, in place on `a[..2^ext_k]`: the NTT at
 /// `w^-1` of the `2^ext_k` domain, every element times `divisor` (the
 /// domain's `extended_ifft_divisor`, folded into the last pass), then
-/// [`encode_distribute_zeta`] with `zeta_out` (`[g_coset_inv, g_coset]`).
-/// `tmp` as for [`ntt_dev`]. Returns the GPU time.
+/// [`encode_distribute_zeta`] with `zeta_out` (`[g_coset_inv, g_coset]`, in
+/// the last command buffer of the transform). `tmp` as for [`ntt_dev`].
+/// Returns the GPU time.
 pub(crate) fn extended_to_coeff_dev(
     ctx: &Ctx,
     a: &Buffer,
@@ -566,9 +623,53 @@ pub(crate) fn extended_to_coeff_dev(
     divisor: &Scalar,
     zeta_out: &[Scalar; 2],
 ) -> Result<u64, Error> {
-    let mut ns = ntt_dev(ctx, a, tmp, ext_k, Dir::Inverse, Some(divisor))?;
-    ns += ctx.run(|cmd| encode_distribute_zeta(cmd, a, 1usize << ext_k, zeta_out))?.1;
-    Ok(ns)
+    run_job(
+        ctx,
+        &Job {
+            log_n: ext_k,
+            dir: Dir::Inverse,
+            src: a,
+            dst: a,
+            dst_off: 0,
+            tmp,
+            scale: Some(*divisor),
+            coset: None,
+            pre_mul: None,
+            post_zeta: Some(*zeta_out),
+        },
+    )
+}
+
+/// [`encode_mul_periodic`] of `a` by `t` (`2^log_tn` elements: the division
+/// by the vanishing polynomial), then [`extended_to_coeff_dev`], with the
+/// multiplication in the transform's first command buffer. Returns the GPU
+/// time.
+#[allow(clippy::too_many_arguments)]
+pub(crate) fn divide_extended_to_coeff_dev(
+    ctx: &Ctx,
+    a: &Buffer,
+    tmp: &Buffer,
+    ext_k: u32,
+    divisor: &Scalar,
+    zeta_out: &[Scalar; 2],
+    t: &Buffer,
+    log_tn: u32,
+) -> Result<u64, Error> {
+    run_job(
+        ctx,
+        &Job {
+            log_n: ext_k,
+            dir: Dir::Inverse,
+            src: a,
+            dst: a,
+            dst_off: 0,
+            tmp,
+            scale: Some(*divisor),
+            coset: None,
+            pre_mul: Some((t, log_tn)),
+            post_zeta: Some(*zeta_out),
+        },
+    )
 }
 
 fn elementwise_len(a: &Buffer, n: usize) -> Result<(), Error> {
@@ -667,13 +768,16 @@ fn par_copy(dst: &mut [Scalar], src: &[Scalar]) {
     });
 }
 
-/// `[copy in (with the lock and buffers), device part (wall), GPU, copy
-/// out]` nanoseconds of the last host transform.
+/// `[copy in (with the buffers), device part (wall, with the wait for the
+/// device), GPU, copy out]` nanoseconds of the last host transform.
 static LAST_HOST: Mutex<[u64; 4]> = Mutex::new([0; 4]);
 
-/// The transform of a host slice through the per-request buffers `ntt-data`
-/// and `ntt-scratch`. `a` is written only after every command buffer has
-/// completed.
+/// The transform of a host slice through per-request buffers (`ntt-data`,
+/// and `ntt-scratch` above one pass) that the call takes for itself
+/// ([`ctx::take_request_buffer`]): the copies in and out run without the
+/// device, so the copies of calls made from several threads overlap the
+/// device work of the others. `a` is written only after every command
+/// buffer has completed.
 fn transform_host(
     a: &mut [Scalar],
     log_n: u32,
@@ -681,37 +785,38 @@ fn transform_host(
     scale: Option<&Scalar>,
 ) -> Result<u64, Error> {
     let t0 = Instant::now();
-    let mut s = ctx::lock()?;
-    let ctx = s.ctx();
+    let ctx = ctx::context()?;
     let bytes = std::mem::size_of_val(a);
-    par_copy(
-        &mut s.scratch("ntt-data", bytes)?.as_mut_slice::<Scalar>()[..a.len()],
-        a,
-    );
-    let t1 = Instant::now();
-    let two = scratch_bytes(log_n) > 0;
-    if two {
-        s.scratch("ntt-scratch", bytes)?;
-    }
-    let ns = if two {
-        let [data, tmp] = s
-            .scratch_many(["ntt-data", "ntt-scratch"])
-            .ok_or_else(|| Error::Memory("ntt: scratch buffers".into()))?;
-        ntt_dev(ctx, data, tmp, log_n, dir, scale)?
+    let mut data = ctx::take_request_buffer("ntt-data", bytes)?;
+    par_copy(&mut data.buf_mut().as_mut_slice::<Scalar>()[..a.len()], a);
+    let tmp = if scratch_bytes(log_n) > 0 {
+        Some(ctx::take_request_buffer("ntt-scratch", bytes)?)
     } else {
-        let [data] = s
-            .scratch_many(["ntt-data"])
-            .ok_or_else(|| Error::Memory("ntt: scratch buffer".into()))?;
-        ntt_dev(ctx, data, data, log_n, dir, scale)?
+        None
     };
-    let [data] = s
-        .scratch_many(["ntt-data"])
-        .ok_or_else(|| Error::Memory("ntt: scratch buffer".into()))?;
+    let t1 = Instant::now();
+    let ns = {
+        let _device = ctx::lock()?;
+        let d = data.buf();
+        ntt_dev(
+            ctx,
+            d,
+            tmp.as_ref().map_or(d, |t| t.buf()),
+            log_n,
+            dir,
+            scale,
+        )?
+    };
     let t2 = Instant::now();
-    par_copy(a, &data.as_slice::<Scalar>()[..a.len()]);
+    par_copy(a, &data.buf().as_slice::<Scalar>()[..a.len()]);
+    let t3 = Instant::now();
+    data.give_back();
+    if let Some(t) = tmp {
+        t.give_back();
+    }
     let nanos = |d: std::time::Duration| d.as_nanos() as u64;
     *LAST_HOST.lock().unwrap_or_else(|e| e.into_inner()) =
-        [nanos(t1 - t0), nanos(t2 - t1), ns, nanos(t2.elapsed())];
+        [nanos(t1 - t0), nanos(t2 - t1), ns, nanos(t3 - t2)];
     Ok(ns)
 }
 

@@ -42,7 +42,7 @@ use midnight_metal::{
 use midnight_proofs::{
     gpu::{GpuHooks, adapter, install, test_switches::without_hooks},
     poly::{
-        EvaluationDomain, PolynomialLabel,
+        Coeff, EvaluationDomain, PolynomialLabel,
         commitment::PolynomialCommitmentScheme,
         kzg::{KZGCommitmentScheme, params::ParamsKZG},
     },
@@ -374,11 +374,39 @@ fn check(name: &str, s: &[Fq], b: &[G1Affine]) {
     assert_eq!(midnight_metal::stats().msm.served, before + 1, "{name}");
 }
 
-#[test]
-fn msm_matches_cpu() {
-    let _g = serial();
-    require_device();
-    assert!(midnight_metal::set_min_k(14));
+/// Sets `MIDNIGHT_METAL_MSM_CPU_SHARE` (`off`: device only) or removes it.
+/// The tests that call it hold [`serial`], and no other thread of this binary
+/// reads the environment meanwhile.
+fn set_cpu_share(on: bool) {
+    // SAFETY: see above.
+    unsafe {
+        if on {
+            std::env::remove_var("MIDNIGHT_METAL_MSM_CPU_SHARE");
+        } else {
+            std::env::set_var("MIDNIGHT_METAL_MSM_CPU_SHARE", "off");
+        }
+    }
+}
+
+/// The stage report of one MSM, checked against the CPU: whether the CPU took
+/// a share.
+fn splits(s: &[Fq], b: &[G1Affine]) -> bool {
+    let (r, st) = midnight_metal::msm_g1_stages(adapter::scalars(s), adapter::affine(b)).unwrap();
+    assert!(adapter::from_jacobian(r) == msm_pippenger(s, b));
+    st.device_points < s.len() as u64
+}
+
+/// The differential set, with the CPU share on or off. Every case below
+/// spreads its special inputs (infinity points, equal and opposite points,
+/// repeated scalars) over all indices, so with the split both the device
+/// share and the CPU share hold them, and a point of one share repeats in
+/// the other (`odd[i] = odd[i / 2]`).
+fn differential(split: bool) {
+    // an explicit threshold of 2^0: the all-zero and other cases below whose
+    // effective size (non-zero scalars) is under the default thresholds
+    // still run on the device
+    assert!(midnight_metal::set_min_k(0));
+    set_cpu_share(split);
     midnight_metal::reset_stats();
     let all = points_cache();
     for k in sizes() {
@@ -386,7 +414,9 @@ fn msm_matches_cpu() {
         let bases = &all[..n];
         let t0 = Instant::now();
 
-        check("random", &random_scalars(n, k as u64), bases);
+        let random = random_scalars(n, k as u64);
+        assert_eq!(splits(&random, bases), split, "2^{k}: split");
+        check("random", &random, bases);
         let c = Fq::random(ChaCha8Rng::seed_from_u64(99 + k as u64));
         check("all equal", &vec![c; n], bases);
         check("all zero", &vec![Fq::ZERO; n], bases);
@@ -415,11 +445,9 @@ fn msm_matches_cpu() {
         for i in (5..n).step_by(17) {
             odd[i] = -odd[i - 1];
         }
-        check(
-            "odd bases, random",
-            &random_scalars(n, 1000 + k as u64),
-            &odd,
-        );
+        let odd_random = random_scalars(n, 1000 + k as u64);
+        assert_eq!(splits(&odd_random, &odd), split, "2^{k}: split");
+        check("odd bases, random", &odd_random, &odd);
         check("odd bases, repeated", &repeated, &odd);
         check("odd bases, all one", &vec![Fq::ONE; n], &odd);
         eprintln!("2^{k}: 10 cases in {:.1?}", t0.elapsed());
@@ -429,6 +457,44 @@ fn msm_matches_cpu() {
         "{:?}",
         midnight_metal::declines()
     );
+    set_cpu_share(true);
+    assert!(midnight_metal::set_min_k(14));
+}
+
+#[test]
+fn msm_matches_cpu() {
+    let _g = serial();
+    require_device();
+    differential(true);
+}
+
+#[test]
+fn msm_matches_cpu_device_only() {
+    let _g = serial();
+    require_device();
+    differential(false);
+}
+
+/// MSMs issued from rayon workers, as the prover issues them: from the
+/// global pool, and from a small pool whose every worker calls at once (they
+/// all wait on the device lock while the holder's CPU share runs).
+#[test]
+fn msm_from_rayon_pool() {
+    let _g = serial();
+    require_device();
+    assert!(midnight_metal::set_min_k(14));
+    set_cpu_share(true);
+    let n = 1usize << 17;
+    let bases = &points_cache()[..n];
+    let inputs: Vec<Vec<Fq>> = (0..6).map(|i| random_scalars(n, 300 + i)).collect();
+    let want: Vec<G1Projective> = inputs.iter().map(|s| msm_pippenger(s, bases)).collect();
+    assert!(splits(&inputs[0], bases));
+    let got: Vec<G1Projective> = inputs.par_iter().map(|s| device_msm(s, bases)).collect();
+    assert!(got == want);
+    let pool = rayon::ThreadPoolBuilder::new().num_threads(3).build().unwrap();
+    let got: Vec<G1Projective> =
+        pool.install(|| inputs.par_iter().map(|s| device_msm(s, bases)).collect());
+    assert!(got == want);
 }
 
 /// One size above the measured table, where the command-buffer bound splits
@@ -469,7 +535,141 @@ fn msm_odd_lengths() {
     ] {
         let s = random_scalars(n, n as u64);
         check("odd length", &s, &all[..n]);
+        // the one-shot path splits from 2^14 points
+        assert_eq!(splits(&s, &all[..n]), n >= 1 << 14, "{n}");
     }
+    assert!(midnight_metal::set_min_k(14));
+}
+
+// ---------------------------------------------------------------------------
+// The effective size (non-zero scalars) against the default thresholds.
+
+/// `n` scalars, zero except `nz` of them (random, at spread positions).
+fn sparse_scalars(n: usize, nz: usize, seed: u64) -> Vec<Fq> {
+    let mut s = vec![Fq::ZERO; n];
+    let mut rng = ChaCha8Rng::seed_from_u64(seed);
+    let step = n / nz.max(1);
+    for i in 0..nz {
+        s[i * step + (i * 7919) % step.max(1)] = Fq::random(&mut rng);
+    }
+    s
+}
+
+/// The device MSM, or `None` when it declined; panics on any decline other
+/// than `below-min-k`, and checks a decline left the counters unchanged.
+fn try_device_msm(s: &[Fq], b: &[G1Affine]) -> Option<G1Projective> {
+    midnight_metal::reset_stats();
+    let counts = midnight_metal::msm_counts();
+    let served = midnight_metal::stats().msm.served;
+    match midnight_metal::msm_g1(adapter::scalars(s), adapter::affine(b)) {
+        Some(r) => {
+            assert_eq!(midnight_metal::stats().msm.served, served + 1);
+            Some(adapter::from_jacobian(r))
+        }
+        None => {
+            assert_eq!(
+                midnight_metal::declines(),
+                vec![("msm", "below-min-k", 1)],
+                "only a below-min-k decline"
+            );
+            // no device work: no table upload, no MSM of either path
+            assert_eq!(midnight_metal::msm_counts(), counts);
+            assert_eq!(midnight_metal::stats().msm.served, served);
+            None
+        }
+    }
+}
+
+#[test]
+fn sparse_msm_declines_below_min_k() {
+    let _g = serial();
+    require_device();
+    midnight_metal::reset_min_k();
+    let t = midnight_metal::thresholds();
+    assert!(!t.explicit, "MIDNIGHT_METAL_MIN_K is set: {t:?}");
+    let n = 1usize << 20;
+    let bases = &points_cache()[..n];
+    // the needs with the default thresholds: max(2^threshold, n/3) one-shot,
+    // max(2^threshold, n/5) on a table (the measured sparse crossovers)
+    let one_shot = (1usize << t.msm_one_shot).max(n / 3);
+    let table = (1usize << t.msm_table).max(n / 5);
+    assert_eq!((one_shot, table), (n / 3, n / 5));
+
+    let served = |nz: usize, seed: u64| {
+        let s = sparse_scalars(n, nz, seed);
+        let got = try_device_msm(&s, bases).expect("served");
+        if !cfg!(debug_assertions) {
+            assert!(got == msm_pippenger(&s, bases), "{nz}");
+        }
+    };
+    // one-shot: a mostly-zero MSM (as a permutation product or a quotient
+    // limb) declines, and so does one below the crossover although above the
+    // length threshold; from the crossover it is served; dense is served
+    for nz in [0, 2, 11, 1 << t.msm_one_shot, one_shot - 1] {
+        assert!(
+            try_device_msm(&sparse_scalars(n, nz, nz as u64), bases).is_none(),
+            "{nz}"
+        );
+    }
+    served(one_shot, 1);
+    served(n, 2);
+
+    // a registered table: its own need
+    let h = midnight_metal::register_srs(adapter::affine(bases));
+    for nz in [2, 1 << t.msm_table, table - 1] {
+        assert!(
+            try_device_msm(&sparse_scalars(n, nz, 5), bases).is_none(),
+            "table {nz}"
+        );
+    }
+    served(table, 6);
+
+    // an explicit threshold replaces the need: 2^k alone, on both paths
+    assert!(midnight_metal::set_min_k(14));
+    served(1 << 14, 7);
+    assert!(try_device_msm(&sparse_scalars(n, (1 << 14) - 1, 8), bases).is_none());
+    drop(h);
+    served(1 << 14, 9);
+    assert!(try_device_msm(&sparse_scalars(n, (1 << 14) - 1, 10), bases).is_none());
+    assert!(midnight_metal::set_min_k(14));
+}
+
+#[test]
+fn hook_sparse_commitment_matches_stock() {
+    let _g = serial();
+    require_device();
+    midnight_metal::reset_min_k();
+    assert!(!midnight_metal::thresholds().explicit);
+    const K: u32 = 16;
+    let mut rng = ChaCha8Rng::seed_from_u64(12);
+    let params = ParamsKZG::<Bls12>::unsafe_setup(K, &mut rng);
+    let h = midnight_metal::register_srs(adapter::affine(params.bases::<Coeff>()));
+    let domain = EvaluationDomain::<Fq>::new(1, K);
+    install_hooks();
+    let label = || PolynomialLabel::Custom("p".into());
+    for (nz, device) in [(5usize, false), (1usize << K, true)] {
+        let mut poly = domain.empty_coeff();
+        let step = poly.len() / nz;
+        for i in 0..nz {
+            poly[i * step] = Fq::random(&mut rng);
+        }
+        midnight_metal::reset_stats();
+        let got = KZGCommitmentScheme::<Bls12>::commit(&params, &poly, label());
+        let served = midnight_metal::stats().msm.served;
+        let declines = midnight_metal::declines();
+        if device {
+            assert_eq!(served, 1, "{declines:?}");
+        } else {
+            assert_eq!(served, 0);
+            assert_eq!(declines, vec![("msm", "below-min-k", 1)]);
+        }
+        let want = without_hooks(|| KZGCommitmentScheme::<Bls12>::commit(&params, &poly, label()));
+        assert!(
+            got == want,
+            "{nz} non-zero: the commitment differs from the stock one"
+        );
+    }
+    drop(h);
     assert!(midnight_metal::set_min_k(14));
 }
 
@@ -518,8 +718,46 @@ fn registered_table_prefix_and_changed_slice() {
     drop(handle);
 }
 
+/// A registered table's prefixes split between the device (a prefix of the
+/// table) and the CPU (the caller's points after it).
+#[test]
+fn registered_table_prefix_splits() {
+    let _g = serial();
+    require_device();
+    assert!(midnight_metal::set_min_k(14));
+    set_cpu_share(true);
+    let n = 1usize << 18;
+    let bases = &points_cache()[..n];
+    let handle = midnight_metal::register_srs(adapter::affine(bases));
+    for m in [1usize << 17, (1 << 17) + 5, n] {
+        let s = random_scalars(m, m as u64);
+        let (r, st) =
+            midnight_metal::msm_g1_stages(adapter::scalars(&s), adapter::affine(&bases[..m]))
+                .unwrap();
+        assert!(
+            adapter::from_jacobian(r) == msm_pippenger(&s, &bases[..m]),
+            "{m}"
+        );
+        assert!(st.table && st.device_points < m as u64, "{m}: {st:?}");
+        check("table prefix, split", &s, &bases[..m]);
+    }
+    drop(handle);
+}
+
 // ---------------------------------------------------------------------------
 // The hook.
+
+/// Installs the MSM hook (once per process: the tests of this binary that
+/// use the hook all install this one).
+fn install_hooks() {
+    static ONCE: OnceLock<()> = OnceLock::new();
+    ONCE.get_or_init(|| {
+        assert!(install(GpuHooks {
+            msm_g1: Some(midnight_metal::msm_g1),
+            ..Default::default()
+        }));
+    });
+}
 
 #[test]
 fn hook_commitment_matches_stock() {
@@ -534,10 +772,7 @@ fn hook_commitment_matches_stock() {
     for c in poly.iter_mut() {
         *c = Fq::random(&mut rng);
     }
-    assert!(install(GpuHooks {
-        msm_g1: Some(midnight_metal::msm_g1),
-        ..Default::default()
-    }));
+    install_hooks();
     let label = || PolynomialLabel::Custom("p".into());
     let before = midnight_metal::stats().msm.served;
     let got = KZGCommitmentScheme::<Bls12>::commit(&params, &poly, label());
@@ -603,7 +838,7 @@ fn msm_timings() {
     }
     println!();
     println!(
-        "k | path | wbits nwins batches passes | upload | digits | sort | accumulate | integrate | collect (ms) | bucket max/mean"
+        "k | path | wbits nwins batches passes | device points | upload | digits | sort | accumulate | integrate | collect | cpu share (ms) | bucket max/mean"
     );
     for k in 14..=22u32 {
         let n = 1usize << k;
@@ -614,17 +849,19 @@ fn msm_timings() {
         let (_, tab) = midnight_metal::msm_g1_stages(s, b).unwrap();
         for (path, st) in [("one-shot", one), ("table", tab)] {
             println!(
-                "{k} | {path} | {} {} {} {} | {:.1} | {:.1} | {:.1} | {:.1} | {:.1} | {:.1} | {} / {:.1}",
+                "{k} | {path} | {} {} {} {} | {} | {:.1} | {:.1} | {:.1} | {:.1} | {:.1} | {:.1} | {:.1} | {} / {:.1}",
                 st.wbits,
                 st.nwins,
                 st.batches,
                 st.passes,
+                st.device_points,
                 ms(st.upload_ns),
                 ms(st.digits_ns),
                 ms(st.sort_ns),
                 ms(st.accumulate_ns),
                 ms(st.integrate_ns),
                 ms(st.collect_ns),
+                ms(st.cpu_ns),
                 st.bucket_max,
                 st.bucket_entries as f64 / st.bucket_slots.max(1) as f64,
             );

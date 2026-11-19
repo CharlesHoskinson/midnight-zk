@@ -40,6 +40,12 @@
 
 namespace g1 {
 
+// The field multiplication of the curve formulas, out of line: one copy of
+// its unrolled body (about 2k instructions) serves every multiplication of
+// a formula, where ten inlined copies overflow the GPU's instruction cache
+// (measured on Apple M4 Max: the mixed addition runs about 13% faster).
+static __attribute__((noinline)) Fp mul(Fp a, Fp b) { return fp_mul(a, b); }
+
 struct Affine {
     Fp x;
     Fp y;
@@ -91,45 +97,45 @@ MONT_INLINE void add(thread Xyzz &p31, Xyzz p2) {
         return;
     }
 
-    Fp U = fp_mul(p31.X, p2.ZZ);   // U1 = X1*ZZ2
-    Fp S = fp_mul(p31.Y, p2.ZZZ);  // S1 = Y1*ZZZ2
-    Fp P = fp_mul(p2.X, p31.ZZ);   // U2 = X2*ZZ1
-    Fp R = fp_mul(p2.Y, p31.ZZZ);  // S2 = Y2*ZZZ1
+    Fp U = mul(p31.X, p2.ZZ);      // U1 = X1*ZZ2
+    Fp S = mul(p31.Y, p2.ZZZ);     // S1 = Y1*ZZZ2
+    Fp P = mul(p2.X, p31.ZZ);      // U2 = X2*ZZ1
+    Fp R = mul(p2.Y, p31.ZZZ);     // S2 = Y2*ZZZ1
     P = fp_sub(P, U);              // P = U2-U1
     R = fp_sub(R, S);              // R = S2-S1
 
     if (!fp_is_zero(P)) {          // X1 != X2: add
-        Fp PP = fp_sqr(P);         // PP = P^2
-        Fp PPP = fp_mul(P, PP);    // PPP = P*PP
-        p31.ZZ = fp_mul(p31.ZZ, PP);
-        p31.ZZZ = fp_mul(p31.ZZZ, PPP);
-        Fp Q = fp_mul(U, PP);      // Q = U1*PP
-        p31.X = fp_sqr(R);         // R^2
+        Fp PP = mul(P, P);         // PP = P^2
+        Fp PPP = mul(P, PP);       // PPP = P*PP
+        p31.ZZ = mul(p31.ZZ, PP);
+        p31.ZZZ = mul(p31.ZZZ, PPP);
+        Fp Q = mul(U, PP);         // Q = U1*PP
+        p31.X = mul(R, R);         // R^2
         p31.X = fp_sub(p31.X, PPP);
         p31.X = fp_sub(p31.X, Q);
         p31.X = fp_sub(p31.X, Q);  // X3 = R^2-PPP-2*Q
         Q = fp_sub(Q, p31.X);
-        Q = fp_mul(Q, R);          // R*(Q-X3)
-        p31.Y = fp_mul(S, PPP);    // S1*PPP
+        Q = mul(Q, R);             // R*(Q-X3)
+        p31.Y = mul(S, PPP);       // S1*PPP
         p31.Y = fp_sub(Q, p31.Y);  // Y3 = R*(Q-X3)-S1*PPP
-        p31.ZZ = fp_mul(p31.ZZ, p2.ZZ);    // ZZ3 = ZZ1*ZZ2*PP
-        p31.ZZZ = fp_mul(p31.ZZZ, p2.ZZZ); // ZZZ3 = ZZZ1*ZZZ2*PPP
+        p31.ZZ = mul(p31.ZZ, p2.ZZ);       // ZZ3 = ZZ1*ZZ2*PP
+        p31.ZZZ = mul(p31.ZZZ, p2.ZZZ);    // ZZZ3 = ZZZ1*ZZZ2*PPP
     } else if (fp_is_zero(R)) {    // X1 == X2, Y1 == Y2: double
         U = fp_dbl(p31.Y);         // U = 2*Y1
-        Fp V = fp_sqr(U);          // V = U^2
-        Fp W = fp_mul(U, V);       // W = U*V
-        S = fp_mul(p31.X, V);      // S = X1*V
-        Fp M = fp_sqr(p31.X);
+        Fp V = mul(U, U);          // V = U^2
+        Fp W = mul(U, V);          // W = U*V
+        S = mul(p31.X, V);         // S = X1*V
+        Fp M = mul(p31.X, p31.X);
         M = fp_add(fp_dbl(M), M);  // M = 3*X1^2 (a = 0)
-        p31.X = fp_sqr(M);
+        p31.X = mul(M, M);
         p31.X = fp_sub(p31.X, S);
         p31.X = fp_sub(p31.X, S);  // X3 = M^2-2*S
-        p31.Y = fp_mul(p31.Y, W);  // W*Y1
+        p31.Y = mul(p31.Y, W);     // W*Y1
         S = fp_sub(S, p31.X);
-        S = fp_mul(S, M);          // M*(S-X3)
+        S = mul(S, M);             // M*(S-X3)
         p31.Y = fp_sub(S, p31.Y);  // Y3 = M*(S-X3)-W*Y1
-        p31.ZZ = fp_mul(p31.ZZ, V);   // ZZ3 = V*ZZ1
-        p31.ZZZ = fp_mul(p31.ZZZ, W); // ZZZ3 = W*ZZZ1
+        p31.ZZ = mul(p31.ZZ, V);      // ZZ3 = V*ZZ1
+        p31.ZZZ = mul(p31.ZZZ, W);    // ZZZ3 = W*ZZZ1
     } else {                       // X1 == X2, Y1 == -Y2
         p31 = inf();
     }
@@ -142,20 +148,20 @@ MONT_INLINE void dbl(thread Xyzz &p31) {
         return;
     }
     Fp U = fp_dbl(p31.Y);          // U = 2*Y1
-    Fp V = fp_sqr(U);              // V = U^2
-    Fp W = fp_mul(U, V);           // W = U*V
-    Fp S = fp_mul(p31.X, V);       // S = X1*V
-    Fp M = fp_sqr(p31.X);
+    Fp V = mul(U, U);              // V = U^2
+    Fp W = mul(U, V);              // W = U*V
+    Fp S = mul(p31.X, V);          // S = X1*V
+    Fp M = mul(p31.X, p31.X);
     M = fp_add(fp_dbl(M), M);      // M = 3*X1^2
-    p31.X = fp_sqr(M);
+    p31.X = mul(M, M);
     p31.X = fp_sub(p31.X, S);
     p31.X = fp_sub(p31.X, S);      // X3 = M^2-2*S
-    p31.Y = fp_mul(p31.Y, W);      // W*Y1
+    p31.Y = mul(p31.Y, W);         // W*Y1
     S = fp_sub(S, p31.X);
-    S = fp_mul(S, M);              // M*(S-X3)
+    S = mul(S, M);                 // M*(S-X3)
     p31.Y = fp_sub(S, p31.Y);      // Y3 = M*(S-X3)-W*Y1
-    p31.ZZ = fp_mul(p31.ZZ, V);    // ZZ3 = V*ZZ1
-    p31.ZZZ = fp_mul(p31.ZZZ, W);  // ZZZ3 = W*ZZZ1
+    p31.ZZ = mul(p31.ZZ, V);       // ZZ3 = V*ZZ1
+    p31.ZZZ = mul(p31.ZZZ, W);     // ZZZ3 = W*ZZZ1
 }
 
 // p31 += p2, or p31 -= p2 when `subtract` (sppark `xyzz_t::add(const
@@ -173,39 +179,39 @@ MONT_INLINE void add(thread Xyzz &p31, Affine p2, bool subtract) {
         return;
     }
 
-    Fp R = fp_mul(p2.y, p31.ZZZ);  // S2 = Y2*ZZZ1
+    Fp R = mul(p2.y, p31.ZZZ);     // S2 = Y2*ZZZ1
     R = fp_cneg(R, subtract);
     R = fp_sub(R, p31.Y);          // R = S2-Y1
-    Fp P = fp_mul(p2.x, p31.ZZ);   // U2 = X2*ZZ1
+    Fp P = mul(p2.x, p31.ZZ);      // U2 = X2*ZZ1
     P = fp_sub(P, p31.X);          // P = U2-X1
 
     if (!fp_is_zero(P)) {          // X1 != X2: add
-        Fp PP = fp_sqr(P);         // PP = P^2
-        Fp PPP = fp_mul(P, PP);    // PPP = P*PP
-        p31.ZZ = fp_mul(p31.ZZ, PP);       // ZZ3 = ZZ1*PP
-        p31.ZZZ = fp_mul(p31.ZZZ, PPP);    // ZZZ3 = ZZZ1*PPP
-        Fp Q = fp_mul(PP, p31.X);  // Q = X1*PP
-        p31.X = fp_sqr(R);         // R^2
+        Fp PP = mul(P, P);         // PP = P^2
+        Fp PPP = mul(P, PP);       // PPP = P*PP
+        p31.ZZ = mul(p31.ZZ, PP);          // ZZ3 = ZZ1*PP
+        p31.ZZZ = mul(p31.ZZZ, PPP);       // ZZZ3 = ZZZ1*PPP
+        Fp Q = mul(PP, p31.X);     // Q = X1*PP
+        p31.X = mul(R, R);         // R^2
         p31.X = fp_sub(p31.X, PPP);
         p31.X = fp_sub(p31.X, Q);
         p31.X = fp_sub(p31.X, Q);  // X3 = R^2-PPP-2*Q
         Q = fp_sub(Q, p31.X);
-        Q = fp_mul(Q, R);          // R*(Q-X3)
-        p31.Y = fp_mul(p31.Y, PPP);        // Y1*PPP
+        Q = mul(Q, R);             // R*(Q-X3)
+        p31.Y = mul(p31.Y, PPP);           // Y1*PPP
         p31.Y = fp_sub(Q, p31.Y);  // Y3 = R*(Q-X3)-Y1*PPP
     } else if (fp_is_zero(R)) {    // X1 == X2, Y1 == +-Y2: double p2
         Fp U = fp_dbl(p2.y);       // U = 2*Y1
-        p31.ZZ = fp_sqr(U);        // ZZ3 = V = U^2
-        p31.ZZZ = fp_mul(p31.ZZ, U);       // ZZZ3 = W = U*V
-        Fp S = fp_mul(p2.x, p31.ZZ);       // S = X1*V
-        Fp M = fp_sqr(p2.x);
+        p31.ZZ = mul(U, U);        // ZZ3 = V = U^2
+        p31.ZZZ = mul(p31.ZZ, U);          // ZZZ3 = W = U*V
+        Fp S = mul(p2.x, p31.ZZ);          // S = X1*V
+        Fp M = mul(p2.x, p2.x);
         M = fp_add(fp_dbl(M), M);  // M = 3*X1^2 (a = 0)
-        p31.X = fp_sqr(M);
+        p31.X = mul(M, M);
         p31.X = fp_sub(p31.X, S);
         p31.X = fp_sub(p31.X, S);  // X3 = M^2-2*S
-        p31.Y = fp_mul(p31.ZZZ, p2.y);     // W*Y1
+        p31.Y = mul(p31.ZZZ, p2.y);        // W*Y1
         S = fp_sub(S, p31.X);
-        S = fp_mul(S, M);          // M*(S-X3)
+        S = mul(S, M);             // M*(S-X3)
         p31.Y = fp_sub(S, p31.Y);  // Y3 = M*(S-X3)-W*Y1
         p31.ZZZ = fp_cneg(p31.ZZZ, subtract);
     } else {                       // X1 == X2, Y1 == -+Y2

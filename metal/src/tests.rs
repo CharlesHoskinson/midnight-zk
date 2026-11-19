@@ -479,8 +479,9 @@ fn request_buffers_and_byte_accounting() {
     assert!(crate::end_request());
     let mut s = ctx::lock().unwrap();
     // what stays for the life of the process (the NTT twiddles once a
-    // transform ran) or of a handle
-    let (before, _) = crate::device_bytes();
+    // transform ran) or of a handle; the idle buffers of the pool are not in
+    // use
+    let before = ctx::in_use_bytes();
     {
         let b = s.scratch("test-scratch", 1 << 20).unwrap();
         b.as_mut_slice::<u64>().fill(0xdead_beef);
@@ -489,14 +490,15 @@ fn request_buffers_and_byte_accounting() {
     let b = s.scratch("test-scratch", 1 << 19).unwrap();
     assert!(b.as_slice::<u64>().iter().all(|v| *v == 0xdead_beef));
     assert!(s.scratch_bytes() >= 1 << 20);
-    let (mid, peak) = crate::device_bytes();
-    assert!(mid >= before + (1 << 20) && peak >= mid);
+    let mid = ctx::in_use_bytes();
+    let (held, peak) = crate::device_bytes();
+    assert!(mid >= before + (1 << 20) && held >= mid && peak >= held);
     {
         let owned = s.ctx().alloc(1 << 16).unwrap();
-        assert!(crate::device_bytes().0 >= mid + (1 << 16));
+        assert!(ctx::in_use_bytes() >= mid + (1 << 16));
         drop(owned);
     }
-    assert_eq!(crate::device_bytes().0, mid);
+    assert_eq!(ctx::in_use_bytes(), mid);
     drop(s);
     assert!(crate::end_request());
     // under the lock no other test holds a buffer (each drops its buffers
@@ -504,7 +506,63 @@ fn request_buffers_and_byte_accounting() {
     let s = ctx::lock().unwrap();
     assert!(s.get_scratch("test-scratch").is_none());
     assert_eq!(s.scratch_bytes(), 0);
-    assert_eq!(crate::device_bytes().0, before);
+    assert_eq!(ctx::in_use_bytes(), before);
+    // the region is idle in the pool, zeroed, until the pool is released
+    assert!(crate::pool_bytes() >= 1 << 20);
+    drop(s);
+    let (held, _) = crate::device_bytes();
+    let freed = crate::release_pool();
+    assert!(freed >= 1 << 20);
+    assert_eq!(crate::pool_bytes(), 0);
+    assert_eq!(crate::device_bytes().0, held - freed);
+}
+
+/// A pooled buffer goes back to the pool only zeroed, and comes out of it
+/// zeroed; the pool keeps no more than its limit.
+#[test]
+fn pooled_buffers_come_back_zeroed() {
+    let _g = serial();
+    require_device();
+    assert!(crate::end_request());
+    let c = ctx::context().unwrap();
+    let len = (3 << 20) + 4096;
+    let mut a = c.alloc_pooled(len).unwrap();
+    a.as_mut_slice::<u8>().fill(0x5a);
+    let at = a.as_slice::<u8>().as_ptr() as usize;
+    drop(a);
+    assert!(crate::pool_bytes() >= len as u64);
+    // a little shorter: from the pool (this one unless a test running at
+    // the same time took it first), zero over its whole allocation
+    let b = c.alloc_pooled(len - 4096).unwrap();
+    assert_eq!(b.len_bytes(), len - 4096);
+    let p = b.as_slice::<u8>().as_ptr();
+    if p as usize == at {
+        assert_eq!(b.alloc_bytes(), len);
+    }
+    // SAFETY: the allocation is `alloc_bytes` long
+    let whole = unsafe { std::slice::from_raw_parts(p, b.alloc_bytes()) };
+    assert!(whole.iter().all(|x| *x == 0));
+    drop(b);
+    // much shorter: not that buffer
+    let small = c.alloc_pooled(4096).unwrap();
+    assert_ne!(small.as_slice::<u8>().as_ptr() as usize, at);
+    drop(small);
+    // a buffer written in the background zeroing
+    let mut d = c.alloc_pooled(len).unwrap();
+    d.as_mut_slice::<u8>().fill(0x33);
+    ctx::release_later(vec![d]);
+    ctx::settle_releases();
+    let e = c.alloc_pooled(len).unwrap();
+    assert!(e.as_slice::<u8>().iter().all(|x| *x == 0));
+    drop(e);
+    // a limit below the pool releases what is above it
+    ctx::set_pool_limit(Some(0));
+    assert_eq!(crate::pool_bytes(), 0);
+    let f = c.alloc_pooled(len).unwrap();
+    drop(f);
+    assert_eq!(crate::pool_bytes(), 0, "nothing is kept above the limit");
+    ctx::set_pool_limit(None);
+    assert!(crate::end_request());
 }
 
 // --- the entry points against the stock CPU code ------------------------------

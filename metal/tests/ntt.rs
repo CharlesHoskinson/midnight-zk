@@ -509,3 +509,124 @@ fn large_transforms() {
     let back = dev::ntt(&fwd, log_n, true, Some(scalar(n_inv))).unwrap();
     assert_eq!(&back[..], scalars(&input));
 }
+
+/// Inverse transforms called from several threads at once (each takes its
+/// own per-request buffers and the device only for the transform) give the
+/// stock values.
+#[test]
+fn parallel_ifft_callers_match_stock() {
+    setup();
+    let log_n = 16;
+    let n = 1usize << log_n;
+    let w_inv = root(log_n).invert().unwrap();
+    let divisor = Fq::from(n as u64).invert().unwrap();
+    std::thread::scope(|s| {
+        for t in 0..6u64 {
+            s.spawn(move || {
+                for rep in 0..3u64 {
+                    let input = random(n, 100 + 10 * t + rep);
+                    let mut want = input.clone();
+                    stock_ifft(&mut want, w_inv, log_n, divisor);
+                    let mut got = input.clone();
+                    assert!(midnight_metal::ifft(
+                        scalars_mut(&mut got),
+                        scalar(w_inv),
+                        log_n,
+                        scalar(divisor)
+                    ));
+                    assert_eq!(first_diff(&got, &want), None, "caller {t}, rep {rep}");
+                }
+            });
+        }
+    });
+    assert!(midnight_metal::end_request());
+}
+
+/// Wall time of the `ifft` hook at `2^IFFT_BENCH_LOG` (default 20): a warm
+/// call, the first call of a request (after `end_request`), and
+/// `IFFT_BENCH_CALLERS` (default 4) callers on as many threads at once, the
+/// way the prover's phase 1 calls it; minimum of `IFFT_BENCH_REPS` (default
+/// 7) runs each.
+#[test]
+#[ignore]
+fn bench_ifft_hook() {
+    use std::time::Instant;
+    setup();
+    let env = |k: &str, d: usize| std::env::var(k).map_or(d, |v| v.parse().unwrap());
+    let log_n = env("IFFT_BENCH_LOG", 20) as u32;
+    let callers = env("IFFT_BENCH_CALLERS", 4);
+    let reps = env("IFFT_BENCH_REPS", 7);
+    let n = 1usize << log_n;
+    let w_inv = root(log_n).invert().unwrap();
+    let divisor = Fq::from(n as u64).invert().unwrap();
+    let input = random(n, 7);
+    let call = |a: &mut Vec<Fq>| {
+        assert!(midnight_metal::ifft(
+            scalars_mut(a),
+            scalar(w_inv),
+            log_n,
+            scalar(divisor)
+        ))
+    };
+    let ms = |x: u64| x as f64 / 1e6;
+    // warm up
+    let mut a = input.clone();
+    call(&mut a);
+    let mut warm = (f64::MAX, [0u64; 4]);
+    for _ in 0..reps {
+        let mut a = input.clone();
+        let t = Instant::now();
+        call(&mut a);
+        let wall = t.elapsed().as_secs_f64() * 1e3;
+        if wall < warm.0 {
+            warm = (wall, dev::last_host_timing());
+        }
+    }
+    let mut first = (f64::MAX, [0u64; 4]);
+    for _ in 0..reps {
+        assert!(midnight_metal::end_request());
+        midnight_metal::begin_request();
+        let mut a = input.clone();
+        let t = Instant::now();
+        call(&mut a);
+        let wall = t.elapsed().as_secs_f64() * 1e3;
+        if wall < first.0 {
+            first = (wall, dev::last_host_timing());
+        }
+    }
+    let mut par = f64::MAX;
+    let mut gpu_par = 0u64;
+    for _ in 0..reps {
+        let mut bufs: Vec<Vec<Fq>> = (0..callers).map(|_| input.clone()).collect();
+        let before = midnight_metal::stats().ifft.device_nanos;
+        let t = Instant::now();
+        std::thread::scope(|s| {
+            for b in bufs.iter_mut() {
+                s.spawn(|| call(b));
+            }
+        });
+        let wall = t.elapsed().as_secs_f64() * 1e3;
+        if wall < par {
+            par = wall;
+            gpu_par = midnight_metal::stats().ifft.device_nanos - before;
+        }
+    }
+    println!("ifft hook at 2^{log_n} (ms, min of {reps})");
+    for (what, (wall, [cin, dev_wall, gpu, cout])) in
+        [("warm", warm), ("first of a request", first)]
+    {
+        println!(
+            "| {what} | wall {wall:.2} | copy in {:.2} | device part {:.2} (gpu {:.2}) | copy out {:.2} |",
+            ms(cin),
+            ms(dev_wall),
+            ms(gpu),
+            ms(cout)
+        );
+    }
+    println!(
+        "| {callers} callers at once | wall {par:.2} | gpu {:.2} | per call {:.2} |",
+        ms(gpu_par),
+        par / callers as f64
+    );
+    assert!(midnight_metal::end_request());
+}

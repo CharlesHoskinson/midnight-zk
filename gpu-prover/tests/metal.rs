@@ -304,9 +304,12 @@ mod seeded {
         // every MSM of the proof had a table
         let held = gpu.held();
         assert!(held.tables > 0 && held.resident > 0, "{held:?}");
+        // the key copies, the tables and the idle pool of zeroed buffers
+        let pooled = midnight_metal::pool_bytes();
         let freed = gpu.evict(true);
-        eprintln!("poseidon-chain k=16: evicted {freed} bytes");
-        assert_eq!(freed, held.tables + held.resident);
+        eprintln!("poseidon-chain k=16: evicted {freed} bytes ({pooled} pooled)");
+        assert_eq!(freed, held.tables + held.resident + pooled);
+        assert_eq!(midnight_metal::pool_bytes(), 0);
         assert_eq!(gpu.held(), device::Held::default());
         midnight_metal::set_keep_resident(false);
     }
@@ -438,6 +441,8 @@ fn the_device_layer_admits_phases_and_ends_a_request() {
     eprintln!("wipe: {w:?}");
     assert_eq!(w.erasure_failures, 0);
     assert_eq!(d.held(), device::Held::default());
-    assert_eq!(d.evict(true), 0);
+    // nothing but the idle pool of zeroed buffers
+    let pooled = midnight_metal::pool_bytes();
+    assert_eq!(d.evict(true), pooled);
     print_classes("device layer");
 }

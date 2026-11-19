@@ -25,8 +25,28 @@
 //! least `2^msm_one_shot` unless a registered table serves the bases, a
 //! usable device, every scalar reduced) before it calls [`msm_g1`]. That
 //! function ends with exactly one of `account::served` or `account::decline`
-//! (`below-min-k` when the table it counted on turned out stale and the call
-//! is below the one-shot threshold).
+//! (`below-min-k` when the table it counted on turned out stale and the
+//! call's effective size is below the one-shot threshold).
+//!
+//! # Effective size
+//!
+//! The size compared with the thresholds is the MSM's count of non-zero
+//! scalars (1 when all are zero), not its length: a zero scalar adds nothing,
+//! and the masked device MSM costs the same for 2 non-zero scalars out of
+//! `2^20` as for a dense one (about 108 ms on Apple M4 Max), while the stock
+//! CPU MSM, whose time already follows the sparsity, takes about a
+//! millisecond. [`crate::msm_g1`] checks it (with
+//! [`effective_size_reaches`]) after the length admission and before any
+//! device work, against the need of the path the call would take
+//! ([`effective_need`]): `max(2^msm_table, n/5)` with a registered table,
+//! else `max(2^msm_one_shot, n/3)`, the measured crossovers of the stock CPU
+//! MSM on sparse inputs ([`SPARSE_TABLE_DIV`]); below it, the call declines
+//! `below-min-k`, the ordinary reason of a short MSM. The count itself is
+//! not kept, logged, counted or returned: the decline is the only
+//! observable, and it is the one a short dense MSM gives. An explicit
+//! threshold ([`crate::set_min_k`], `MIDNIGHT_METAL_MIN_K`) replaces the
+//! need entirely (`2^min_k`, no fraction of `n`), so `set_min_k(0)` sends
+//! every MSM, the all-zero one included, to the device.
 //!
 //! # Algorithm
 //!
@@ -45,6 +65,10 @@
 //! 3. `msm_ones` (sppark `batch_addition`): the bucket of digit 1 in window
 //!    0, summed by the whole grid.
 //! 4. `msm_accumulate`: one thread per bucket, mixed additions into XYZZ.
+//!    Each threadgroup first orders its buckets by length (longest first),
+//!    so that the 32 lanes of a SIMD-group sum buckets of similar length;
+//!    the field multiplication of the curve formulas is one out-of-line
+//!    function (see `shaders/include/g1.h`).
 //! 5. `msm_integrate`: per window, `2 * threads` partial sums of the
 //!    weighted bucket sum.
 //!
@@ -62,6 +86,25 @@
 //! table and length; the one-shot path computes it at every call. The result
 //! is the same group element. No statistic of the scalars is computed,
 //! logged or branched on (except by [`msm_g1_stages`], a measurement entry).
+//!
+//! # The CPU share
+//!
+//! While the device runs, the CPU computes part of the MSM: the device takes
+//! the points `[0, m)` (masked, as above, with `MSM(r)` cached per table
+//! and share length) and the stock `msm_pippenger` of midnight-curves takes
+//! `[m, n)` with the plain scalars on another thread at the same time; the
+//! two sums are added on the host, which gives the same group element. `m`
+//! is a fixed function of `n` and of the path (table or one-shot) only,
+//! measured on this hardware (`MEASURED_SHARE`); scalar values never move
+//! it (the effective-size decline above runs before it). The CPU share runs
+//! on its own rayon pool, never on the caller's: the prover calls MSMs from
+//! rayon workers, which can all be blocked on the device lock while the
+//! holder waits for its CPU share, so a share queued on their pool could
+//! never start. It reads the caller's slices in place (no host copy of the
+//! scalars is made for it; `msm_pippenger` makes its own, as the stock code
+//! does). `MIDNIGHT_METAL_MSM_CPU_SHARE=off` gives `m = n` (device only).
+//! The device time accounted for the call is the device share's GPU time.
+//! A failure of either share declines the whole call.
 //!
 //! # Registered base tables
 //!
@@ -153,6 +196,8 @@ const SORT_BLOCK: usize = 1024;
 /// `BATCH_ADD_BLOCK_SIZE`).
 const ONES_GROUPS: usize = 32;
 const ONES_BLOCK: usize = 256;
+/// Threads of an `msm_accumulate` group (`ACC_GROUP` in msm.metal).
+const ACC_GROUP: usize = 256;
 /// Threads per window of `msm_integrate` (sppark `MSM_NTHREADS`).
 const MSM_NTHREADS: usize = 256;
 /// The most window digits (bucket additions) of one chunk, so that a
@@ -234,10 +279,34 @@ const fn lg2(mut n: usize) -> u32 {
 /// (*) At 2^15 one table run favoured 12 by 0.5 ms and the other two runs
 /// and the one-shot path favoured 11; 11 is kept.
 ///
+/// Re-checked on 2026-11-19 after the accumulation kernel changed (an
+/// out-of-line field multiplication, buckets ordered by load within each
+/// threadgroup), on the table path with the CPU share off, `wbits` in
+/// 12..=17 around the entries of 2^18 to 2^22 and at the device-share sizes
+/// of the split (`MEASURED_SHARE`), GPU time plus host collection, minimum
+/// of 3 calls, two rounds (another process ran GPU work at the same time;
+/// the rounds differed by up to 20% at 2^22, the minima are given). Wider
+/// windows now win from 2^20; 2^18, 2^19 and 2^21 keep their entries:
+///
+/// | n          | best (wbits) | ms    | runner-up | ms    | old entry | ms    |
+/// |------------|--------------|-------|-----------|-------|-----------|-------|
+/// | 2^18       | 13           | 22.2  | 14        | 24.3  | 13        |       |
+/// | 2^19       | 15           | 41.3  | 13        | 41.5  | 13 (kept) |       |
+/// | 2^19.81    | 15           | 65.7  | 16        | 69.2  | (13)      | 70.3  |
+/// | 2^20       | 15           | 74.2  | 16        | 76.9  | 13        | 79.3  |
+/// | 2^21       | 16           | 145.6 | 17        | 151.4 | 16        |       |
+/// | 2^21.81    | 17           | 269.6 | 16        | 243.1*| (16)      |       |
+/// | 2^22       | 16           | 273.5 | 15        | 286.4 | 14        | 313.7 |
+///
+/// (*) At 2^21.81 (the device share of 2^22) the two rounds disagreed
+/// (16: 243.1 then 307.8; 17: 269.6 once); the 2^22 entry, 16, applies.
+///
 /// Outside the table: below `2^14` the `2^14` entry; from `2^23` the
 /// `2^22` entry, where the command-buffer bound makes every chunk at most
 /// `CHUNK_ADDS / nwins` points, the chunk size measured at `2^22`. A length
-/// that is not a power of two takes the entry of its floor log2.
+/// that is not a power of two takes the entry of its nearest log2 (on the
+/// log scale), so that the device share of a split MSM, 81% to 84% of a
+/// power of two, takes that power's entry.
 const MEASURED: [(u32, u32, usize); 9] = [
     (14, 11, 1),
     (15, 11, 1),
@@ -245,17 +314,24 @@ const MEASURED: [(u32, u32, usize); 9] = [
     (17, 13, 1),
     (18, 13, 1),
     (19, 13, 1),
-    (20, 13, 1),
+    (20, 15, 1),
     (21, 16, 1),
-    (22, 14, 1),
+    (22, 16, 1),
 ];
 
 /// `(wbits, chunks)` of `MEASURED` for `n` points.
 fn measured(n: usize) -> (u32, usize) {
     let (lo, hi) = (MEASURED[0].0, MEASURED[MEASURED.len() - 1].0);
-    let k = lg2(n).clamp(lo, hi);
+    let k = lg2_nearest(n).clamp(lo, hi);
     let e = MEASURED[(k - lo) as usize];
     (e.1, e.2)
+}
+
+/// log2 rounded to the nearest integer on the log scale: the floor of
+/// `log2(n sqrt 2)`.
+const fn lg2_nearest(n: usize) -> u32 {
+    // 181 / 128 = 1.4140625, just below sqrt 2
+    lg2(((n as u128 * 181) >> 7) as usize)
 }
 
 fn plan(n: usize) -> Plan {
@@ -461,6 +537,109 @@ fn table_for(
 }
 
 // ---------------------------------------------------------------------------
+// The effective size.
+
+/// The non-zero scalars an MSM of `n` scalars needs for the device, under
+/// the log2 threshold `k` of its path (`table`: a registered table serves
+/// it). With the default thresholds, `max(2^k, n / SPARSE_TABLE_DIV)` on the
+/// table path and `max(2^k, n / SPARSE_ONE_SHOT_DIV)` on the one-shot path;
+/// with an explicit threshold (`explicit`, [`crate::set_min_k`] or
+/// `MIDNIGHT_METAL_MIN_K`), `2^k` alone.
+pub(crate) fn effective_need(n: usize, k: u32, table: bool, explicit: bool) -> usize {
+    let min = 1usize << k.min(40);
+    if explicit {
+        return min;
+    }
+    let div = if table {
+        SPARSE_TABLE_DIV
+    } else {
+        SPARSE_ONE_SHOT_DIV
+    };
+    min.max(n / div)
+}
+
+/// The sparse crossovers: the device takes an MSM of `n` scalars only from
+/// `n / SPARSE_TABLE_DIV` non-zero scalars on the table path and from
+/// `n / SPARSE_ONE_SHOT_DIV` on the one-shot path (with the default
+/// thresholds).
+///
+/// The device MSM costs the same for any number of non-zero scalars of a
+/// given length (the masked scalars are dense), while the stock CPU MSM
+/// skips the zero ones. Measured on Apple M4 Max (40-core GPU, 16 CPU
+/// cores), 2026-11-19, release build, on `2^20` random points with `nz`
+/// random non-zero scalars at spread positions, with the CPU share of the
+/// split active (its share of a sparse input is cheap, so the device time
+/// stays that of a dense MSM), each configuration checked against
+/// `msm_pippenger` and timed as the minimum of 5 calls, two rounds
+/// interleaved in one process (load average 9 to 20 from another process;
+/// the rounds agreed within 4 ms). Wall time per call (ms), best round:
+///
+/// | non-zero        | CPU `msm_pippenger` | device, table | device, one-shot |
+/// |-----------------|-------|------|-------|
+/// | 2^17 (n/8)      | 42.8  | 61.3 | 102.2 |
+/// | 3·2^16 (n/5.33) | 60.0  | 61.7 | 102.3 |
+/// | 2^18 (n/4)      | 74.3  | 61.4 | 102.1 |
+/// | 3·2^17 (n/2.67) | 109.8 | 61.3 | 102.4 |
+/// | 2^19 (n/2)      | 152.0 | 61.3 | 105.4 |
+/// | 3·2^18 (n/1.33) | 218.7 | 61.4 | 102.3 |
+///
+/// The CPU time crosses the table path's at about `n/5.3` and the one-shot
+/// path's at about `n/2.9`: hence `n/5` and `n/3`. (Before the split, on a
+/// busier machine, the crossovers were about `n/3.4` and `n/1.5`; the
+/// device-only figures are in the report of that measurement, not here.)
+/// The fractions are a function of the length only, never of the values.
+pub(crate) const SPARSE_TABLE_DIV: usize = 5;
+/// See [`SPARSE_TABLE_DIV`].
+pub(crate) const SPARSE_ONE_SHOT_DIV: usize = 3;
+
+/// Whether an MSM over `scalars` has an effective size of at least `need`:
+/// its count of non-zero scalars, taken as 1 when every scalar is zero (so a
+/// threshold of `2^0` admits everything). The count is never stored or
+/// returned; only this comparison leaves the function.
+///
+/// A sequential scan of a prefix stops as soon as `need` non-zero scalars
+/// are seen (a dense input decides within about `need` scalars); otherwise
+/// the rest is counted on several threads, each stopping once the shared
+/// total reaches `need`.
+pub(crate) fn effective_size_reaches(scalars: &[Scalar], need: usize) -> bool {
+    use std::sync::atomic::AtomicUsize;
+    const BLOCK: usize = 1 << 13;
+    if need <= 1 {
+        return true;
+    }
+    let nz = |s: &Scalar| (s[0] | s[1] | s[2] | s[3] != 0) as usize;
+    let head = scalars.len().min(need.saturating_mul(2).max(BLOCK));
+    let mut seen = 0usize;
+    for b in scalars[..head].chunks(BLOCK) {
+        seen += b.iter().map(nz).sum::<usize>();
+        if seen >= need {
+            return true;
+        }
+    }
+    let rest = &scalars[head..];
+    if seen + rest.len() < need {
+        return false;
+    }
+    let total = AtomicUsize::new(seen);
+    let threads = std::thread::available_parallelism().map_or(4, |t| t.get()).min(16);
+    let per = rest.len().div_ceil(threads).max(BLOCK);
+    std::thread::scope(|s| {
+        for part in rest.chunks(per) {
+            let total = &total;
+            s.spawn(move || {
+                for b in part.chunks(BLOCK) {
+                    if total.load(Relaxed) >= need {
+                        return;
+                    }
+                    total.fetch_add(b.iter().map(nz).sum::<usize>(), Relaxed);
+                }
+            });
+        }
+    });
+    total.load(Relaxed) >= need
+}
+
+// ---------------------------------------------------------------------------
 // Entry points.
 
 /// Whether a registered table would serve an MSM on `bases` (the registered
@@ -473,7 +652,8 @@ pub(crate) fn has_table(bases: &[G1AffineLimbs]) -> bool {
 
 /// `sum scalars[i] * bases[i]`, or `None` (declined). Without a table that
 /// serves `bases` (none registered, or the registered one no longer matches),
-/// an MSM shorter than `one_shot_min` declines `below-min-k`.
+/// an MSM whose effective size is below `one_shot_min` (the one-shot path's
+/// [`effective_need`]) declines `below-min-k`.
 pub(crate) fn msm_g1(
     scalars: &[Scalar],
     bases: &[G1AffineLimbs],
@@ -522,6 +702,11 @@ pub struct MsmStages {
     pub integrate_ns: u64,
     /// Host time reading the partial sums and combining them (`blst`).
     pub collect_ns: u64,
+    /// Points of the device share (`n` when the CPU takes no share).
+    pub device_points: u64,
+    /// Wall time of the CPU share (`msm_pippenger` on the points the device
+    /// does not take), run at the same time as the device share.
+    pub cpu_ns: u64,
     /// The most points in one bucket (any window, any chunk, any pass).
     pub bucket_max: u32,
     /// Points summed in buckets, over all windows, chunks and passes
@@ -554,8 +739,8 @@ pub fn msm_g1_stages(
 }
 
 /// The table or one-shot path, then the masked MSM. `Ok(None)`: no table
-/// serves `bases` and the MSM is shorter than `one_shot_min` (no device
-/// work was done).
+/// serves `bases` and the MSM's effective size is below `one_shot_min` (no
+/// device work was done).
 fn dispatch(
     scalars: &[Scalar],
     bases: &[G1AffineLimbs],
@@ -589,16 +774,191 @@ fn dispatch(
                 p.table = true;
             }
             let points = dev.as_ref().unwrap();
-            return masked(&mut s, Points::Table(points), scalars, Some(masks), prof).map(Some);
+            return split(
+                &mut s,
+                Points::Table(points),
+                scalars,
+                bases,
+                Some(masks),
+                prof,
+            )
+            .map(Some);
         }
     }
     drop(guard);
-    if n < one_shot_min {
+    if !effective_size_reaches(scalars, one_shot_min) {
         return Ok(None);
     }
     ONE_SHOT.fetch_add(1, Relaxed);
     let mut s = ctx::lock()?;
-    masked(&mut s, Points::Host(bases), scalars, None, prof).map(Some)
+    split(&mut s, Points::Host(bases), scalars, bases, None, prof).map(Some)
+}
+
+/// The device share `m` of an MSM of `n` points on the table path or the
+/// one-shot path (`MEASURED_SHARE`): the device computes the points `[0, m)`
+/// and the CPU `[m, n)`. A function of `n` and the path only.
+/// `MIDNIGHT_METAL_MSM_CPU_SHARE=off` gives `m = n`.
+fn device_share(n: usize, table: bool) -> usize {
+    if std::env::var("MIDNIGHT_METAL_MSM_CPU_SHARE").as_deref() == Ok("off") || cpu_pool().is_none()
+    {
+        return n;
+    }
+    let k = lg2_nearest(n);
+    let (lo, hi) = (
+        MEASURED_SHARE[0].0,
+        MEASURED_SHARE[MEASURED_SHARE.len() - 1].0,
+    );
+    if k < lo {
+        return n;
+    }
+    let e = MEASURED_SHARE[(k.min(hi) - lo) as usize];
+    let frac = if table { e.1 } else { e.2 };
+    (n * frac / SHARE_DEN).clamp(1, n)
+}
+
+/// The denominator of the shares in `MEASURED_SHARE`.
+const SHARE_DEN: usize = 64;
+
+/// The device share by size: `(log2 n, table path, one-shot path)`, in
+/// 64ths of the points (64: device only).
+///
+/// Measured on Apple M4 Max (40-core GPU, 16 CPU cores, 128 GB), 2026-11-19,
+/// release build, with the window plan above: for each size, random scalars
+/// and random points, the share swept over 64ths (table path: 64 down to 40
+/// or 44; one-shot path: 64 down to 36), every configuration checked against
+/// `msm_pippenger` once and timed as the minimum of 3 calls, the
+/// configurations of one size interleaved in one process. Two other
+/// processes shared the machine (one CPU-heavy, load average 12 to 23; one
+/// running GPU work), so single timings moved by up to 15%. The table path
+/// was swept two or three times (run 1 before the window plan above changed
+/// at 2^20 and 2^22); where the runs' best shares differed, the share between
+/// them is taken. Wall time per call (ms): device only, and the best share
+/// of each run with its time:
+///
+/// | n    | table: device only | best share (runs) | taken | one-shot: device only | best share | taken |
+/// |------|-----------|-------------------------------|----|-------|----------|----|
+/// | 2^14 | 5.7, 6.8  | 48: 6.5; 58 or 50: 5.2        | 56 | 11.0  | 40: 9.1  | 40 |
+/// | 2^15 | 6.8, 7.1  | 56: 6.2; 50: 6.1              | 56 | 20.9  | 40: 13.9 | 40 |
+/// | 2^16 | 9.0, 8.5  | 64; 64 (58: 8.6)              | 64 | 21.8  | 48: 17.8 | 48 |
+/// | 2^17 | 14.0, 13.4| 58: 13.2; 52: 11.3; 54: 11.5  | 54 | 25.8  | 52: 22.3 | 52 |
+/// | 2^18 | 24.2, 31.3| 56: 21.9; 50: 25.7           | 54 | 45.1  | 40: 35.4 | 40 |
+/// | 2^19 | 42.7, 47.3| 58: 39.3; 52: 39.9           | 54 | 83.0  | 40: 67.3 | 40 |
+/// | 2^20 | 80.8, 80.5| 54: 70.4; 52: 70.3           | 52 | 148.4 | 40: 116.2| 40 |
+/// | 2^21 | 139.6, 161| 52: 131.9; 52: 134.5        | 52 | 287.5 | 48: 232.0| 48 |
+/// | 2^22 | 314, 311  | 54: 237.4; 52: 266.7         | 52 | 558.7 | 44: 412.1| 44 |
+///
+/// The stock CPU MSM alone took 9.3, 15.4, 25.5, 39.2, 78, 144, 288, 586 and
+/// 1175 ms (best of the runs). At 2^14 and 2^15 the one-shot optimum is at
+/// the end of the swept range (40); the one-shot path is taken there only
+/// with an explicit threshold.
+///
+/// Outside the table: below `2^14` (reached only with an explicit
+/// threshold) device only; from `2^23` the `2^22` shares. A length that is
+/// not a power of two takes the entry of its nearest log2, as the plan does.
+const MEASURED_SHARE: [(u32, usize, usize); 9] = [
+    (14, 56, 40),
+    (15, 56, 40),
+    (16, 64, 48),
+    (17, 54, 52),
+    (18, 54, 40),
+    (19, 54, 40),
+    (20, 52, 40),
+    (21, 52, 48),
+    (22, 52, 44),
+];
+
+/// The thread pool of the CPU share: its own threads, so that the share
+/// never waits for a worker of the caller's pool (the prover calls MSMs from
+/// rayon workers, which may all be blocked on the device lock).
+fn cpu_pool() -> Option<&'static rayon::ThreadPool> {
+    static POOL: std::sync::OnceLock<Option<rayon::ThreadPool>> = std::sync::OnceLock::new();
+    POOL.get_or_init(|| {
+        rayon::ThreadPoolBuilder::new()
+            .num_threads(std::thread::available_parallelism().map_or(4, |t| t.get()))
+            .thread_name(|i| format!("midnight-metal-msm-cpu-{i}"))
+            .build()
+            .ok()
+    })
+    .as_ref()
+}
+
+const _: () = {
+    assert!(size_of::<midnight_curves::Fq>() == size_of::<Scalar>());
+    assert!(align_of::<midnight_curves::Fq>() == align_of::<Scalar>());
+    assert!(size_of::<midnight_curves::G1Affine>() == size_of::<G1AffineLimbs>());
+    assert!(align_of::<midnight_curves::G1Affine>() == align_of::<G1AffineLimbs>());
+    assert!(size_of::<midnight_curves::G1Projective>() == size_of::<blst_p1>());
+};
+
+/// The CPU share: the stock `msm_pippenger` of midnight-curves, on the
+/// share's own pool. The scalars and points are the caller's slices (no
+/// copy is made here).
+fn cpu_msm(scalars: &[Scalar], bases: &[G1AffineLimbs]) -> blst_p1 {
+    use midnight_curves::{Fq, G1Affine, G1Projective, msm::msm_pippenger};
+    // SAFETY: `Fq` is a transparent `blst_fr` (`[u64; 4]`), `G1Affine` a
+    // transparent `blst_p1_affine` (`[u64; 12]`), `G1Projective` a transparent
+    // `blst_p1`; sizes and alignments are checked above. The scalars were
+    // checked reduced at admission.
+    let (s, b) = unsafe {
+        (
+            &*(scalars as *const [Scalar] as *const [Fq]),
+            &*(bases as *const [G1AffineLimbs] as *const [G1Affine]),
+        )
+    };
+    let pool = cpu_pool().expect("the CPU share runs only with its pool");
+    let r: G1Projective = pool.install(|| msm_pippenger(s, b));
+    // SAFETY: as above.
+    unsafe { std::mem::transmute::<G1Projective, blst_p1>(r) }
+}
+
+/// The MSM split between the device (`[0, m)`, masked) and the CPU (`[m, n)`,
+/// on another thread at the same time), the two sums added on the host.
+fn split(
+    s: &mut Session,
+    points: Points<'_>,
+    scalars: &[Scalar],
+    bases: &[G1AffineLimbs],
+    masks: Option<&mut HashMap<usize, G1JacobianLimbs>>,
+    mut prof: Option<&mut MsmStages>,
+) -> Result<(G1JacobianLimbs, u64), Error> {
+    let n = scalars.len();
+    let m = device_share(n, matches!(points, Points::Table(_)));
+    if let Some(p) = prof.as_deref_mut() {
+        p.device_points += m as u64;
+    }
+    if m == n {
+        return masked(s, points, scalars, masks, prof);
+    }
+    let points = match points {
+        Points::Host(b) => Points::Host(&b[..m]),
+        t => t,
+    };
+    let (dev, cpu) = std::thread::scope(|sc| {
+        let h = sc.spawn(|| {
+            let t0 = Instant::now();
+            let r = cpu_msm(&scalars[m..], &bases[m..]);
+            (r, t0.elapsed().as_nanos() as u64)
+        });
+        let dev = masked(s, points, &scalars[..m], masks, prof.as_deref_mut());
+        (dev, h.join())
+    });
+    let (mut cpu, cpu_ns) = cpu.map_err(|_| Error::Device("msm: the CPU share failed".into()))?;
+    if let Some(p) = prof {
+        p.cpu_ns += cpu_ns;
+    }
+    let (d, ns) = match dev {
+        Ok(r) => r,
+        Err(e) => {
+            wipe(std::slice::from_mut(&mut cpu));
+            return Err(e);
+        }
+    };
+    let mut sum = p1_of(&d);
+    add(&mut sum, &cpu);
+    let out = limbs_of(&sum);
+    wipe(std::slice::from_mut(&mut sum));
+    wipe(std::slice::from_mut(&mut cpu));
+    Ok((out, ns))
 }
 
 enum Points<'a> {
@@ -640,7 +1000,7 @@ fn masked(
     s.scratch(K_HIST, rows * 4)?;
     s.scratch(K_BUCKETS, rows * size_of::<Xyzz>())?;
     s.scratch(K_ONES, geo.ones_slots() * size_of::<Xyzz>())?;
-    s.scratch(K_SCALARS, size_of_val(scalars))?.write(scalars);
+    write_parallel(s.scratch(K_SCALARS, size_of_val(scalars))?, scalars);
     if let Points::Host(b) = points {
         s.scratch(K_POINTS, size_of_val(b))?.write(b);
     }
@@ -700,6 +1060,24 @@ fn masked(
     let out = limbs_of(&sr);
     wipe(std::slice::from_mut(&mut sr));
     Ok((out, ns))
+}
+
+/// Copies `data` to the start of `buf` on a few threads (a 2^20-scalar copy
+/// takes about 0.5 ms on one).
+fn write_parallel<T: ctx::Pod + Sync + Send>(buf: &mut Buffer, data: &[T]) {
+    const PART: usize = 1 << 20;
+    let bytes = size_of_val(data);
+    if bytes <= PART {
+        buf.write(data);
+        return;
+    }
+    let per = data.len().div_ceil(4).max(PART / size_of::<T>().max(1));
+    let dst = &mut buf.as_mut_slice::<T>()[..data.len()];
+    std::thread::scope(|s| {
+        for (d, x) in dst.chunks_mut(per).zip(data.chunks(per)) {
+            s.spawn(move || d.copy_from_slice(x));
+        }
+    });
 }
 
 /// Thread counts that depend on the pipelines.
@@ -893,9 +1271,10 @@ fn enc_accumulate<'a>(
         ],
         &[],
     )?;
-    cmd.dispatch(
+    cmd.dispatch_with(
         "msm_accumulate",
         (pl.nwins as usize) << pl.bits,
+        ACC_GROUP,
         &[
             Arg::Buffer(b.buckets),
             pts,
@@ -903,6 +1282,7 @@ fn enc_accumulate<'a>(
             Arg::Buffer(b.hist),
             Arg::value(&p.acc),
         ],
+        &[],
     )
 }
 
@@ -1122,21 +1502,24 @@ fn integrate_row(row: &[Xyzz], lsbits: u32, nthrbits: u32) -> blst_p1 {
         wipe(std::slice::from_mut(&mut acc));
         return res;
     }
+    // sppark adds `acc * 2^(lsbits - 1 - nthrbits)` at every step; the sum of
+    // the running sums is doubled once at the end instead (the same point)
     let mut res = rec(i, 0);
     let mut acc = rec(i, 1);
+    let mut raised = blst_p1::default();
     while i > 0 {
         i -= 1;
-        let mut raise = acc;
-        for _ in 0..(lsbits - 1 - nthrbits) {
-            dbl(&mut raise);
-        }
-        add(&mut res, &raise);
+        add(&mut raised, &acc);
         add(&mut res, &rec(i, 0));
         if i != 0 {
             add(&mut acc, &rec(i, 1));
         }
-        wipe(std::slice::from_mut(&mut raise));
     }
+    for _ in 0..(lsbits - 1 - nthrbits) {
+        dbl(&mut raised);
+    }
+    add(&mut res, &raised);
+    wipe(std::slice::from_mut(&mut raised));
     wipe(std::slice::from_mut(&mut acc));
     res
 }
@@ -1195,19 +1578,23 @@ mod tests {
             (17, 13, 20, 1),
             (18, 13, 20, 1),
             (19, 13, 20, 1),
-            (20, 13, 20, 1),
+            (20, 15, 17, 1),
             (21, 16, 16, 1),
-            (22, 14, 19, 3),
+            (22, 16, 16, 2),
         ] {
             let p = plan(1 << k);
             assert_eq!((p.wbits, p.nwins, p.batch), (wbits, nwins, batch), "2^{k}");
             assert_eq!(p.top, NBITS - wbits * (nwins - 1));
             assert!(p.stride * p.batch >= 1 << k, "2^{k}");
         }
-        // outside the table: the end entries; a non-power of two: its floor
+        // outside the table: the end entries; a non-power of two: its
+        // nearest log2 (a device share of 52/64 of 2^20 takes the 2^20 entry)
         assert_eq!(plan(1).wbits, 11);
         assert_eq!(plan(1000).wbits, 11);
-        assert_eq!(plan((1 << 21) - 1).wbits, 13);
+        assert_eq!(plan((1 << 20) * 52 / 64).wbits, 15);
+        assert_eq!(plan((1 << 20) * 46 / 64).wbits, 15);
+        assert_eq!(plan((1 << 20) * 45 / 64).wbits, 13);
+        assert_eq!(plan((1 << 21) - 1).wbits, 16);
         assert_eq!(plan((1 << 21) + 5).wbits, 16);
         // the command-buffer bound up to 2^28
         for k in 0..=crate::MAX_MSM_LOG {
@@ -1220,11 +1607,26 @@ mod tests {
                 );
                 assert!(p.stride.is_multiple_of(32), "{n}");
                 if k >= 22 {
-                    assert_eq!(p.wbits, 14, "{n}");
+                    assert_eq!(p.wbits, 16, "{n}");
                 }
             }
         }
-        assert_eq!(plan(1 << 23).batch, 5);
-        assert_eq!(plan(1 << 28).batch, 153);
+        assert_eq!(plan(1 << 23).batch, 4);
+        assert_eq!(plan(1 << 28).batch, 128);
+    }
+
+    #[test]
+    fn device_share_follows_measured_table() {
+        if std::env::var("MIDNIGHT_METAL_MSM_CPU_SHARE").as_deref() == Ok("off") {
+            return;
+        }
+        for &(k, t, o) in &MEASURED_SHARE {
+            let n = 1usize << k;
+            assert_eq!(device_share(n, true), n * t / SHARE_DEN, "2^{k}");
+            assert_eq!(device_share(n, false), n * o / SHARE_DEN, "2^{k}");
+        }
+        assert_eq!(device_share(1000, true), 1000);
+        assert_eq!(device_share(1 << 13, false), 1 << 13);
+        assert_eq!(device_share(1 << 24, true), (1 << 24) * 52 / 64);
     }
 }

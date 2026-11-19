@@ -429,23 +429,53 @@ struct AccParams {
     uint bits;    // wbits - 1
     uint stride;  // digits row length
 };
+// Threads of an `msm_accumulate` group (src/msm.rs `ACC_GROUP`).
+constant uint ACC_GROUP = 256;
 } // namespace msm
+
+using msm::ACC_GROUP;
+
+// The length of bucket `t` (0 for the bucket left to `msm_ones`) and its
+// first sorted entry.
+MONT_INLINE uint bucket_len(device const uint *hist, constant msm::AccParams &p, uint t,
+                            thread uint &idx) {
+    const uint y = t >> p.bits, x = t & ((1u << p.bits) - 1);
+    device const uint *h = hist + ((size_t)y << p.bits);
+    idx = x ? h[x - 1] : 0;
+    return (x == 0 && y == 0) ? 0 : h[x] - idx;
+}
 
 kernel void msm_accumulate(device g1::Xyzz *buckets [[buffer(0)]],
                            device const g1::Affine *points [[buffer(1)]],
                            device const uint *digits [[buffer(2)]],
                            device const uint *hist [[buffer(3)]],
                            constant msm::AccParams &p [[buffer(4)]],
-                           uint t [[thread_position_in_grid]]) {
-    if (t >= (p.nwins << p.bits)) return;
-    const uint y = t >> p.bits, x = t & ((1u << p.bits) - 1);
-    device const uint *h = hist + ((size_t)y << p.bits);
-    const uint end = h[x];
-    const uint idx = x ? h[x - 1] : 0;
-    uint len = end - idx;
+                           uint g [[thread_position_in_grid]],
+                           uint tid [[thread_index_in_threadgroup]],
+                           uint tpg [[threads_per_threadgroup]]) {
+    threadgroup uint lens[ACC_GROUP];
+    threadgroup uint slot[ACC_GROUP];
+    const uint total = p.nwins << p.bits;
+    uint idx;
+    const uint mine = g < total ? bucket_len(hist, p, g, idx) : 0;
+    // the group's buckets by load, longest first: each SIMD-group takes 32
+    // buckets of similar length
+    lens[tid] = mine;
+    metal::threadgroup_barrier(metal::mem_flags::mem_threadgroup);
+    uint rank = 0;
+    for (uint j = 0; j < tpg; j++) {
+        uint l = lens[j];
+        rank += (l > mine || (l == mine && j < tid)) ? 1u : 0u;
+    }
+    slot[rank] = tid;
+    metal::threadgroup_barrier(metal::mem_flags::mem_threadgroup);
+    const uint t = g - tid + slot[tid];
+    if (t >= total) return;
+    const uint y = t >> p.bits;
+    uint len = bucket_len(hist, p, t, idx);
 
     g1::Xyzz bucket;
-    if (len && !(x == 0 && y == 0)) {
+    if (len) {
         device const uint *digs = digits + (size_t)y * p.stride + idx;
         uint digit = *digs++;
         bucket = g1::from_affine(points[digit & 0x7fffffff]);

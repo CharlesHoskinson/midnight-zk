@@ -23,7 +23,10 @@
 //! copy only after its full digest matched the registration in the current
 //! request (at every serve in a debug build); a polynomial whose content
 //! changed is counted ([`key_stale`]), loses its registration and is uploaded
-//! for the call only.
+//! for the call only. The digests of a quotient's key polynomials are
+//! computed while the device transforms the proof's polynomials ([`plan`],
+//! [`settle`]), and settled before the numerator, the first kernel that
+//! reads a slot.
 //!
 //! The copies are freed at [`crate::end_request`] unless [`keep_resident`]
 //! (`set_keep_resident`, or `MIDNIGHT_METAL_KEEP_KEYS=1`), by
@@ -50,37 +53,66 @@ fn sha256(b: &[u8]) -> [u8; 32] {
     out
 }
 
-/// The content digest of public data: SHA-256 of the length and the SHA-256
-/// of each 16 MiB chunk (the chunks hashed in parallel). The same function
-/// as the CUDA crate's `ident::digest`.
-pub(crate) fn digest(v: &[Scalar]) -> [u8; 32] {
-    // SAFETY: plain limbs, no padding.
-    let b = unsafe { std::slice::from_raw_parts(v.as_ptr() as *const u8, size_of_val(v)) };
-    let chunks: Vec<&[u8]> = b.chunks(CHUNK).collect();
+/// The content digest of each of `vs` (public data): SHA-256 of the length
+/// and the SHA-256 of each 16 MiB chunk, the same function as the CUDA
+/// crate's `ident::digest`. The chunks of all of them are hashed together on
+/// all cores (a polynomial of a few chunks alone would keep most idle).
+pub(crate) fn digest_many(vs: &[&[Scalar]]) -> Vec<[u8; 32]> {
+    let bytes: Vec<&[u8]> = vs
+        .iter()
+        .map(|v| {
+            // SAFETY: plain limbs, no padding.
+            unsafe { std::slice::from_raw_parts(v.as_ptr() as *const u8, size_of_val(*v)) }
+        })
+        .collect();
+    let chunks: Vec<&[u8]> = bytes.iter().flat_map(|b| b.chunks(CHUNK)).collect();
     let mut ds = vec![[0u8; 32]; chunks.len()];
-    let threads = std::thread::available_parallelism().map_or(4, |t| t.get()).clamp(1, 8);
-    if chunks.len() <= 1 || threads == 1 {
+    let threads = std::thread::available_parallelism()
+        .map_or(4, |t| t.get())
+        .clamp(1, 16)
+        .min(chunks.len());
+    if threads <= 1 {
         for (d, c) in ds.iter_mut().zip(&chunks) {
             *d = sha256(c);
         }
     } else {
-        let per = chunks.len().div_ceil(threads);
+        // each thread takes the next chunk
+        let next = std::sync::atomic::AtomicUsize::new(0);
         std::thread::scope(|sc| {
-            for (dp, cp) in ds.chunks_mut(per).zip(chunks.chunks(per)) {
-                sc.spawn(move || {
-                    for (d, c) in dp.iter_mut().zip(cp) {
-                        *d = sha256(c);
-                    }
-                });
+            let hs: Vec<_> = (0..threads)
+                .map(|_| {
+                    sc.spawn(|| {
+                        let mut done = Vec::new();
+                        loop {
+                            let i = next.fetch_add(1, Relaxed);
+                            let Some(c) = chunks.get(i) else { break };
+                            done.push((i, sha256(c)));
+                        }
+                        done
+                    })
+                })
+                .collect();
+            for h in hs {
+                for (i, d) in h.join().expect("a digest thread") {
+                    ds[i] = d;
+                }
             }
         });
     }
-    let mut top = Vec::with_capacity(8 + 32 * ds.len());
-    top.extend_from_slice(&(b.len() as u64).to_le_bytes());
-    for d in &ds {
-        top.extend_from_slice(d);
-    }
-    sha256(&top)
+    let mut at = 0;
+    bytes
+        .iter()
+        .map(|b| {
+            let n = b.len().div_ceil(CHUNK);
+            let mut top = Vec::with_capacity(8 + 32 * n);
+            top.extend_from_slice(&(b.len() as u64).to_le_bytes());
+            for d in &ds[at..at + n] {
+                top.extend_from_slice(d);
+            }
+            at += n;
+            sha256(&top)
+        })
+        .collect()
 }
 
 /// A registered polynomial.
@@ -168,8 +200,11 @@ pub fn evict_key_copies() -> u64 {
             c.present.iter_mut().for_each(|p| *p = false);
         }
     }
-    // zeroed and released outside the lock
-    freed.iter().map(|b| b.len_bytes() as u64).sum()
+    // zeroed (in the background) and put back into the pool outside the
+    // lock
+    let bytes = freed.iter().map(|b| b.len_bytes() as u64).sum();
+    crate::ctx::release_later(freed);
+    bytes
 }
 
 /// The registration of proving-key polynomials. While it lives the
@@ -185,14 +220,17 @@ impl KeyHandle {
     /// Whether every registered polynomial still has its registered content
     /// (full digests).
     pub fn verify(&self, polys: &[&[Scalar]]) -> bool {
+        if polys.len() != self.keys.len() {
+            return false;
+        }
+        let ds = digest_many(polys);
         let r = registry();
-        polys.len() == self.keys.len()
-            && polys.iter().zip(&self.keys).all(|(p, key)| {
-                (p.as_ptr() as usize, p.len()) == *key
-                    && r.as_ref()
-                        .and_then(|r| r.entries.get(key))
-                        .is_some_and(|e| e.id == self.id && e.digest == digest(p))
-            })
+        polys.iter().zip(&self.keys).zip(&ds).all(|((p, key), d)| {
+            (p.as_ptr() as usize, p.len()) == *key
+                && r.as_ref()
+                    .and_then(|r| r.entries.get(key))
+                    .is_some_and(|e| e.id == self.id && e.digest == *d)
+        })
     }
 
     /// The bytes of this handle's device copy now (0 before the first
@@ -228,8 +266,11 @@ impl Drop for KeyHandle {
 pub fn register_key(polys: &[&[Scalar]]) -> KeyHandle {
     let id = NEXT_ID.fetch_add(1, Relaxed);
     // hash before taking the lock
-    let entries: Vec<((usize, usize), [u8; 32])> =
-        polys.iter().map(|p| ((p.as_ptr() as usize, p.len()), digest(p))).collect();
+    let entries: Vec<((usize, usize), [u8; 32])> = polys
+        .iter()
+        .map(|p| (p.as_ptr() as usize, p.len()))
+        .zip(digest_many(polys))
+        .collect();
     let now = EPOCH.load(Relaxed);
     let mut r = registry();
     let r = r.get_or_insert_with(Registry::default);
@@ -311,52 +352,68 @@ impl Lent {
     }
 }
 
-/// Places the job's proving-key polynomials (`keys`: start and length of
-/// each, distinct). Each registered one is checked against its digest (once
-/// per request in a release build, at every call in a debug build); a stale
-/// one is dropped from the registry and counted. The handle with the most
-/// fresh polynomials of the job is lent for the call; the others are
-/// uploaded.
-pub(crate) fn place(keys: &[&[Scalar]]) -> (Vec<Place>, Option<Lent>) {
-    let mut places = vec![Place::Temp; keys.len()];
+/// The placement of a job's proving-key polynomials before their digests
+/// are checked ([`plan`]), settled by [`settle`].
+pub(crate) struct Plan {
+    /// Where each polynomial is read from, assuming that every registered
+    /// one still has its content; [`settle`] makes a stale one `Temp`.
+    pub(crate) places: Vec<Place>,
+    /// The copy lent for the call.
+    pub(crate) lent: Option<Lent>,
+    /// Indices (into the job's polynomials) of the registered ones whose
+    /// digest is to be checked: not checked yet in this request, or every
+    /// one in a debug build.
+    pub(crate) check: Vec<usize>,
+    /// `(id, slot)` of each registered polynomial as [`plan`] found it.
+    regs: Vec<Option<(u64, usize)>>,
+    /// The request of the plan.
+    epoch: u64,
+}
+
+/// Plans the placement of the job's proving-key polynomials (`keys`: start
+/// and length of each, distinct) without hashing them: the handle with the
+/// most registered polynomials of the job is lent for the call and its
+/// polynomials are placed in its slots; the others are uploaded. Each
+/// registered polynomial that was not checked against its digest in this
+/// request (every one in a debug build) is listed in [`Plan::check`]; the
+/// caller hashes them ([`digest_many`]) while the device works on the proof's
+/// polynomials, and [`settle`] drops a stale one before any slot is read.
+pub(crate) fn plan(keys: &[&[Scalar]]) -> Plan {
+    let now = EPOCH.load(Relaxed);
+    let mut p = Plan {
+        places: vec![Place::Temp; keys.len()],
+        lent: None,
+        check: Vec::new(),
+        regs: vec![None; keys.len()],
+        epoch: now,
+    };
     let mut r = registry();
     let Some(reg) = r.as_mut() else {
-        return (places, None);
+        return p;
     };
-    let now = EPOCH.load(Relaxed);
-    let mut fresh: Vec<Option<(u64, usize)>> = vec![None; keys.len()];
-    for (i, p) in keys.iter().enumerate() {
-        let key = (p.as_ptr() as usize, p.len());
-        let Some(e) = reg.entries.get_mut(&key) else {
+    for (i, k) in keys.iter().enumerate() {
+        let key = (k.as_ptr() as usize, k.len());
+        let Some(e) = reg.entries.get(&key) else {
             continue;
         };
-        let ok = (e.seen == now && !cfg!(debug_assertions)) || e.digest == digest(p);
-        if ok {
-            e.seen = now;
-            fresh[i] = Some((e.id, e.slot));
-        } else {
-            KEY_STALE.fetch_add(1, Relaxed);
-            let (id, slot) = (e.id, e.slot);
-            reg.entries.remove(&key);
-            // the slot's copy no longer holds a registered polynomial
-            if let Some(c) = reg.copies.get_mut(&id) {
-                c.present[slot] = false;
-            }
+        p.regs[i] = Some((e.id, e.slot));
+        if e.seen != now || cfg!(debug_assertions) {
+            p.check.push(i);
         }
     }
-    // the handle with the most fresh polynomials
+    // the handle with the most registered polynomials
     let mut counts: HashMap<u64, usize> = HashMap::new();
-    for (id, _) in fresh.iter().flatten() {
+    for (id, _) in p.regs.iter().flatten() {
         *counts.entry(*id).or_default() += 1;
     }
     let Some(best) = counts.into_iter().max_by_key(|(id, n)| (*n, u64::MAX - id)).map(|c| c.0)
     else {
-        return (places, None);
+        return p;
     };
     let Some(c) = reg.copies.get_mut(&best) else {
-        return (places, None);
+        return p;
     };
-    for (pl, f) in places.iter_mut().zip(&fresh) {
+    for (pl, f) in p.places.iter_mut().zip(&p.regs) {
         if let Some((id, slot)) = f
             && *id == best
         {
@@ -369,12 +426,99 @@ pub(crate) fn place(keys: &[&[Scalar]]) -> (Vec<Place>, Option<Lent>) {
     } else {
         vec![false; c.npolys]
     };
-    let lent = Lent {
+    p.lent = Some(Lent {
         id: best,
         buf: c.buf.take(),
         npolys: c.npolys,
         present,
         evictions: reg.evictions,
-    };
-    (places, Some(lent))
+    });
+    p
+}
+
+/// Settles a [`plan`] with the digests of its [`Plan::check`] polynomials
+/// (in that order): a polynomial whose digest matches its registration is
+/// marked checked for the request; one whose content changed is counted
+/// ([`key_stale`]), loses its registration and its slot of the lent copy,
+/// and becomes `Temp`, as does one whose registration went away meanwhile.
+/// Returns whether a polynomial placed in a slot became `Temp`.
+pub(crate) fn settle(p: &mut Plan, keys: &[&[Scalar]], digests: &[[u8; 32]]) -> bool {
+    let mut moved = false;
+    let mut r = registry();
+    for (&i, d) in p.check.iter().zip(digests) {
+        let key = (keys[i].as_ptr() as usize, keys[i].len());
+        let planned = p.regs[i];
+        let fresh = match r.as_mut().and_then(|reg| reg.entries.get_mut(&key)) {
+            Some(e) if Some((e.id, e.slot)) == planned => {
+                if e.digest == *d {
+                    e.seen = p.epoch;
+                    true
+                } else {
+                    KEY_STALE.fetch_add(1, Relaxed);
+                    let (id, slot) = (e.id, e.slot);
+                    let reg = r.as_mut().expect("a registry");
+                    reg.entries.remove(&key);
+                    // the slot's copy no longer holds a registered polynomial
+                    if let Some(c) = reg.copies.get_mut(&id)
+                        && let Some(pr) = c.present.get_mut(slot)
+                    {
+                        *pr = false;
+                    }
+                    false
+                }
+            }
+            _ => false,
+        };
+        if !fresh && let Place::Resident(slot) = p.places[i] {
+            if let Some(l) = p.lent.as_mut()
+                && let Some(pr) = l.present.get_mut(slot)
+            {
+                *pr = false;
+            }
+            p.places[i] = Place::Temp;
+            moved = true;
+        }
+    }
+    moved
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// The digest of each polynomial, one at a time, as the definition
+    /// reads: SHA-256 of the length and of each chunk's SHA-256.
+    fn reference(v: &[Scalar]) -> [u8; 32] {
+        // SAFETY: plain limbs, no padding.
+        let b = unsafe { std::slice::from_raw_parts(v.as_ptr() as *const u8, size_of_val(v)) };
+        let mut top = (b.len() as u64).to_le_bytes().to_vec();
+        for c in b.chunks(CHUNK) {
+            top.extend_from_slice(&sha256(c));
+        }
+        sha256(&top)
+    }
+
+    /// Hashing several polynomials together gives each one's own digest
+    /// (empty, shorter than a chunk, several chunks with a partial last one).
+    #[test]
+    fn digests_of_several_polynomials_are_their_own() {
+        let words = |n: usize, seed: u64| -> Vec<Scalar> {
+            (0..n as u64)
+                .map(|i| [i ^ seed, i.wrapping_mul(0x9e37_79b9_7f4a_7c15), seed, !i])
+                .collect()
+        };
+        let per_chunk = CHUNK / size_of::<Scalar>();
+        let polys = [
+            words(0, 1),
+            words(3, 2),
+            words(per_chunk, 3),
+            words(2 * per_chunk + 5, 4),
+            words(per_chunk / 2, 5),
+        ];
+        let refs: Vec<&[Scalar]> = polys.iter().map(|p| p.as_slice()).collect();
+        let want: Vec<[u8; 32]> = refs.iter().map(|p| reference(p)).collect();
+        assert_eq!(digest_many(&refs), want);
+        assert_eq!(digest_many(&refs[3..4]), want[3..4]);
+        assert!(digest_many(&[]).is_empty());
+    }
 }
