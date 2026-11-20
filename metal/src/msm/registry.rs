@@ -11,8 +11,13 @@
 // See the License for the specific language governing permissions and
 // limitations under the License.
 
-//! Registered base tables ("Registered base tables" in the module text) and
-//! the MSM counters.
+//! Registered SRS base tables and the MSM counters.
+//!
+//! A table is keyed by the address and length of the registered slice and
+//! serves that slice and its prefixes. Every use compares each point of the
+//! caller's slice with the table before any scalar is read; a mismatch drops
+//! the table. The registry lock is held only to look up and pin a table
+//! (an `Arc`), so a table dropped during an MSM lives until that MSM ends.
 
 use std::{
     collections::HashMap,
@@ -49,25 +54,23 @@ impl Store {
     }
 }
 
-/// `MSM(r)` of a table by length (public: the mask and the points are
-/// public).
+/// `MSM(r)` of a table by length (public: the mask and the points are).
 pub(super) type MaskCache = Mutex<HashMap<usize, G1JacobianLimbs>>;
 
 /// A registered table. Its points never change after registration.
 pub(super) struct Table {
     id: u64,
     len: usize,
-    /// The first index whose point is not in G1 (off the curve, or on it
-    /// outside the prime-order subgroup); `len` when every point is. An MSM
-    /// on a prefix longer than this declines.
+    /// The first index whose point is not in G1, or `len`. An MSM on a longer
+    /// prefix declines.
     pub(super) first_bad: usize,
     pub(super) store: RwLock<Store>,
     pub(super) masks: MaskCache,
 }
 
 impl Table {
-    /// Whether the table still has the caller's points (it is the slice or a
-    /// longer one): every point compared.
+    /// Whether the table still holds the caller's points (every point
+    /// compared).
     fn serves(&self, bases: &[G1AffineLimbs]) -> bool {
         if bases.len() > self.len {
             return false;
@@ -77,8 +80,8 @@ impl Table {
         t.len() >= bases.len() && points_equal(&t[..bases.len()], bases)
     }
 
-    /// Copies the host copy into a device buffer, once (the caller holds the
-    /// device state, see the lock order).
+    /// Uploads the host copy to a device buffer, once (the caller holds the
+    /// device lock).
     pub(super) fn upload(&self, ctx: &Ctx) -> Result<(), Error> {
         if matches!(*read(&self.store), Store::Host(_)) {
             let mut w = write(&self.store);
@@ -113,15 +116,13 @@ fn tables() -> MutexGuard<'static, Option<Registry>> {
     lock(&TABLES)
 }
 
-/// The live table registered under `key` with `id`, pinned (the registry
-/// lock is released on return).
+/// The live table registered under `key` with `id`, pinned.
 fn pinned(key: (usize, usize), id: u64) -> Option<Arc<Table>> {
     tables().as_ref().and_then(|t| t.get(&key)).filter(|e| e.id == id).cloned()
 }
 
 /// The registration of an SRS base slice. While it lives, the registrant
-/// promises to keep the slice alive and unchanged; MSMs on it or on a prefix
-/// of it use a device table. Dropping it frees the table.
+/// keeps the slice alive and unchanged. Dropping it frees the table.
 #[derive(Debug)]
 pub struct SrsHandle {
     id: u64,
@@ -139,10 +140,8 @@ impl SrsHandle {
         self.key.1 == 0
     }
 
-    /// Bytes this table holds in device memory now: its points once the
-    /// first MSM on it uploaded them, 0 before that and after the table was
-    /// dropped as stale. The host copy of a registration that was not
-    /// uploaded yet is not counted.
+    /// Bytes this table holds in device memory: its points once uploaded,
+    /// else 0.
     pub fn device_bytes(&self) -> u64 {
         pinned(self.key, self.id).map_or(0, |t| match &*read(&t.store) {
             Store::Device(b) => b.len_bytes() as u64,
@@ -150,8 +149,7 @@ impl SrsHandle {
         })
     }
 
-    /// Whether `bases` is the registered slice with the registered content
-    /// (every point compared).
+    /// Whether `bases` is the registered slice with the registered content.
     pub fn verify(&self, bases: &[G1AffineLimbs]) -> bool {
         (bases.as_ptr() as usize, bases.len()) == self.key
             && pinned(self.key, self.id).is_some_and(|t| t.serves(bases))
@@ -167,19 +165,18 @@ impl Drop for SrsHandle {
                 _ => None,
             }
         };
-        // outside the registry lock (an MSM may still hold the table: it is
-        // freed when that MSM ends)
+        // outside the registry lock; an MSM still holding the table frees it
+        // when it ends
         drop(removed);
     }
 }
 
-/// Registers a host copy of an SRS base slice (no device work: the first MSM
-/// on the slice uploads it). Registering the same slice again replaces the
-/// table.
+/// Registers a host copy of an SRS base slice; the first MSM on it uploads
+/// it. Registering the same slice again replaces the table. The KZG prover
+/// commits from four `ParamsKZG` base vectors, so register all four.
 ///
-/// Every point is checked to be in G1 (see "Bases outside G1" in the module
-/// text): a table with a point that is not is still registered, and MSMs on
-/// a prefix that includes that point decline.
+/// Every point is checked to be in G1 once here. A table with a point outside
+/// G1 is still registered, and MSMs on a prefix that includes it decline.
 pub fn register_srs(bases: &[G1AffineLimbs]) -> SrsHandle {
     let key = (bases.as_ptr() as usize, bases.len());
     let id = NEXT_ID.fetch_add(1, Relaxed);
@@ -216,18 +213,16 @@ pub fn msm_counts() -> (u64, u64, u64) {
     )
 }
 
-/// Per-call G1 checks of the bases started on the one-shot path since
-/// process start (feature `test-support`; not a stable interface). The check
-/// of [`register_srs`] is not counted.
+/// Per-call G1 checks started on the one-shot path since process start (not
+/// a stable interface).
 #[doc(hidden)]
 #[cfg(any(test, feature = "test-support"))]
 pub fn one_shot_g1_checks() -> u64 {
     G1_CHECKS.load(Relaxed)
 }
 
-/// The key of the table that serves an MSM of `m` scalars on the slice
-/// `key`: the exact entry, else the shortest entry at the same address that
-/// is longer.
+/// The key of the table that serves `m` scalars on the slice `key`: the exact
+/// entry, else the shortest longer entry at the same address.
 fn table_for(t: &Registry, key: (usize, usize), m: usize) -> Option<(usize, usize)> {
     if m > key.1 {
         return None;
@@ -238,11 +233,9 @@ fn table_for(t: &Registry, key: (usize, usize), m: usize) -> Option<(usize, usiz
     t.keys().filter(|k| k.0 == key.0 && k.1 > key.1).min_by_key(|k| k.1).copied()
 }
 
-/// The table that serves an MSM of `n` scalars on `bases`, pinned, after
-/// every point of `bases` was compared with it. A table that does not match
-/// is dropped from the registry (with its cached mask MSMs), unless it was
-/// replaced or dropped meanwhile, and the next candidate is tried. The
-/// registry lock is held only for the lookups and the removal.
+/// The table that serves an MSM of `n` scalars on `bases`, pinned, after every
+/// point was compared. A mismatching table is dropped (with its cached mask
+/// MSMs) unless it was replaced meanwhile, and the next candidate is tried.
 pub(super) fn serving_table(bases: &[G1AffineLimbs], n: usize) -> Option<Arc<Table>> {
     let key = (bases.as_ptr() as usize, bases.len());
     loop {

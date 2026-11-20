@@ -11,14 +11,8 @@
 // See the License for the specific language governing permissions and
 // limitations under the License.
 
-//! The Metal device context (macOS only).
-//!
-//! One process-wide context, made lazily at the first use ([`context`]): the
-//! system default `MTLDevice`, one command queue, the shader library (the
-//! embedded metallib, else the embedded source compiled at that moment, see
-//! `build.rs`) and a cache of compute pipeline states by kernel name.
-//!
-//! # Use from a kernel module
+//! The Metal device context: the default `MTLDevice`, one command queue, the
+//! shader library and a pipeline cache, made at first use ([`context`]).
 //!
 //! ```ignore
 //! let mut s = ctx::lock()?;                  // serialises device work
@@ -31,68 +25,25 @@
 //! a.read(out);
 //! ```
 //!
-//! [`lock`] returns a [`Session`]: device work, the per-request buffers and
-//! [`end_request`] are serialised by it, so [`end_request`] never zeroes a
-//! buffer a kernel is using. A [`Ctx::run`] encodes any number of dispatches
-//! into one command buffer (one serial compute encoder: each dispatch sees the
-//! writes of the previous ones), commits it, waits for it and returns the GPU
-//! time. A command buffer that ends in the error state is an
-//! [`Error::Device`], never a panic.
+//! [`lock`] returns a [`Session`], which also guards the per-request buffers,
+//! so [`end_request`] never zeroes a buffer a kernel is using. [`Ctx::run`]
+//! encodes dispatches into one command buffer with one serial encoder and
+//! waits for it; a command buffer in the error state is [`Error::Device`].
 //!
-//! # Memory on unified-memory Apple GPUs
+//! Every buffer is `MTLResourceStorageModeShared`, so host access is a plain
+//! copy. Caller slices are copied rather than wrapped (wrapping needs
+//! page-aligned slices), which also means the caller's slice is written only
+//! once the device result is complete.
 //!
-//! Apple Silicon has one physical memory shared by the CPU and the GPU. Every
-//! buffer here is `MTLResourceStorageModeShared`: its `contents()` pointer is
-//! host-visible and coherent with the GPU at command-buffer boundaries, so a
-//! "transfer" is a plain `memcpy` into or out of the buffer, with no DMA and
-//! no staging copy. Reading results after [`Ctx::run`] returns needs no blit
-//! and no synchronisation call (`didModifyRange` is a managed-mode concept).
-//!
-//! Wrapping a caller's slice without a copy
-//! (`newBufferWithBytesNoCopy:length:options:deallocator:`) needs a
-//! page-aligned start address and a length that is a multiple of the page
-//! size (16 KiB on Apple Silicon). Slices from the prover are ordinary heap
-//! allocations, so they are generally copied ([`Ctx::upload`],
-//! [`Buffer::write`]); at memory bandwidth the copy is small next to the
-//! kernels. A copy also keeps the hook contract simple: the caller's slice is
-//! written only after the device result is complete, so a decline leaves it
-//! unchanged.
-//!
-//! [`device_bytes`] counts the bytes this process holds in Metal buffers (now
-//! and peak since [`begin_request`]), the idle buffers of the pool included;
-//! [`in_use_bytes`] leaves them out, and [`request_peak_bytes`] is its peak
-//! since [`begin_request`]. Metal's own figure for the device,
-//! `currentAllocatedSize`, also includes the library, pipelines and driver
-//! allocations.
-//!
-//! # Buffers
-//!
+//! Buffers:
 //! - [`Buffer`]: owned by the caller, zeroed when dropped if it may hold a
-//!   non-zero byte (written by the host or bound to a kernel since it was made
-//!   or zeroed). Large zeroing runs on several threads.
-//! - Pooled buffers ([`Ctx::alloc_pooled`]): a zeroed buffer from the pool, or
-//!   a new one; when dropped it is zeroed and goes back to the pool instead of
-//!   being released. [`release_later`] drops buffers on a background thread;
-//!   [`end_request_report`] waits for it.
-//! - Per-request buffers ([`Session::scratch`], and [`take_request_buffer`] for
-//!   a call that fills its buffer without holding the device): kept by the
-//!   context under a key while a request is open ([`begin_request`]) until
-//!   [`end_request_report`], which zeroes each one, with its check reads it
-//!   back from the host mapping (and every idle buffer of the pool too), and
-//!   puts it back into the pool; a region, or an idle buffer of the pool, that
-//!   reads back non-zero (or cannot be read back) is zeroed again, read back
-//!   again and released, never pooled, and the report is `Err`. A kernel uses
-//!   them for scratch it reuses across the calls of one request. A hook call
-//!   made outside a request zeroes them before it returns (`crate::HookScope`,
-//!   [`wipe_unbracketed`]).
-//!
-//! # Residency and first use
-//!
-//! The start of a command buffer waits while Metal makes its buffers
-//! resident: for a new buffer, and for one not used for about two seconds.
-//! On an M4 Max each costs 13 to 30 ms for the 448 MiB of the quotient's
-//! cosets at `k = 20`. The pool of zeroed buffers avoids the first, the
-//! queue's residency set (see [`Ctx`]) the second.
+//!   non-zero byte.
+//! - Pooled ([`Ctx::alloc_pooled`]): taken from and returned to a pool of
+//!   zeroed buffers, because a new buffer delays its first command buffer
+//!   while Metal maps it.
+//! - Per-request ([`Session::scratch`], [`take_request_buffer`]): kept under a
+//!   key until [`end_request_report`] zeroes them, or zeroed at the end of a
+//!   hook call made outside a request (`wipe_unbracketed`).
 
 use std::{
     collections::{BTreeSet, HashMap, hash_map::Entry},
@@ -123,8 +74,8 @@ use objc2_metal::{
 
 use crate::{MetalInfo, account::Reason};
 
-// MTLCreateSystemDefaultDevice returns no device in a process that does not
-// link CoreGraphics.
+// MTLCreateSystemDefaultDevice returns no device unless the process links
+// CoreGraphics.
 #[link(name = "CoreGraphics", kind = "framework")]
 unsafe extern "C" {}
 
@@ -144,14 +95,12 @@ pub enum Error {
     Memory(String),
     /// A pipeline, encoder or command buffer failed.
     Device(String),
-    /// A scalar argument of a device building block is not below the
-    /// modulus (the device field arithmetic takes reduced inputs only).
+    /// A scalar argument of a device building block is not reduced.
     Unreduced(String),
 }
 
 impl Error {
-    /// The decline reason of this error: `no-device`, `memory`,
-    /// `device-error` or `unreduced`.
+    /// The decline reason of this error.
     pub fn reason(&self) -> &'static str {
         Reason::of(self).name()
     }
@@ -206,8 +155,8 @@ fn probe_device() -> Option<&'static Probe> {
         .as_ref()
 }
 
-/// The device's properties, without making the context (no library is
-/// loaded). `None`: no Metal device.
+/// The device's properties, without loading the library. `None`: no Metal
+/// device.
 pub fn probe() -> Option<&'static MetalInfo> {
     probe_device().map(|p| &p.info)
 }
@@ -222,30 +171,20 @@ pub struct Ctx {
     library: Retained<ProtocolObject<dyn MTLLibrary>>,
     library_source: String,
     pipelines: Mutex<HashMap<String, Pipeline>>,
-    /// The queue's residency set (see [`Resident`]); `None` where Metal has
-    /// none (before macOS 15).
+    /// The queue's residency set; `None` before macOS 15.
     resident: Option<Mutex<Resident>>,
 }
 
-/// Buffers of at least this many bytes are in the queue's residency set
-/// while they live.
+/// Buffers of at least this many bytes stay in the queue's residency set.
 const RESIDENT_MIN: usize = 1 << 20;
 
 /// The queue's residency set.
 ///
-/// Metal makes a buffer resident for the GPU when a command buffer uses it,
-/// and lets it go once it has not been used for about two seconds, even
-/// while the GPU works on other buffers. Its next use then waits while it is
-/// made resident again: measured on an M4 Max, two 448 MiB buffers unused
-/// for 2 to 5 s while the GPU ran other work waited 13 to 19 ms from
-/// `commit` to `GPUStartTime` (unused for 1 s: 0.3 ms). A proof takes about
-/// 2 s, so the quotient's buffers, the transform buffers and the MSM tables
-/// would be made resident again at every proof. A buffer in the queue's
-/// residency set stays resident (in the same measurement: no wait). [`Ctx`]
-/// adds every buffer of at least [`RESIDENT_MIN`] bytes when it is made and
-/// removes it when it is released; an idle buffer of the pool stays in it.
-/// The set also makes a new buffer resident when it is added, so its first
-/// command buffer does not wait for that either.
+/// Metal evicts a buffer unused for about two seconds even while the GPU is
+/// busy, and its next use then waits while it is made resident again. A proof
+/// takes about that long, so large buffers would be re-made resident every
+/// proof. [`Ctx`] adds every buffer of at least [`RESIDENT_MIN`] bytes when it
+/// is made (idle pool buffers included) and removes it when released.
 struct Resident {
     set: Retained<ProtocolObject<dyn MTLResidencySet>>,
 }
@@ -271,9 +210,8 @@ impl Ctx {
     }
 }
 
-/// Removes a buffer that is being released from the residency set (when it
-/// is large enough to be in it). A buffer is released by its last owner,
-/// after the GPU work that used it.
+/// Removes a buffer being released from the residency set. A buffer is
+/// released by its last owner, after the GPU work that used it.
 fn unkeep(b: &ProtocolObject<dyn MTLBuffer>) {
     if b.length() >= RESIDENT_MIN
         && let Some(Ok(c)) = CTX.get()
@@ -295,9 +233,8 @@ impl std::fmt::Debug for Ctx {
 
 static CTX: OnceLock<Result<Ctx, String>> = OnceLock::new();
 
-/// The context, made at the first call. The error of a failed attempt (no
-/// device, a library that does not load) is kept: later calls return it
-/// without trying again.
+/// The context, made at the first call. A failure is kept: later calls
+/// return it without trying again.
 pub fn context() -> Result<&'static Ctx, Error> {
     CTX.get_or_init(make_context).as_ref().map_err(|e| Error::NoDevice(e.clone()))
 }
@@ -335,8 +272,8 @@ fn make_context() -> Result<Ctx, String> {
     })
 }
 
-/// The shader library and where it came from ([`Ctx::library_source`]): the
-/// embedded metallib, else the embedded source compiled now.
+/// The shader library and its origin: the embedded metallib, else the
+/// embedded source compiled now.
 fn load_library(
     device: &Device,
 ) -> Result<(Retained<ProtocolObject<dyn MTLLibrary>>, String), String> {
@@ -386,8 +323,7 @@ static IN_USE: AtomicU64 = AtomicU64::new(0);
 /// The peak of [`IN_USE`] since process start or the last [`begin_request`].
 static IN_USE_PEAK: AtomicU64 = AtomicU64::new(0);
 
-/// Adds `bytes` to [`IN_USE`] (a new buffer, or one taken from the pool) and
-/// raises its peak.
+/// Adds `bytes` to [`IN_USE`] and raises its peak.
 fn in_use_add(bytes: u64) {
     let now = IN_USE.fetch_add(bytes, Relaxed) + bytes;
     IN_USE_PEAK.fetch_max(now, Relaxed);
@@ -400,36 +336,28 @@ fn count_alloc(bytes: u64) {
     in_use_add(bytes);
 }
 
-/// `(now, peak)` bytes this process holds in Metal buffers of this crate,
-/// the idle buffers of the pool included ([`pool_bytes`]). The peak is since
-/// process start or the last [`begin_request`].
+/// `(now, peak)` bytes held in this crate's Metal buffers, idle pool buffers
+/// included. The peak is since process start or the last [`begin_request`].
 pub fn device_bytes() -> (u64, u64) {
     (BYTES_NOW.load(Relaxed), BYTES_PEAK.load(Relaxed))
 }
 
-/// Bytes in buffers in use now: [`device_bytes`] without the idle buffers of
-/// the pool.
+/// Bytes in buffers in use now: [`device_bytes`] without idle pool buffers.
 pub fn in_use_bytes() -> u64 {
     IN_USE.load(Relaxed)
 }
 
-/// The peak of [`in_use_bytes`] since the last [`begin_request`] (or process
-/// start): every buffer handed out (new or taken from the pool, per-request,
-/// scoped or per-call), the resident SRS tables and proving-key copies, and
-/// not the idle buffers of the pool. A buffer a request takes from the pool
-/// counts from the moment it is taken. [`begin_request`] resets it to the
-/// bytes in use then (what earlier requests left resident).
+/// The peak of [`in_use_bytes`] since the last [`begin_request`], which resets
+/// it to the bytes in use then.
 pub fn request_peak_bytes() -> u64 {
     IN_USE_PEAK.load(Relaxed)
 }
 
-/// Whether a request is open: between [`begin_request`] and
-/// [`end_request_report`] / [`end_request`].
+/// Whether a request is open.
 static REQUEST_OPEN: AtomicBool = AtomicBool::new(false);
 
-/// Opens a request (per-request buffers are then kept for reuse across the
-/// calls of the request until [`end_request_report`]) and resets the peaks of
-/// [`device_bytes`] and [`request_peak_bytes`] to the current values.
+/// Opens a request and resets the peaks of [`device_bytes`] and
+/// [`request_peak_bytes`].
 pub fn begin_request() {
     BYTES_PEAK.store(BYTES_NOW.load(Relaxed), Relaxed);
     IN_USE_PEAK.store(IN_USE.load(Relaxed), Relaxed);
@@ -437,7 +365,7 @@ pub fn begin_request() {
 }
 
 /// Whether a request is open ([`begin_request`] was called and its
-/// [`end_request_report`] has not started yet).
+/// [`end_request_report`] has not started).
 pub fn request_open() -> bool {
     REQUEST_OPEN.load(SeqCst)
 }
@@ -447,25 +375,12 @@ pub fn request_open() -> bool {
 
 /// Zeroed buffers kept for reuse ([`Ctx::alloc_pooled`]).
 ///
-/// A new shared buffer costs more than its allocation: the first command
-/// buffer that uses it waits while its pages are made resident for the GPU
-/// (18 to 22 ms for 448 MiB, measured on an M4 Max as the time from `commit`
-/// to `GPUStartTime`, with no residency set; about 4 ms with it, which makes
-/// a new buffer resident when it is added). A buffer that is resident starts
-/// within 0.1 ms. So the large per-request and per-call buffers come from
-/// this pool and go back to it, and stay in the residency set meanwhile.
-///
-/// Every buffer in the pool reads zero (the pool's invariant): a buffer goes
-/// back only zero-filled by Metal and never written, or after its zeroing
-/// (on the CPU, of its whole allocation; see [`pool_put`]), so a buffer that
-/// held a witness value is never handed out again, nor reported erased,
-/// before it was zeroed. A buffer whose zeroing panicked, or that read back
-/// non-zero in the erasure check, is released instead. The check mode of
-/// [`end_request_report`] reads back every idle buffer, and [`release_pool`]
-/// (in a debug build) asserts the invariant before it frees them. The pool
-/// keeps at most [`pool_limit`] bytes (a buffer that would exceed it is
-/// released instead); [`release_pool`] releases every idle buffer, and a new
-/// allocation that would not fit releases idle buffers first ([`Ctx::alloc`]).
+/// Invariant: every buffer in the pool reads zero. A buffer enters only
+/// zero-filled by Metal and never written, or after its whole allocation was
+/// zeroed ([`pool_put`]), so a buffer that held a witness value is never
+/// handed out again unzeroed. A buffer whose zeroing panicked or that failed
+/// the erasure check is released instead. The pool keeps at most
+/// [`pool_limit`] bytes.
 struct Pool {
     free: Vec<Retained<ProtocolObject<dyn MTLBuffer>>>,
     bytes: u64,
@@ -480,22 +395,19 @@ static POOL: Mutex<Pool> = Mutex::new(Pool {
     free: Vec::new(),
     bytes: 0,
 });
-/// [`pool_limit`]: [`POOL_LIMIT_UNREAD`] until read; every stored limit is
-/// below it.
+/// [`pool_limit`]: [`POOL_LIMIT_UNREAD`] until read.
 static POOL_LIMIT: AtomicU64 = AtomicU64::new(POOL_LIMIT_UNREAD);
 /// [`POOL_LIMIT`] before the environment is read.
 const POOL_LIMIT_UNREAD: u64 = u64::MAX;
 
-/// The pool, locked. Like every lock of this crate, a poisoned one is taken
-/// over: no update under it is left half done by a panic.
+/// The pool, locked; a poisoned lock is taken over (no update under it is
+/// left half done).
 fn pool() -> MutexGuard<'static, Pool> {
     POOL.lock().unwrap_or_else(|e| e.into_inner())
 }
 
-/// The most bytes the pool keeps idle: `MIDNIGHT_METAL_POOL_MIB` (read
-/// once), else a quarter of the device's `recommendedMaxWorkingSetSize` (0
-/// without a device); the tests can set it (`set_pool_limit`, feature
-/// `test-support`).
+/// The most bytes the pool keeps idle: `MIDNIGHT_METAL_POOL_MIB` (read once),
+/// else a quarter of `recommendedMaxWorkingSetSize`.
 pub fn pool_limit() -> u64 {
     let l = POOL_LIMIT.load(Relaxed);
     if l != POOL_LIMIT_UNREAD {
@@ -540,8 +452,8 @@ pub fn pool_bytes() -> u64 {
     pool().bytes
 }
 
-/// Releases idle buffers taken out of the pool (zero, by the pool's
-/// invariant; a debug build reads each one back first).
+/// Releases idle buffers taken out of the pool (a debug build reads each one
+/// back first).
 fn release_raw(bufs: Vec<Retained<ProtocolObject<dyn MTLBuffer>>>) -> u64 {
     debug_assert!(
         bufs.iter().all(|b| raw_reads_zero(b)),
@@ -550,8 +462,8 @@ fn release_raw(bufs: Vec<Retained<ProtocolObject<dyn MTLBuffer>>>) -> u64 {
     release_unchecked(bufs)
 }
 
-/// Releases buffers taken out of the pool: out of the residency set and out
-/// of the byte count. Returns their bytes.
+/// Releases buffers taken out of the pool: out of the residency set and the
+/// byte count. Returns their bytes.
 fn release_unchecked(bufs: Vec<Retained<ProtocolObject<dyn MTLBuffer>>>) -> u64 {
     let bytes: u64 = bufs.iter().map(|b| b.length() as u64).sum();
     for b in &bufs {
@@ -562,10 +474,8 @@ fn release_unchecked(bufs: Vec<Retained<ProtocolObject<dyn MTLBuffer>>>) -> u64 
     bytes
 }
 
-/// Releases every idle buffer of the pool (after the zeroing still running
-/// in the background has ended, see [`release_later`]). Returns the bytes
-/// released. Every buffer it frees reads zero: that is the pool's invariant
-/// (see [`Pool`]), which a debug build asserts by reading each one back.
+/// Releases every idle buffer of the pool once background zeroing has ended.
+/// Returns the bytes released.
 pub fn release_pool() -> u64 {
     settle_releases();
     let bufs = {
@@ -576,8 +486,8 @@ pub fn release_pool() -> u64 {
     release_raw(bufs)
 }
 
-/// A zeroed buffer of the pool of at least `bytes` bytes and at most a
-/// quarter more (the smallest such), if there is one.
+/// The smallest pooled buffer of at least `bytes` and at most a quarter
+/// more.
 fn pool_take(bytes: usize) -> Option<Retained<ProtocolObject<dyn MTLBuffer>>> {
     let mut p = pool();
     let max = bytes.saturating_add(bytes / 4);
@@ -615,12 +525,10 @@ fn release_idle(need: u64) -> u64 {
 }
 
 /// Puts a zeroed buffer into the pool, or releases it when the pool would
-/// exceed its limit. The caller has zeroed the buffer's whole allocation
-/// (or got it zero-filled from Metal and never wrote it): the only callers
-/// are [`Buffer`]'s drop, after [`Buffer::erase`], which zeroes every buffer
-/// that may hold a non-zero byte (its `dirty` flag, set by every host write
-/// and every kernel binding) and never pools one whose zeroing failed, and
-/// the erasure report, which never pools a region that read back non-zero.
+/// exceed its limit. The caller has zeroed the whole allocation (or it is
+/// Metal-zeroed and unwritten): the callers are [`Buffer`]'s drop after
+/// [`Buffer::erase`] and the erasure report, neither of which pools a buffer
+/// that failed.
 fn pool_put(raw: Retained<ProtocolObject<dyn MTLBuffer>>) {
     let len = raw.length() as u64;
     IN_USE.fetch_sub(len, Relaxed);
@@ -640,9 +548,8 @@ fn pool_put(raw: Retained<ProtocolObject<dyn MTLBuffer>>) {
     }
 }
 
-/// The zeroing and release running on background threads
-/// ([`release_later`]): each call has a ticket; `outstanding` holds the
-/// tickets whose buffers are not all zeroed and pooled or released yet.
+/// Background zeroing ([`release_later`]): each call has a ticket, and
+/// `outstanding` holds the tickets not yet complete.
 struct Releases {
     next: u64,
     outstanding: BTreeSet<u64>,
@@ -661,17 +568,13 @@ fn releases() -> MutexGuard<'static, Releases> {
     RELEASES.lock().unwrap_or_else(|e| e.into_inner())
 }
 
-/// Zeroings that panicked (each one was completed on the calling thread
-/// instead, and its buffer was released, not pooled) since the last
-/// [`end_request_report`], which reports them as erasure failures.
+/// Zeroings that panicked (each completed on the calling thread, its buffer
+/// released) since the last [`end_request_report`].
 static ERASE_FAULTS: AtomicU64 = AtomicU64::new(0);
 
 /// Drops `bufs` (each zeroed, then pooled or released) on a background
-/// thread, so that a caller does not wait for the zeroing. When no thread
-/// can be made, they are dropped on the calling thread before this returns.
-/// [`settle_releases`] (and so [`end_request`], [`end_request_report`] and
-/// [`release_pool`]) waits for every release made before it was called: at
-/// the end of a request every such buffer has been zeroed.
+/// thread, or on this one when no thread can be made. [`settle_releases`]
+/// waits for it, so at the end of a request every such buffer is zeroed.
 pub fn release_later(bufs: Vec<Buffer>) {
     if bufs.is_empty() {
         return;
@@ -695,8 +598,7 @@ pub fn release_later(bufs: Vec<Buffer>) {
 }
 
 /// Drops the buffers of a [`release_later`] call and completes its ticket.
-/// Never panics: a zeroing that panics is completed on this thread and
-/// counted ([`Buffer::erase`]).
+/// Never panics.
 fn release_now(slot: &Mutex<Option<Vec<Buffer>>>, ticket: u64) {
     let bufs = slot.lock().unwrap_or_else(|e| e.into_inner()).take();
     for b in bufs.into_iter().flatten() {
@@ -715,9 +617,8 @@ pub(crate) fn releases_pending() -> bool {
     !releases().outstanding.is_empty()
 }
 
-/// Waits until every [`release_later`] call made before this call has
-/// completed (its buffers zeroed and pooled or released), whatever other
-/// thread waits for them at the same time.
+/// Waits until every [`release_later`] call made before this one has
+/// completed.
 pub fn settle_releases() {
     let mut r = releases();
     let target = r.next;
@@ -729,10 +630,9 @@ pub fn settle_releases() {
 // ---------------------------------------------------------------------------
 // Host copies
 
-/// Copies `src` into `dst` (equal lengths), on several threads when long (a
-/// single thread does not reach the memory bandwidth of the machine). Never
-/// panics: a part whose thread cannot be made is copied on the calling
-/// thread, so a copy into a caller's slice never stops half way.
+/// Copies `src` into `dst` on several threads when long. Never panics: a part
+/// whose thread cannot be made is copied here, so a copy into a caller's slice
+/// never stops half way.
 pub(crate) fn par_copy(dst: &mut [crate::Scalar], src: &[crate::Scalar]) {
     const PART: usize = 1 << 15;
     if src.len() <= 2 * PART {
@@ -764,8 +664,7 @@ pub(crate) fn par_copy(dst: &mut [crate::Scalar], src: &[crate::Scalar]) {
 // ---------------------------------------------------------------------------
 // Buffers
 
-/// Plain data that may be copied into and out of a buffer byte for byte:
-/// every bit pattern is a valid value and there is no padding.
+/// Plain data: every bit pattern is valid and there is no padding.
 ///
 /// # Safety
 /// Implement it only for such types.
@@ -783,12 +682,11 @@ unsafe impl<T: Pod, const N: usize> Pod for [T; N] {}
 pub struct Buffer {
     raw: Retained<ProtocolObject<dyn MTLBuffer>>,
     bytes: usize,
-    /// Goes back to the pool when dropped (after its zeroing); cleared when
-    /// its zeroing panicked or it failed the erasure check, so that it is
-    /// released instead.
+    /// Goes back to the pool when dropped; cleared when its zeroing panicked
+    /// or it failed the erasure check, so it is released instead.
     pooled: bool,
     /// May hold a non-zero byte: written by the host or bound to a kernel
-    /// since it was made or last zeroed.
+    /// since last zeroed.
     dirty: AtomicBool,
 }
 
@@ -805,8 +703,7 @@ impl std::fmt::Debug for Buffer {
     }
 }
 
-/// Byte runs of at least this size are zeroed, copied or checked on several
-/// threads: one core does not reach the memory bandwidth.
+/// Byte runs of at least this size are processed on several threads.
 const PAR_BYTES: usize = 4 << 20;
 
 /// The threads of a parallel host pass over memory.
@@ -816,12 +713,8 @@ fn mem_threads() -> usize {
 
 /// `f(start, len)` over `[0, len)` in parts of at least [`PAR_BYTES`] (a
 /// multiple of 64), on several threads; `true` when every part returned
-/// `true`.
-///
-/// Every part is done exactly once to completion: a part whose thread cannot
-/// be made, or whose thread panicked, is done (again) on the calling thread.
-/// So with an `f` that does not panic (zeroing, reading back) this does not
-/// panic and covers the whole range.
+/// `true`. A part whose thread cannot be made or panicked is redone on the
+/// calling thread, so with a non-panicking `f` this covers the whole range.
 fn par_ranges(len: usize, f: impl Fn(usize, usize) -> bool + Sync) -> bool {
     if len < 2 * PAR_BYTES {
         return f(0, len);
@@ -849,11 +742,8 @@ fn par_ranges(len: usize, f: impl Fn(usize, usize) -> bool + Sync) -> bool {
     })
 }
 
-/// Writes zero over the whole allocation of `raw` (on several threads when
-/// it is large). Does not panic.
-///
-/// The caller has exclusive use of the contents: no host reference to them
-/// and no GPU work on the buffer.
+/// Zeroes the whole allocation of `raw`. Does not panic. The caller has
+/// exclusive use of the contents (no host reference, no GPU work).
 fn raw_zero(raw: &ProtocolObject<dyn MTLBuffer>) {
     let base = raw.contents().as_ptr() as usize;
     par_ranges(raw.length(), |a, n| {
@@ -865,9 +755,8 @@ fn raw_zero(raw: &ProtocolObject<dyn MTLBuffer>) {
     std::sync::atomic::compiler_fence(SeqCst);
 }
 
-/// Whether every byte of `raw`'s allocation reads zero, read word by word
-/// with volatile loads from the host mapping (on several threads when it is
-/// large). Does not panic.
+/// Whether `raw`'s whole allocation reads zero (volatile word loads). Does
+/// not panic.
 fn raw_reads_zero(raw: &ProtocolObject<dyn MTLBuffer>) -> bool {
     let base = raw.contents().as_ptr() as usize;
     par_ranges(raw.length(), |a, n| {
@@ -883,8 +772,8 @@ fn raw_reads_zero(raw: &ProtocolObject<dyn MTLBuffer>) -> bool {
     })
 }
 
-/// Debug builds: samples a new buffer of `newBufferWithLength:options:`,
-/// which Apple documents as zero-filled, and asserts the samples read zero.
+/// Debug builds: asserts that samples of a new buffer read zero (Metal
+/// documents new buffers as zero-filled).
 fn debug_assert_zero_filled(raw: &ProtocolObject<dyn MTLBuffer>) {
     if cfg!(debug_assertions) {
         let len = raw.length();
@@ -916,8 +805,7 @@ impl Buffer {
         self.dirty.store(true, Relaxed);
     }
 
-    /// The contents as a slice of `T` (`len_bytes / size_of::<T>()`
-    /// elements).
+    /// The contents as a slice of `T`.
     pub fn as_slice<T: Pod>(&self) -> &[T] {
         // SAFETY: `contents` is page aligned, valid for `bytes` bytes, and no
         // GPU work writes it while `&self` is held outside `Ctx::run`.
@@ -936,16 +824,13 @@ impl Buffer {
         self.as_mut_slice::<T>()[..data.len()].copy_from_slice(data);
     }
 
-    /// Copies the start of the buffer into `out`. Panics if the buffer is
-    /// shorter.
+    /// Copies the start of the buffer into `out`. Panics if it is shorter.
     pub fn read<T: Pod>(&self, out: &mut [T]) {
         out.copy_from_slice(&self.as_slice::<T>()[..out.len()]);
     }
 
-    /// Writes zero over the whole buffer (its whole allocation, which may be
-    /// longer than [`Buffer::len_bytes`]), on several threads when it is
-    /// large. Does not panic, and always zeroes every byte: a part whose
-    /// thread cannot be made or fails is zeroed on the calling thread.
+    /// Zeroes the whole allocation (which may exceed [`Buffer::len_bytes`]).
+    /// Does not panic and always zeroes every byte.
     pub fn zero(&mut self) {
         // exclusive: `&mut self`
         raw_zero(&self.raw);
@@ -953,10 +838,9 @@ impl Buffer {
     }
 
     /// Zeroes the buffer if it may hold a non-zero byte. If the zeroing
-    /// panics (it does not: this is the last line of defence), the whole
-    /// allocation is zeroed again on this thread with no threads and no
-    /// allocation, the buffer is marked not to be pooled, and the fault is
-    /// counted for [`end_request_report`].
+    /// panics, it is redone on this thread without threads or allocation, the
+    /// buffer is marked not to be pooled, and the fault is counted for
+    /// [`end_request_report`].
     fn erase(&mut self) {
         if !self.dirty.load(Relaxed) {
             return;
@@ -995,14 +879,12 @@ impl Drop for Buffer {
 }
 
 impl Ctx {
-    /// The library's origin: `metallib`, or `source` (with the reason when
-    /// the embedded metallib was not used).
+    /// The library's origin: `metallib`, or `source` with the reason.
     pub fn library_source(&self) -> &str {
         &self.library_source
     }
 
-    /// A new buffer as a [`Buffer`]: counted, and in the residency set when
-    /// large. `None` from Metal is [`Error::Memory`].
+    /// A new [`Buffer`]: counted, and in the residency set when large.
     fn wrap(
         &self,
         raw: Option<Retained<ProtocolObject<dyn MTLBuffer>>>,
@@ -1020,8 +902,7 @@ impl Ctx {
         })
     }
 
-    /// The allocation length of a buffer of `bytes` bytes: `Err` above
-    /// `maxBufferLength`.
+    /// The allocation length for `bytes`; `Err` above `maxBufferLength`.
     fn check_len(&self, bytes: usize) -> Result<usize, Error> {
         let max = self.device.maxBufferLength();
         if bytes > max {
@@ -1033,22 +914,13 @@ impl Ctx {
         Ok(bytes.max(16))
     }
 
-    /// A zero-filled shared buffer of `bytes` bytes (a new one, never from
-    /// the pool).
+    /// A new zero-filled shared buffer (never from the pool). Metal documents
+    /// new buffers as zero-filled, so it starts clean and may be pooled
+    /// unwritten.
     ///
-    /// Zero-filled: `newBufferWithLength:options:` returns a buffer whose
-    /// contents are zero (Apple's documentation of the method: "a new buffer
-    /// with zero-filled contents"). The buffer is therefore made clean
-    /// (`dirty` false: dropped unwritten, it is not zeroed again), and
-    /// [`Ctx::alloc_pooled`] may put it into the pool of zeroed buffers
-    /// unwritten. A debug build samples the new buffer and asserts it.
-    ///
-    /// The pool is never the cause of a failed allocation: when this
-    /// allocation would take the process above `recommendedMaxWorkingSetSize`
-    /// (`currentAllocatedSize` plus the new length), idle buffers of the pool
-    /// are released first, the largest first, until it fits; and when Metal
-    /// still returns no buffer, every idle buffer is released and the
-    /// allocation is tried once more.
+    /// The pool never causes a failed allocation: idle buffers are released
+    /// first when this would exceed `recommendedMaxWorkingSetSize`, and all
+    /// of them before one retry when Metal returns no buffer.
     pub fn alloc(&self, bytes: usize) -> Result<Buffer, Error> {
         let len = self.check_len(bytes)?;
         let total = self.device.recommendedMaxWorkingSetSize();
@@ -1072,19 +944,15 @@ impl Ctx {
         self.wrap(raw, bytes, false)
     }
 
-    /// A zero-filled shared buffer of `bytes` bytes from the pool of zeroed
-    /// buffers (one at most a quarter longer), else a new one ([`Ctx::alloc`],
-    /// zero-filled by Metal); it goes back to the pool when dropped, after its
-    /// zeroing, or is released when that zeroing panicked or it failed the
-    /// erasure check (see the pool's text in this module). For large buffers
-    /// made again and again: one that the GPU used before starts without the
-    /// mapping delay of a new one.
+    /// A zero-filled buffer from the pool (at most a quarter longer), else a
+    /// new one. When dropped it is zeroed and goes back to the pool, or is
+    /// released if that failed.
     pub fn alloc_pooled(&self, bytes: usize) -> Result<Buffer, Error> {
         let len = self.check_len(bytes)?;
         let mut took = pool_take(len);
         if took.is_none() && releases_pending() {
-            // a buffer being zeroed in the background may be the one: its
-            // zeroing ends sooner than a new buffer is mapped for the GPU
+            // a buffer being zeroed in the background may fit, and waiting for it
+            // is faster than mapping a new buffer
             settle_releases();
             took = pool_take(len);
         }
@@ -1101,10 +969,8 @@ impl Ctx {
         Ok(b)
     }
 
-    /// A shared buffer holding a copy of `data`: a zero-filled buffer of the
-    /// allocation's length ([`Ctx::alloc`]; at least 16 bytes) into which
-    /// exactly `size_of_val(data)` bytes are copied, so the bytes past the
-    /// data read zero.
+    /// A shared buffer holding a copy of `data`; bytes past the data read
+    /// zero.
     pub fn upload<T: Pod>(&self, data: &[T]) -> Result<Buffer, Error> {
         let bytes = size_of_val(data);
         let b = self.alloc(bytes)?;
@@ -1118,8 +984,7 @@ impl Ctx {
         Ok(b)
     }
 
-    /// The compute pipeline of a kernel, compiled at its first use and
-    /// cached.
+    /// The compute pipeline of a kernel, compiled at first use and cached.
     pub fn pipeline(&self, kernel: &str) -> Result<Pipeline, Error> {
         let mut cache = self.pipelines.lock().unwrap_or_else(|e| e.into_inner());
         if let Some(p) = cache.get(kernel) {
@@ -1137,10 +1002,9 @@ impl Ctx {
     }
 
     /// Encodes the dispatches of `f` into one command buffer, commits it and
-    /// waits for it. Returns `f`'s value and the GPU time in nanoseconds. A
-    /// command buffer that ends in error is [`Error::Device`]; an error from
-    /// `f` is returned after the encoded work has completed, so no buffer is
-    /// still in use when this returns.
+    /// waits. Returns `f`'s value and the GPU time in nanoseconds. An error
+    /// from `f` is returned only after the encoded work completed, so no
+    /// buffer is in use when this returns.
     pub fn run<'a, R>(
         &'a self,
         f: impl FnOnce(&mut Command<'a>) -> Result<R, Error>,
@@ -1186,8 +1050,7 @@ pub enum Arg<'a> {
     Buffer(&'a Buffer),
     /// A buffer from a byte offset.
     BufferAt(&'a Buffer, usize),
-    /// Bytes copied into the command (`setBytes`, at most 4 KiB): a
-    /// `constant` value or small struct.
+    /// Bytes copied into the command (`setBytes`, at most 4 KiB).
     Bytes(&'a [u8]),
 }
 
@@ -1199,7 +1062,7 @@ impl<'a> Arg<'a> {
     }
 }
 
-/// The command buffer being encoded inside [`Ctx::run`]: one serial compute
+/// The command buffer being encoded in [`Ctx::run`]: one serial compute
 /// encoder, so each dispatch sees the writes of the earlier ones.
 pub struct Command<'a> {
     ctx: &'a Ctx,
@@ -1214,8 +1077,7 @@ impl std::fmt::Debug for Command<'_> {
 }
 
 impl<'a> Command<'a> {
-    /// Sets the pipeline of `kernel`, its arguments and its threadgroup
-    /// memory; returns the pipeline.
+    /// Sets the pipeline, arguments and threadgroup memory of `kernel`.
     fn bind(&self, kernel: &str, args: &[Arg<'a>], tg_mem: &[usize]) -> Result<Pipeline, Error> {
         let p = self.ctx.pipeline(kernel)?;
         self.enc.setComputePipelineState(&p);
@@ -1264,10 +1126,8 @@ impl<'a> Command<'a> {
         Ok(p)
     }
 
-    /// `threads` threads in one dimension, in threadgroups of the pipeline's
-    /// largest size up to 256 (the last group may be partial: Apple GPUs take
-    /// non-uniform threadgroups). The kernel still checks its index against
-    /// its length.
+    /// `threads` threads in threadgroups of up to 256; the last group may be
+    /// partial, so kernels check their index.
     pub fn dispatch(
         &mut self,
         kernel: &str,
@@ -1322,8 +1182,7 @@ impl<'a> Command<'a> {
     }
 }
 
-/// A threadgroup of `group` threads must be non-empty and within the
-/// pipeline's `maxTotalThreadsPerThreadgroup`.
+/// Checks a threadgroup size against the pipeline's limit.
 fn check_group(kernel: &str, p: &Pipeline, group: usize) -> Result<(), Error> {
     let max = p.maxTotalThreadsPerThreadgroup();
     if group == 0 || group > max {
@@ -1354,9 +1213,8 @@ struct State {
 
 /// The device lock and the per-request buffers it guards.
 static STATE: Mutex<Option<State>> = Mutex::new(None);
-/// A per-request buffer of [`Session::scratch`] may exist (set when one is
-/// made, cleared under [`STATE`] when they are all zeroed): lets a call
-/// with nothing to wipe skip taking the device ([`wipe_unbracketed`]).
+/// Whether a per-request buffer may exist, so a call with nothing to wipe
+/// can skip taking the device ([`wipe_unbracketed`]).
 static SCRATCH_ANY: AtomicBool = AtomicBool::new(false);
 
 /// Exclusive use of the device: the context and the per-request buffers.
@@ -1371,8 +1229,7 @@ impl std::fmt::Debug for Session {
     }
 }
 
-/// Takes the device (waiting for the current holder) after making the
-/// context if needed.
+/// Takes the device, making the context if needed.
 pub fn lock() -> Result<Session, Error> {
     let ctx = context()?;
     let mut state = STATE.lock().unwrap_or_else(|e| e.into_inner());
@@ -1386,10 +1243,9 @@ impl Session {
         self.ctx
     }
 
-    /// The per-request buffer `key`, of at least `bytes` bytes: the existing
-    /// one with its contents if it is long enough, else a zero-filled one
-    /// from the pool of zeroed buffers or a new one (the shorter one is
-    /// zeroed and goes back to the pool, see [`Ctx::alloc_pooled`]).
+    /// The per-request buffer `key` of at least `bytes`: the existing one
+    /// with its contents if long enough, else a zero-filled one (the shorter
+    /// one goes back to the pool).
     pub fn scratch(&mut self, key: &'static str, bytes: usize) -> Result<&mut Buffer, Error> {
         let ctx = self.ctx;
         let st = self.state.get_or_insert_with(State::default);
@@ -1428,8 +1284,7 @@ impl Session {
     }
 }
 
-/// Per-request buffers checked out by a call for its own use
-/// ([`take_request_buffer`]), by key: the ones given back and idle.
+/// Per-request buffers given back by [`take_request_buffer`] callers, by key.
 struct Lendable {
     /// The request of the buffers ([`end_request_report`] increments it).
     epoch: u64,
@@ -1442,20 +1297,16 @@ static LENDABLE: Mutex<Lendable> = Mutex::new(Lendable {
     free: Vec::new(),
 });
 
-/// The idle lendable buffers, locked (a poisoned lock is taken over).
+/// The idle lendable buffers, locked.
 fn lendable() -> MutexGuard<'static, Lendable> {
     LENDABLE.lock().unwrap_or_else(|e| e.into_inner())
 }
 
-/// A per-request buffer under `key` taken without the device: the call that
-/// takes it uses it alone, for example to fill it on the CPU while another
-/// call holds the device, and gives it back with [`RequestBuffer::give_back`]
-/// (dropped instead, it is zeroed and goes back to the pool). It is the idle
-/// one of at least `bytes` bytes that an earlier call of the request gave
-/// back, with its contents, else a zero-filled one from the pool or a new
-/// one. [`end_request_report`] zeroes, checks and counts the idle ones as it
-/// does [`Session::scratch`]; one given back after its request ended is
-/// zeroed then.
+/// A per-request buffer under `key` taken without the device, so a call can
+/// fill it on the CPU while another call holds the device. It is the idle
+/// buffer an earlier call of the request gave back, with its contents, else a
+/// zero-filled one. [`end_request_report`] zeroes the idle ones; one given
+/// back after its request ended is zeroed then.
 pub fn take_request_buffer(key: &'static str, bytes: usize) -> Result<RequestBuffer, Error> {
     let (epoch, found) = {
         let mut l = lendable();
@@ -1478,7 +1329,7 @@ pub fn take_request_buffer(key: &'static str, bytes: usize) -> Result<RequestBuf
 }
 
 /// A per-request buffer checked out by [`take_request_buffer`]. Dropped
-/// instead of given back, its buffer is zeroed and goes back to the pool.
+/// instead of given back, it is zeroed and pooled.
 #[derive(Debug)]
 pub struct RequestBuffer {
     key: &'static str,
@@ -1497,9 +1348,8 @@ impl RequestBuffer {
         &mut self.buf
     }
 
-    /// Gives the buffer back to its request (its contents stay until
-    /// [`end_request_report`] zeroes it); after the end of its request it is
-    /// zeroed and goes back to the pool.
+    /// Gives the buffer back to its request; after the request ended it is
+    /// zeroed and pooled instead.
     pub fn give_back(self) {
         let RequestBuffer { key, epoch, buf } = self;
         let mut l = lendable();
@@ -1512,9 +1362,8 @@ impl RequestBuffer {
     }
 }
 
-/// Test switches (feature `test-support`, or this crate's unit tests). In
-/// other builds every switch is a no-op that the compiler removes, so no
-/// code outside the crate can force an erasure failure.
+/// Test switches. In other builds they are no-ops, so no code outside the
+/// crate can force an erasure failure.
 #[cfg(any(test, feature = "test-support"))]
 mod test_switch {
     use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering::Relaxed};
@@ -1526,13 +1375,11 @@ mod test_switch {
     pub(super) static PLANT_NONZERO: AtomicBool = AtomicBool::new(false);
     /// The contents address of the region of the last planted byte.
     pub(super) static LAST_PLANT: AtomicUsize = AtomicUsize::new(0);
-    /// The contents address of the buffer whose next zeroing panics (0:
-    /// none).
+    /// The contents address of the buffer whose next zeroing panics (0: none).
     pub(super) static ZEROING_PANIC: AtomicUsize = AtomicUsize::new(0);
 
-    /// After the zeroing of region `i` of a wipe: plants a non-zero byte into
-    /// the first region of a checked wipe when [`super::set_plant_nonzero`]
-    /// is on.
+    /// After the zeroing of region `i`: plants a non-zero byte into the first
+    /// region of a checked wipe when [`super::set_plant_nonzero`] is on.
     pub(super) fn plant_after_zeroing(check: bool, i: usize, raw: &ProtocolObject<dyn MTLBuffer>) {
         if check && i == 0 && PLANT_NONZERO.load(Relaxed) {
             plant_raw(raw);
@@ -1547,9 +1394,8 @@ mod test_switch {
         }
     }
 
-    /// Writes one non-zero byte into the middle of `raw`'s allocation through
-    /// the raw host pointer (the buffer's `dirty` flag is not set, as for a
-    /// write the crate did not see) and records its address. The caller has
+    /// Writes one non-zero byte into the middle of `raw` behind the crate's
+    /// back (`dirty` not set) and records its address. The caller has
     /// exclusive use of the buffer.
     pub(super) fn plant_raw(raw: &ProtocolObject<dyn MTLBuffer>) {
         let p = raw.contents().as_ptr().cast::<u8>();
@@ -1573,39 +1419,31 @@ mod test_switch {
     pub(super) fn zeroing_panic(_: usize) {}
 }
 
-/// Makes every later [`end_request_report`]`(true)` write a non-zero byte
-/// into its first per-request region after the zeroing, through the raw
-/// host pointer (as a write the crate did not track would), so that the
-/// read-back fails (`true`), or stops it (`false`). A test switch: only with
-/// the feature `test-support` (or in this crate's unit tests).
+/// Makes every later [`end_request_report`]`(true)` plant a non-zero byte in
+/// its first region after zeroing, so the read-back fails. Test support.
 #[cfg(any(test, feature = "test-support"))]
 #[doc(hidden)]
 pub fn set_plant_nonzero(on: bool) {
     test_switch::PLANT_NONZERO.store(on, Relaxed);
 }
 
-/// The contents address of the region the last planted byte went into
-/// ([`set_plant_nonzero`], [`plant_in_idle_pool`]). Test support.
+/// The contents address of the last planted byte. Test support.
 #[cfg(any(test, feature = "test-support"))]
 #[doc(hidden)]
 pub fn last_planted() -> usize {
     test_switch::LAST_PLANT.load(Relaxed)
 }
 
-/// Makes the next zeroing of the dropped buffer whose contents are at
-/// `addr` panic once (inside `Buffer::erase`, which completes the zeroing
-/// on the calling thread, does not pool the buffer and counts the fault);
-/// 0 stops it. Test support.
+/// Makes the next zeroing of the dropped buffer at `addr` panic once; 0
+/// stops it. Test support.
 #[cfg(any(test, feature = "test-support"))]
 #[doc(hidden)]
 pub fn set_zeroing_panic(addr: usize) {
     test_switch::ZEROING_PANIC.store(addr, Relaxed);
 }
 
-/// Writes a non-zero byte into an idle buffer of the pool through the raw
-/// host pointer (breaking the pool's invariant as a stray write would);
-/// returns its contents address, `None` when the pool is empty. Test
-/// support.
+/// Writes a non-zero byte into an idle pool buffer, breaking the pool's
+/// invariant; returns its contents address. Test support.
 #[cfg(any(test, feature = "test-support"))]
 #[doc(hidden)]
 pub fn plant_in_idle_pool() -> Option<usize> {
@@ -1622,18 +1460,15 @@ pub fn idle_pool_addresses() -> Vec<usize> {
     pool().free.iter().map(|b| b.contents().as_ptr() as usize).collect()
 }
 
-/// Whether every idle buffer of the pool reads zero over its whole
-/// allocation. Test support.
+/// Whether every idle pool buffer reads zero. Test support.
 #[cfg(any(test, feature = "test-support"))]
 #[doc(hidden)]
 pub fn idle_pool_reads_zero() -> bool {
     pool().free.iter().all(|b| raw_reads_zero(b))
 }
 
-/// The per-request buffers that exist now, [`Session::scratch`] ones then
-/// idle [`take_request_buffer`] ones: `(key, allocation bytes, reads zero,
-/// contents address)`. Takes the device (waits for device work). Test
-/// support.
+/// The per-request buffers now: `(key, allocation bytes, reads zero,
+/// contents address)`. Takes the device. Test support.
 #[cfg(any(test, feature = "test-support"))]
 #[doc(hidden)]
 pub fn request_buffers() -> Vec<(&'static str, usize, bool, usize)> {
@@ -1660,8 +1495,7 @@ enum ReadBack {
     Unreadable,
 }
 
-/// Reads back the whole allocation of a region (check mode) and counts the
-/// result in `w`.
+/// Reads back a region's whole allocation and counts the result in `w`.
 fn read_back(raw: &ProtocolObject<dyn MTLBuffer>, w: &mut crate::WipeStats) -> ReadBack {
     w.checked_regions += 1;
     if raw.storageMode() != MTLStorageMode::Shared {
@@ -1675,11 +1509,9 @@ fn read_back(raw: &ProtocolObject<dyn MTLBuffer>, w: &mut crate::WipeStats) -> R
     }
 }
 
-/// Check mode of the erasure report: reads back every idle buffer of the
-/// pool (its whole allocation) and counts it as a region. A buffer that
-/// reads back non-zero is zeroed again and read back again; it, and a
-/// buffer not in shared storage (which cannot be read back), is taken out
-/// of the pool and released.
+/// Check mode: reads back every idle pool buffer. One that reads non-zero is
+/// zeroed and read back again; it, and one that cannot be read back, is
+/// taken out of the pool and released.
 fn check_idle_pool(w: &mut crate::WipeStats) {
     let bad: Vec<_> = {
         let mut p = pool();
@@ -1712,18 +1544,15 @@ fn check_idle_pool(w: &mut crate::WipeStats) {
         }
         bad
     };
-    // not through `release_raw`: a buffer not in shared storage cannot be
-    // read back, so its debug read-back would fail too
+    // not `release_raw`: its debug read-back would fail on a buffer that is
+    // not host-readable
     release_unchecked(bad);
 }
 
-/// Zeroes every per-request buffer (the device is held: `state` is its
-/// lock), after the zeroing still running in the background; with `check`
-/// first reads back every idle buffer of the pool, then each per-request
-/// buffer after its zeroing. A region that reads back non-zero (or cannot
-/// be read back) is zeroed again, read back again and released: never put
-/// back into the pool, never kept as scratch. Every other region goes back
-/// into the pool, zeroed.
+/// Zeroes every per-request buffer (`state` is the device lock) after
+/// background zeroing; with `check`, reads back the idle pool and each region.
+/// A region that reads back non-zero or unreadable is zeroed again and
+/// released, never pooled or kept; the others go back to the pool.
 fn wipe_locked(state: &mut Option<State>, check: bool, w: &mut crate::WipeStats) {
     settle_releases();
     if check {
@@ -1756,26 +1585,14 @@ fn wipe_locked(state: &mut Option<State>, check: bool, w: &mut crate::WipeStats)
     }
 }
 
-/// Zeroes every per-request buffer after any device work in progress (it
-/// takes the device) and after the zeroing still running in the background
-/// ([`release_later`]), and closes the request ([`request_open`]).
+/// Zeroes every per-request buffer after any device work and background
+/// zeroing, and closes the request.
 ///
-/// With `check` it first reads back every idle buffer of the pool of zeroed
-/// buffers (the scoped buffers that held witness values go back there after
-/// their zeroing), then reads back each per-request buffer after its
-/// zeroing, from the host mapping, and compares it with zero. A region is a
-/// buffer's whole allocation: its bytes are the bytes zeroed and read back.
-/// On unified memory a shared buffer is the memory the GPU used, so the
-/// read-back sees what the device would read.
-///
-/// Every region that reads back zero goes back into the pool (or is
-/// released, see [`Ctx::alloc_pooled`]). A region that reads back non-zero,
-/// or cannot be read back from the host, is zeroed again, read back again
-/// and released: it never goes back into the pool and is never kept as
-/// scratch. `Err` then, with the region counted (`nonzero_regions` or
-/// `check_failures`); `Err` also when a zeroing panicked since the last
-/// report (`erasure_failures`: the zeroing was completed on the calling
-/// thread and the buffer released, not pooled). There is no quarantine.
+/// With `check`, reads back every idle pool buffer and each per-request
+/// buffer after zeroing (on unified memory this is the memory the GPU used).
+/// A region that reads back non-zero or cannot be read is zeroed again and
+/// released; the report is then `Err`, as it is when a zeroing panicked since
+/// the last report.
 pub fn end_request_report(check: bool) -> Result<crate::WipeStats, crate::WipeStats> {
     let mut w = crate::WipeStats {
         checked: check,
@@ -1798,15 +1615,11 @@ pub fn end_request() -> bool {
     end_request_report(false).is_ok()
 }
 
-/// The wipe of a hook call made outside a request (`crate::HookScope`):
-/// waits for the zeroing running in the background, then zeroes every
-/// per-request buffer, as [`end_request`] does without closing a request,
-/// without the read-back and without taking the erasure-fault count. It
-/// takes the device, so it never zeroes a buffer that another call is
-/// using: a call holds the device ([`Session`]) while it uses
-/// [`Session::scratch`] buffers, and a [`take_request_buffer`] buffer is
-/// not in the idle list until given back. When there is nothing to wipe it
-/// returns without taking the device.
+/// The wipe of a hook call made outside a request (`crate::HookScope`): as
+/// [`end_request`] without closing a request or reading back. It takes the
+/// device, so it never zeroes a buffer another call is using; a
+/// [`take_request_buffer`] buffer is not idle until given back. With nothing
+/// to wipe it does not take the device.
 pub(crate) fn wipe_unbracketed() {
     let idle_lent = !lendable().free.is_empty();
     if !(SCRATCH_ANY.load(SeqCst) || idle_lent || releases_pending()) {
@@ -1817,14 +1630,9 @@ pub(crate) fn wipe_unbracketed() {
     wipe_locked(&mut state, false, &mut w);
 }
 
-/// `(free, total)`: `total` is `recommendedMaxWorkingSetSize`, `free` is
-/// that minus `currentAllocatedSize`, plus the idle buffers of the pool
-/// ([`pool_bytes`]). The idle buffers count as free because they are free
-/// for any allocation, not only for one they fit: a pooled buffer is reused
-/// for a length within `[len, 1.25 len]`, and a new allocation that would
-/// otherwise take the process above `total` (or that Metal refuses) first
-/// releases idle buffers ([`Ctx::alloc`]), so the pool never causes an
-/// allocation to fail. See [`crate::mem_info`].
+/// `(free, total)`: `total` is `recommendedMaxWorkingSetSize`, `free` is that
+/// minus `currentAllocatedSize` plus the idle pool buffers, which count as
+/// free because an allocation that would not fit releases them first.
 pub fn mem_info() -> Option<(usize, usize)> {
     let ctx = context().ok()?;
     let total = ctx.device.recommendedMaxWorkingSetSize() as usize;

@@ -13,19 +13,17 @@
 
 //! Build of the Metal shaders.
 //!
-//! On a macOS target every `shaders/*.metal` file (headers in
-//! `shaders/include`) is compiled with `xcrun metal` to AIR and linked with
-//! `xcrun metallib` into one `.metallib`, which the crate embeds and loads at
-//! first use; the cfg `midnight_metal_metallib` is set. Without the Metal
-//! toolchain, or after a failed compile, the crate embeds the shader source
-//! instead (all files as one translation unit, the `#include "..."` headers
-//! expanded once each) and compiles it at first use with
-//! `newLibraryWithSource`. The expanded source is always embedded, so a
-//! metallib the running system refuses also falls back to it. A cargo warning
-//! says which path was taken. Other targets build the stub (no shaders).
+//! On macOS every `shaders/*.metal` file is compiled with `xcrun metal` and
+//! linked into one embedded `.metallib` (cfg `midnight_metal_metallib`). The
+//! shader source, all files as one translation unit with each `#include`
+//! expanded once, is always embedded too, and is compiled at first use when
+//! the toolchain is missing, the compile failed, or the system refuses the
+//! metallib. Since a kernel file is its own translation unit on one path and
+//! shares one on the other, each file includes the headers it needs, prefixes
+//! its kernels with its file stem (`ntt_*`, `msm_*`, `quotient_*`) and keeps
+//! its helpers in a namespace of that name.
 //!
-//! The test and diagnostic kernels ([`TEST_SHADERS`]) are part of the library
-//! only with the feature `test-support`.
+//! [`TEST_SHADERS`] are compiled only with the feature `test-support`.
 //!
 //! Environment:
 //! - `MIDNIGHT_METAL_SHADER_SOURCE=1`: skip the toolchain and embed the source.
@@ -161,10 +159,9 @@ fn metallib(files: &[PathBuf], include: &Path, out: &Path) -> Result<(), String>
     Ok(())
 }
 
-/// Appends `file` to `out` with each `#include "name"` replaced by the named
-/// header (looked up next to the file, then in `include`) the first time it
-/// is met, and dropped after that. `#line` directives keep the compiler's
-/// messages pointing at the original files.
+/// Appends `file` to `out`, replacing each `#include "name"` with the header
+/// the first time it is met and dropping it after that. `#line` directives
+/// keep compiler messages pointing at the original files.
 fn expand(file: &Path, include: &Path, seen: &mut HashSet<PathBuf>, out: &mut String) {
     let file = file.canonicalize().unwrap_or_else(|_| file.to_path_buf());
     if !seen.insert(file.clone()) {

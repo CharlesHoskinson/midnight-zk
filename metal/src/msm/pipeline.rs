@@ -11,9 +11,9 @@
 // See the License for the specific language governing permissions and
 // limitations under the License.
 
-//! One device MSM pass (sppark `invoke`): the kernels of each chunk in one
-//! command buffer, and the host collection of each chunk on its own thread
-//! while the device runs the next.
+//! One device MSM pass (sppark `invoke`): each chunk's kernels in one command
+//! buffer, and each chunk's host collection on its own thread while the
+//! device runs the next.
 
 use std::{mem::size_of, sync::Mutex};
 
@@ -44,14 +44,13 @@ const ONES_BLOCK: usize = 256;
 const ACC_GROUP: usize = 256;
 /// Threads per window of `msm_integrate` (sppark `MSM_NTHREADS`).
 const MSM_NTHREADS: usize = 256;
-/// The largest low-digit width the lower sort holds in threadgroup memory
-/// (`MAX_LOW` in msm.metal).
+/// The largest low-digit width of the lower sort (`MAX_LOW` in msm.metal).
 const MAX_LOW_BITS: u32 = 12;
 /// The largest top-digit width of the upper sort (`MAX_TOP` in msm.metal).
 const MAX_TOP_BITS: u32 = 9;
 
-/// The SIMD-group width the kernels assume (the reduction of `msm_ones`, the
-/// prefix sums of the sort).
+/// The SIMD-group width the `msm_ones` reduction and the sort's prefix sums
+/// assume.
 const SIMD_WIDTH: usize = 32;
 /// The kernels whose pipelines must have [`SIMD_WIDTH`].
 const KERNELS: [&str; 9] = [
@@ -66,36 +65,21 @@ const KERNELS: [&str; 9] = [
     "msm_integrate",
 ];
 
-/// The most points one bucket of a chunk may hold (the bucket of digit 1 in
-/// window 0, summed by the whole grid in `msm_ones`, excepted). A bucket is
-/// summed serially by one GPU thread, so its length bounds the time of the
-/// chunk's command buffer; `CHUNK_ADDS` assumes balanced buckets.
+/// The most points one bucket of a chunk may hold (the digit-1 bucket of
+/// window 0 excepted). One GPU thread sums a bucket serially, so its length
+/// bounds the command buffer's time; `CHUNK_ADDS` assumes balanced buckets.
 ///
-/// With the skew mask the masked scalars `s_i + r_i` of any input that does
-/// not depend on the public mask spread evenly over the buckets of each
-/// window; the largest legitimate loads are in the top window, whose digits
-/// have few values: with `wbits` 11 (lengths below `2^15.5`) a bucket holds
-/// fewer points than the chunk (`< 2^15.5 < 2^16`); with `wbits` 13 (below
-/// `2^19.5`) the top window has about 116 digit values, about `n / 116 <
-/// 6400` points each; wider windows have far fewer per bucket. Scalars
-/// chosen as `s_i = c - r_i` send every point of a window to one bucket (a
-/// chunk of `2^20` points then takes seconds of GPU time, near the GPU
-/// watchdog). Above this limit `msm_bucket_guard` flags the chunk,
-/// `msm_accumulate` skips it, and the call declines (`device-error`, the
-/// reason a watchdog timeout gives).
-///
-/// What the decline reveals: that in some chunk and some window, more than
-/// `HOT_BUCKET_LIMIT` of the masked scalars `s_i + r_i` (`r` public and
-/// fixed) have the same window digit: one bit about the scalars, which
-/// honest (mask-independent) scalars set with negligible probability. It is
-/// not counted, logged or reported anywhere but as one generic
-/// `device-error` decline.
+/// With the mask, honest scalars spread evenly over the buckets and stay far
+/// below this limit. Scalars chosen as `s_i = c - r_i` send a whole window to
+/// one bucket, which can run into the GPU watchdog. Above the limit the chunk
+/// skips accumulation and the call declines `device-error`. That decline
+/// reveals one bit about the masked scalars, which honest scalars set with
+/// negligible probability; it is reported only as a generic `device-error`.
 pub(super) const HOT_BUCKET_LIMIT: u32 = 1 << 16;
 
 /// Scalar mode of `msm_digits`: the masked scalars `s + r`.
 pub(super) const MODE_MASKED: u32 = 1;
-/// Scalar mode of `msm_digits`: the mask `r` alone (the scalars are not
-/// read).
+/// Scalar mode of `msm_digits`: the mask `r` alone (scalars not read).
 pub(super) const MODE_MASK: u32 = 2;
 
 /// Thread counts that depend on the pipelines.
@@ -108,9 +92,8 @@ pub(super) struct Geometry {
 }
 
 impl Geometry {
-    /// The thread counts of `pl` on this device, after the checks the
-    /// kernels rely on (threadgroup sizes, sort widths, the SIMD-group
-    /// width).
+    /// The thread counts of `pl` on this device, after checking what the
+    /// kernels rely on (threadgroup sizes, sort widths, SIMD-group width).
     pub(super) fn of(c: &Ctx, pl: &Plan) -> Result<Geometry, Error> {
         let max = |k: &str| -> Result<usize, Error> {
             Ok(c.pipeline(k)?.maxTotalThreadsPerThreadgroup())
@@ -143,17 +126,14 @@ impl Geometry {
         })
     }
 
-    /// The records `msm_ones` writes: one per 32 threads of its grid (each
-    /// written at every run, whatever the SIMD-group width, see msm.metal).
+    /// The records `msm_ones` writes: one per 32 threads of its grid.
     pub(super) fn ones_slots(&self) -> usize {
         ONES_GROUPS * self.ones_block / SIMD_WIDTH
     }
 }
 
-/// Whether every MSM pipeline runs SIMD-groups of [`SIMD_WIDTH`] threads
-/// (`threadExecutionWidth`), checked once per process: the reduction of
-/// `msm_ones` and the prefix sums of the sort assume it. Another width is a
-/// `device-error` decline.
+/// Whether every MSM pipeline has SIMD-groups of [`SIMD_WIDTH`], checked once
+/// per process. Another width is a `device-error` decline.
 fn simd_width_ok(c: &Ctx) -> Result<(), Error> {
     static OK: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
     let ok = match OK.get() {
@@ -188,18 +168,17 @@ pub(super) struct Bufs<'a> {
     pub(super) counts: &'a Buffer,
     /// `nwins` rows of bucket end offsets.
     pub(super) hist: &'a Buffer,
-    /// `nwins` rows of bucket sums, then of the partial sums of
-    /// `msm_integrate`.
+    /// `nwins` rows of bucket sums, then of `msm_integrate` partial sums.
     pub(super) buckets: &'a Buffer,
     /// The partial sums of `msm_ones`.
     pub(super) ones: &'a Buffer,
-    /// One `uint`: set by `msm_bucket_guard` when a bucket of the chunk holds
-    /// more than [`HOT_BUCKET_LIMIT`] points (reset by `msm_digits`).
+    /// Set by `msm_bucket_guard` when a bucket exceeds [`HOT_BUCKET_LIMIT`]
+    /// (reset by `msm_digits`).
     pub(super) hot: &'a Buffer,
 }
 
-/// The byte sizes of the scratch buffers of `pl` (in the order of the
-/// fields of [`Bufs`] from `digits` to `hot`).
+/// Byte sizes of the scratch buffers of `pl`, in [`Bufs`] field order from
+/// `digits` to `hot`.
 pub(super) fn scratch_bytes(pl: &Plan, g: &Geometry) -> [usize; 7] {
     let ntop = 1usize << pl.top_bits;
     let rows = (pl.nwins as usize) << pl.bits;
@@ -214,8 +193,7 @@ pub(super) fn scratch_bytes(pl: &Plan, g: &Geometry) -> [usize; 7] {
     ]
 }
 
-/// The kernel parameters of one chunk (the `constant` structs of
-/// msm.metal).
+/// The kernel parameters of one chunk (the `constant` structs of msm.metal).
 struct ChunkParams {
     /// `DigitsParams`.
     digits: [u32; 6],
@@ -266,8 +244,8 @@ fn enc_digits<'a>(
     h_off: usize,
     num: usize,
 ) -> Result<(), Error> {
-    // the mask mode does not read the scalars: the scalars buffer is bound
-    // (from its start) only so that the input is not the output buffer
+    // the mask mode does not read the scalars; binding them keeps the input
+    // distinct from the output buffer
     let sc = if p.digits[5] == MODE_MASK {
         Arg::Buffer(b.scalars)
     } else {
@@ -400,18 +378,16 @@ fn enc_integrate<'a>(
     )
 }
 
-/// A chunk's partial sums on the host: each window's `2 * nthr` records of
-/// `msm_integrate`, and the records of `msm_ones`.
+/// A chunk's partial sums on the host: `2 * nthr` records per window from
+/// `msm_integrate`, and the `msm_ones` records.
 type Partials = (SecretVec<Xyzz>, SecretVec<Xyzz>);
 
-/// One device MSM pass (sppark `invoke`) over the first `pl.n` points of
-/// `b.points` with the scalars of `mode`. Returns the sum and the GPU time.
+/// One device MSM pass (sppark `invoke`) over the first `pl.n` points with the
+/// scalars of `mode`. Returns the sum and the GPU time.
 ///
-/// Each chunk's partial sums are copied into guards and combined on a host
-/// thread while the device runs the next chunk (on this thread when no
-/// thread can be started). A failure of any chunk or of any collection is
-/// an error, after every started collection has been joined; every copy and
-/// partial sum is zeroed on every exit.
+/// Each chunk's partial sums are combined on a host thread while the device
+/// runs the next chunk. Any chunk or collection failure is an error, returned
+/// after every started collection has been joined.
 pub(super) fn run(
     c: &Ctx,
     b: &Bufs<'_>,
@@ -419,8 +395,8 @@ pub(super) fn run(
     g: &Geometry,
     mode: u32,
 ) -> Result<(Secret<blst_p1>, u64), Error> {
-    // the inputs of each chunk's collection, taken by its thread, or by this
-    // thread when that thread could not be started
+    // each chunk's collection inputs, taken by its thread (or by this thread
+    // when that thread could not be started)
     type Inputs = Mutex<Option<Partials>>;
     let inputs: Vec<Inputs> = (0..pl.batch).map(|_| Mutex::new(None)).collect();
     let nthr = g.nthr;
@@ -474,9 +450,8 @@ pub(super) fn run(
     })
 }
 
-/// The chunk of `num` points from `h_off` in one command buffer, then its
-/// partial sums copied out of the device buffers (before the next chunk
-/// reuses them). Returns the GPU time and the partial sums.
+/// Runs the chunk of `num` points from `h_off` in one command buffer and
+/// copies out its partial sums before the next chunk reuses the buffers.
 fn run_chunk(
     c: &Ctx,
     b: &Bufs<'_>,
@@ -493,9 +468,8 @@ fn run_chunk(
         enc_accumulate(cmd, b, &p, pl, g, h_off)?;
         enc_integrate(cmd, b, &p, pl, g)
     })?;
-    // a bucket above the bound: the accumulation was skipped and the chunk
-    // declines (see `HOT_BUCKET_LIMIT`; a generic message, the same as for
-    // any failed command buffer)
+    // a bucket above the bound skipped accumulation: decline with the generic
+    // message of any failed command buffer
     if b.hot.as_slice::<u32>().first().is_none_or(|&h| h != 0) {
         return Err(Error::Device("msm: a command buffer failed".into()));
     }

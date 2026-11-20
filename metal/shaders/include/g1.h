@@ -13,26 +13,17 @@
 
 // BLS12-381 G1 points for the MSM: affine and XYZZ coordinates.
 //
-// The formulas are transcribed from sppark `ec/xyzz_t.hpp` (Copyright
-// Supranational LLC, Apache-2.0; https://github.com/supranational/sppark,
-// commit 08033103c14ff3c742e710b9463dde42acc0f058, vendored in
-// gpu/third_party/sppark): the addition `add-2008-s` and the mixed addition
-// `madd-2008-s` (with sppark's twists for a subtraction and for either input
-// at infinity), with the doublings `dbl-2008-s-1` and `mdbl-2008-s-1` for
-// equal inputs, of the Explicit-Formulas Database, short Weierstrass with
-// a = 0.
+// The formulas are ported from sppark `ec/xyzz_t.hpp` (Copyright Supranational
+// LLC, Apache-2.0, https://github.com/supranational/sppark, commit
+// 08033103c14ff3c742e710b9463dde42acc0f058): `add-2008-s` and `madd-2008-s`,
+// with `dbl-2008-s-1` and `mdbl-2008-s-1` for equal inputs (EFD, short
+// Weierstrass, a = 0).
 //
-// - `g1::Affine`: `x`, `y` in `Fp`, the bytes of a host `blst_p1_affine`
-//   (`G1AffineLimbs`); the point at infinity is all zero.
-// - `g1::Xyzz`: `X`, `Y`, `ZZZ`, `ZZ` in `Fp` (sppark's member order), the
-//   point `(X / ZZ, Y / ZZZ)` with `ZZ^3 = ZZZ^2`; infinity has `ZZZ = ZZ =
-//   0`, stored all zero (as the vendored sppark patch stores it). A negation
-//   negates `ZZZ` (sppark's `cneg`). As Jacobian coordinates the point is
-//   `(X * ZZ, Y * ZZZ, ZZ)`.
-//
-// sppark also has `uadd`, the same additions written as one multiplication
-// loop to bound the CUDA register count; the Metal code uses the plain
-// formulas only (the results are identical).
+// - `g1::Affine`: `x`, `y` in `Fp`, the bytes of a host `blst_p1_affine`;
+//   infinity is all zero.
+// - `g1::Xyzz`: `X`, `Y`, `ZZZ`, `ZZ` (sppark's order), the point
+//   `(X / ZZ, Y / ZZZ)`; infinity is stored all zero. As Jacobian coordinates
+//   the point is `(X * ZZ, Y * ZZZ, ZZ)`. A negation negates `ZZZ`.
 
 #ifndef MIDNIGHT_METAL_G1_H
 #define MIDNIGHT_METAL_G1_H
@@ -42,9 +33,8 @@
 namespace g1 {
 
 // The field multiplication of the curve formulas, out of line: one copy of
-// its unrolled body (about 2k instructions) serves every multiplication of
-// a formula, where ten inlined copies overflow the GPU's instruction cache
-// (measured on Apple M4 Max: the mixed addition runs about 13% faster).
+// its unrolled body serves every multiplication of a formula, where inlined
+// copies overflow the GPU's instruction cache.
 static __attribute__((noinline)) Fp mul(Fp a, Fp b) { return fp_mul(a, b); }
 
 struct Affine {

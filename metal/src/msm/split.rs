@@ -11,9 +11,8 @@
 // See the License for the specific language governing permissions and
 // limitations under the License.
 
-//! The MSM of one call: the split between the device and the CPU share
-//! ("The CPU share" in the module text), and the device share as
-//! `MSM(s + r) - MSM(r)` ("Skew mask").
+//! The MSM of one call: the device share as `MSM(s + r) - MSM(r)` and the CPU
+//! share on its own thread, added on the host.
 
 use std::mem::{size_of, size_of_val};
 
@@ -51,10 +50,9 @@ const K_BUCKETS: &str = "msm-buckets";
 const K_ONES: &str = "msm-ones";
 const K_HOT: &str = "msm-hot";
 
-/// The MSM split between the device (`[0, m)`, masked) and the CPU (`[m,
-/// n)`, on another thread at the same time, or after the device share on this
-/// thread when no thread can be started), the two sums added on the host.
-/// `masks`: the table's cache of `MSM(r)`.
+/// Splits the MSM: the device takes `[0, m)` masked, the CPU `[m, n)` on
+/// another thread (or on this one after the device share when no thread can
+/// be started). `masks`: the table's cache of `MSM(r)`.
 pub(super) fn split(
     s: &mut Session,
     points: Points<'_>,
@@ -115,11 +113,8 @@ pub(super) fn cpu_pool() -> Option<&'static rayon::ThreadPool> {
     .as_ref()
 }
 
-/// The CPU share: the stock `msm_pippenger` of midnight-curves, on the
-/// share's own pool, over the caller's slices (no copy is made here).
-/// `None` without the pool (not reached: without it the device takes every
-/// point). Afterwards each thread of the pool zeroes `SCRUB_BYTES` of its
-/// stack (the stock MSM's temporaries).
+/// The CPU share: the stock `msm_pippenger` on the share's own pool, over the
+/// caller's slices. Afterwards each pool thread scrubs its stack.
 fn cpu_msm(scalars: &[Scalar], bases: &[G1AffineLimbs]) -> Option<Secret<blst_p1>> {
     use midnight_curves::{Fq, G1Affine, G1Projective, msm::msm_pippenger};
     // SAFETY: `Fq` is a transparent `blst_fr` (`[u64; 4]`) and `G1Affine` a
@@ -143,9 +138,8 @@ fn cpu_msm(scalars: &[Scalar], bases: &[G1AffineLimbs]) -> Option<Secret<blst_p1
     Some(r)
 }
 
-/// `MSM(s + r) - MSM(r)` on the device, with `MSM(r)` from `masks` when it
-/// holds this length (and stored there otherwise). Returns the result and
-/// the GPU time.
+/// `MSM(s + r) - MSM(r)` on the device, with `MSM(r)` from `masks` when cached
+/// (stored there otherwise). Returns the result and the GPU time.
 fn masked(
     s: &mut Session,
     points: Points<'_>,
@@ -187,8 +181,8 @@ fn masked(
     Ok((Secret(limbs_of(&sr)), ns))
 }
 
-/// The scratch buffers of `pl` in the session, with the scalars (and on the
-/// one-shot path the points) copied in.
+/// Binds the scratch buffers of `pl`, copying in the scalars (and the points
+/// on the one-shot path).
 fn bind_buffers<'s>(
     s: &'s mut Session,
     pl: &Plan,
@@ -230,9 +224,8 @@ fn bind_buffers<'s>(
     })
 }
 
-/// Copies `data` to the start of `buf` on a few threads (a `2^20`-scalar
-/// copy takes about 0.5 ms on one); a part whose thread cannot be started is
-/// copied on this thread.
+/// Copies `data` to the start of `buf` on a few threads; a part whose thread
+/// cannot be started is copied on this thread.
 fn write_parallel<T: ctx::Pod + Sync + Send>(buf: &mut Buffer, data: &[T]) -> Result<(), Error> {
     const PART: usize = 1 << 20;
     let short = || Error::Memory("msm scratch".into());

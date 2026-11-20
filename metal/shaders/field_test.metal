@@ -11,9 +11,7 @@
 // See the License for the specific language governing permissions and
 // limitations under the License.
 
-// Test kernels of the field arithmetic (fr.h, fp.h), for the crate's tests
-// (feature `test-support`), which compare every operation with blst element
-// for element.
+// Test kernels of the field arithmetic (fr.h, fp.h).
 
 #include "fr.h"
 #include "fp.h"

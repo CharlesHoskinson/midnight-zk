@@ -27,10 +27,9 @@
 // CIOS multiplication; both BLS12-381 fields meet it), so that `a + b < 2p`
 // fits in N limbs and the products below never carry out of the top limb.
 //
-// Multiplication is CIOS over 32-bit limbs with 32x32->64 products and 64-bit
-// (`ulong`) accumulators: on Apple M4 Max it is faster than CIOS with
-// `mulhi` and 32-bit carries, product scanning (FIPS) and CIOS over 64-bit
-// limbs, for both fields.
+// Multiplication is CIOS over 32-bit limbs with 64-bit (`ulong`)
+// accumulators, measured faster than the `mulhi`, product-scanning and
+// 64-bit-limb variants for both fields.
 
 #ifndef MIDNIGHT_METAL_MONT_H
 #define MIDNIGHT_METAL_MONT_H

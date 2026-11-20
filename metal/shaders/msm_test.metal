@@ -11,9 +11,7 @@
 // See the License for the specific language governing permissions and
 // limitations under the License.
 
-// Test kernels of the G1 curve code (g1.h) and of the MSM mask (msm.h); the
-// tests in tests/msm.rs compare them with blst and with the CUDA crate's
-// mask vector.
+// Test kernels of the G1 curve code (g1.h) and of the MSM mask (msm.h).
 
 #include "fp.h"
 #include "g1.h"

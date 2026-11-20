@@ -11,17 +11,8 @@
 // See the License for the specific language governing permissions and
 // limitations under the License.
 
-//! The device quotient against midnight-proofs: the job layout, the
-//! numerator against `QuotientJob::numerator_reference` on every row, the
-//! quotient against the stock CPU quotient (the hook layer's check mode and
-//! `divide_reference`), whole proofs with all four hooks installed against
-//! proofs without hooks, the declines, and the resident proving-key copies.
-//!
-//! The jobs come from real proving keys: a quotient hook installed by this
-//! test sees the job of each proof (`midnight_proofs::gpu::abi::
-//! QuotientJobAbi`), rebuilds the `QuotientJob` from it for the references,
-//! and passes it on to `midnight_metal::quotient`; [`OwnedJob`] keeps a deep
-//! copy of a job for the tests that serve it again after the proof.
+//! The device quotient against the references of midnight-proofs, on the
+//! jobs of real proofs seen by a quotient hook installed here.
 
 #![cfg(target_os = "macos")]
 
@@ -45,9 +36,6 @@ use midnight_proofs::gpu::{
     test_switches::{self, QUOTIENT_CHECK, RandomCircuit},
 };
 
-// ---------------------------------------------------------------------------
-// The layout
-
 macro_rules! same {
     ($a:ty, $b:ty, $($f:ident),*) => {
         assert_eq!(size_of::<$a>(), size_of::<$b>(), stringify!($a));
@@ -56,8 +44,7 @@ macro_rules! same {
     };
 }
 
-/// The crate's copy of the job types equals `midnight_proofs::gpu::abi`
-/// field by field (offsets, sizes, alignment), and the constants agree.
+/// The crate's copy of the job types matches `midnight_proofs::gpu::abi`.
 #[test]
 fn abi_layout_matches() {
     same!(ma::DeviceOp, hooks::DeviceOp, kind, dst, a, b, c);
@@ -174,23 +161,12 @@ fn abi_layout_matches() {
             hooks::COLUMN_INSTANCE
         ]
     );
-    // the hook signature takes the entry point as it is
-    let _ = GpuHooks {
-        quotient: Some(metal::quotient),
-        ..Default::default()
-    };
 }
 
-// ---------------------------------------------------------------------------
-// The harness
-
-/// The installed hooks, the min-k, the check switch and the probe are
-/// process-wide: one test at a time.
 static SERIAL: Mutex<()> = Mutex::new(());
 
 type Probe = Box<dyn FnMut(*const c_void) + Send>;
 static PROBE: Mutex<Option<Probe>> = Mutex::new(None);
-/// Calls of the quotient hook.
 static QUOTIENT_CALLS: AtomicU64 = AtomicU64::new(0);
 
 unsafe fn quotient_hook(job: *const c_void, out: &mut [Scalar]) -> bool {
@@ -225,8 +201,6 @@ fn set_probe(p: Option<Probe>) {
     *PROBE.lock().unwrap_or_else(|e| e.into_inner()) = p;
 }
 
-/// The job behind a hook's pointer.
-///
 /// # Safety
 /// `job` is the prover's job, within the hook call.
 unsafe fn abi<'a>(job: *const c_void) -> &'a pa::QuotientJobAbi {
@@ -234,8 +208,6 @@ unsafe fn abi<'a>(job: *const c_void) -> &'a pa::QuotientJobAbi {
     unsafe { &*(job as *const pa::QuotientJobAbi) }
 }
 
-/// A slice from a job's pointer and count.
-///
 /// # Safety
 /// For a non-zero count, `p` is valid for `n` reads for `'a`.
 unsafe fn sl<'a, T>(p: *const T, n: usize) -> &'a [T] {
@@ -265,8 +237,6 @@ unsafe fn program(p: &ProgramAbi) -> DeviceProgram<Fq> {
     }
 }
 
-/// The `QuotientJob` of a packed job, for its references.
-///
 /// # Safety
 /// `j` is a valid packed job whose pointers live while the result is used.
 unsafe fn job_of<'a>(j: &'a pa::QuotientJobAbi) -> QuotientJob<'a, Fq> {
@@ -338,8 +308,6 @@ unsafe fn job_of<'a>(j: &'a pa::QuotientJobAbi) -> QuotientJob<'a, Fq> {
     }
 }
 
-/// The shape of a job: (k, ext_k, permutation sets, chunks of each lookup,
-/// trash arguments, gate operations, nslots).
 #[derive(Clone, Debug, Default, PartialEq, Eq)]
 struct Shape {
     k: u32,
@@ -377,20 +345,8 @@ fn count(reason: &str) -> u64 {
     reasons().iter().filter(|r| r.0 == reason).map(|r| r.1).sum()
 }
 
-/// The quotient of a job on the CPU by the job's own definition.
-fn reference_quotient(j: &pa::QuotientJobAbi) -> Vec<Fq> {
-    // SAFETY: within the hook call.
-    let job = unsafe { job_of(j) };
-    job.divide_reference(job.numerator_reference()).as_slice().to_vec()
-}
-
-// ---------------------------------------------------------------------------
-// A circuit with multi-chunk lookups
-
 mod range {
-    //! `Pow2RangeChip` of midnight-circuits with nine parallel lookup columns
-    //! (its lookup splits into several chunks at a low degree), a custom gate
-    //! and copy constraints into the range-checked columns and the instance.
+    //! `Pow2RangeChip` with nine lookup columns: a lookup of several chunks.
 
     use ff::Field;
     use midnight_circuits::{
@@ -462,7 +418,6 @@ mod range {
             let inst = meta.instance_column();
             meta.enable_equality(inst);
             let q = meta.selector();
-            // src[1] = src[0]^2 + src[0] (degree 3 with the selector)
             meta.create_gate("square plus", |vc| {
                 let a = vc.query_advice(src[0], Rotation::cur());
                 let b = vc.query_advice(src[1], Rotation::cur());
@@ -552,14 +507,8 @@ mod range {
     }
 }
 
-// ---------------------------------------------------------------------------
-// The numerator and the quotient against the references
-
 static SHAPES: Mutex<Vec<Shape>> = Mutex::new(Vec::new());
 
-/// The probe of the differential tests: the device numerator against
-/// `numerator_reference` on every row, and the device quotient against
-/// `divide_reference` of it.
 fn differential_probe() -> Probe {
     Box::new(|job| {
         // SAFETY: within the hook call.
@@ -592,16 +541,8 @@ fn differential_probe() -> Probe {
     })
 }
 
-/// For jobs of real proving keys, the device numerator equals
-/// `numerator_reference` on every row of the extended domain (so every
-/// rotation, the permutation's negative last rotation included, wraps at the
-/// domain's ends as the reference does) and the device quotient equals
-/// `divide_reference`; the prover's check mode compares the hook's quotient
-/// with the stock CPU quotient. The circuits are the cheapest that cover
-/// every feature: random circuits with custom gates of every operation kind,
-/// a LogUp lookup and a trash argument, with two permutation sets (seed 0)
-/// and one (seed 3); the range circuit with a lookup of three chunks at a
-/// two-pass transform size (`ext_k` 11).
+/// Every row of the numerator, the quotient, and the check mode's comparison
+/// with the stock CPU quotient.
 #[test]
 fn numerator_and_quotient_match_references() {
     let _g = lock();
@@ -631,7 +572,6 @@ fn numerator_and_quotient_match_references() {
         diffs,
         "the device quotient is the stock one"
     );
-    // the probe's quotient and the hook's own one
     assert_eq!(metal::stats().quotient.served - served, 2 * proofs);
     let shapes = SHAPES.lock().unwrap_or_else(|e| e.into_inner()).clone();
     assert_eq!(shapes.len() as u64, proofs);
@@ -655,10 +595,7 @@ fn numerator_and_quotient_match_references() {
     );
 }
 
-/// A dispatch narrower than the domain (each thread takes several rows,
-/// stepping `omega` by `omega^threads`) and a domain split over many command
-/// buffers give the reference numerator; the other tests run one dispatch
-/// as wide as the domain.
+/// Several rows per thread, and many command buffers.
 #[test]
 fn numerator_independent_of_threads() {
     let _g = lock();
@@ -666,7 +603,6 @@ fn numerator_independent_of_threads() {
     set_probe(Some(differential_probe()));
     qt::set_threads(Some(256));
     RandomCircuit::new(10, false, 9).prove();
-    // many command buffers of one dispatch of rows each
     qt::set_target_nanos(Some(1));
     RandomCircuit::new(10, false, 9).prove();
     let runs = qt::last_stages().unwrap().numerator_runs;
@@ -681,12 +617,8 @@ fn numerator_independent_of_threads() {
     );
 }
 
-// ---------------------------------------------------------------------------
-// Whole proofs
-
-/// Proves `prove` with all four hooks and without hooks: the same bytes, a
-/// proof the stock verifier accepts, the quotient served by the device; then
-/// once more in check mode with no difference.
+/// The proof with all four hooks is served, verifies and has the bytes of
+/// the proof without hooks.
 fn end_to_end(name: &str, prove: impl Fn() -> (Vec<u8>, bool)) {
     let served = metal::stats().quotient.served;
     let calls = QUOTIENT_CALLS.load(Relaxed);
@@ -732,8 +664,7 @@ fn end_to_end_small() {
     end_to_end("range k=10", || range::prove(&params, &pk, &c));
 }
 
-/// At `2^16` rows, where the transforms read the low twiddle table past its
-/// first entry (`ext_k > 16`). Ignored in debug builds: minutes there.
+/// `ext_k > 16` reads the low twiddle table past its first entry.
 #[test]
 #[cfg_attr(debug_assertions, ignore)]
 fn end_to_end_k16() {
@@ -743,12 +674,6 @@ fn end_to_end_k16() {
     end_to_end("random k=16", || rc.prove());
 }
 
-// ---------------------------------------------------------------------------
-// Declines
-
-/// A job with a wrong ABI version, below min-k, above the memory limit, with
-/// a wrong output length or an unreduced challenge declines with its reason
-/// and leaves `out` byte-identical.
 #[test]
 fn declines_leave_out_unchanged() {
     let _g = lock();
@@ -763,26 +688,23 @@ fn declines_leave_out_unchanged() {
     qt::set_memory_limit(Some(metal::need_bytes(a.ext_k, 1, 1, 0) as u64));
     expect_decline(&a, "memory");
     qt::set_memory_limit(None);
-    // a wrong output length
     let before = count("shape");
     let mut out = pattern(a.len + 1);
     // SAFETY: the job's storage lives in `j`.
     assert!(!unsafe { metal::quotient(j.ptr(), &mut out) });
     assert!(out == pattern(a.len + 1), "out unchanged");
     assert_eq!(count("shape") - before, 1);
+    let before = count("shape");
+    let mut out = pattern(a.len);
+    // SAFETY: a null job is declined before use.
+    assert!(!unsafe { metal::quotient(std::ptr::null(), &mut out) });
+    assert!(out == pattern(a.len), "out unchanged");
+    assert_eq!(count("shape") - before, 1);
     let mut bad = a;
     bad.y = [u64::MAX; 4];
     expect_decline(&bad, "unreduced");
 }
 
-// ---------------------------------------------------------------------------
-// Resident proving-key copies
-
-/// Registered key polynomials: the first quotient makes the copy, the second
-/// reads it without copying, a changed polynomial is detected, counted stale,
-/// uploaded for the call and still gives the right quotient; the copies go
-/// at the end of a request unless kept, and with [`metal::evict_key_copies`];
-/// the registrations go with the handle.
 #[test]
 fn registered_key_is_resident() {
     let _g = lock();
@@ -810,7 +732,6 @@ fn registered_key_is_resident() {
         (s2.resident_polys, s2.uploaded_polys, s2.key_copies_made),
         (nkeys, 0, 0)
     );
-    // a changed polynomial
     let stale = metal::key_stale();
     j.bump_key(nkeys as usize - 1, 3, 1);
     metal::begin_request();
@@ -818,7 +739,6 @@ fn registered_key_is_resident() {
     assert_eq!(metal::key_stale() - stale, 1);
     assert_eq!((s3.resident_polys, s3.uploaded_polys), (nkeys - 1, 1));
     assert_eq!(metal::keys_registered(), nkeys as usize - 1);
-    // freed at the end of a request, kept with keep_resident
     assert!(metal::end_request());
     assert_eq!(handle.resident_bytes(), 0);
     metal::set_keep_resident(true);
@@ -833,10 +753,6 @@ fn registered_key_is_resident() {
     assert_eq!(metal::keys_registered(), 0);
 }
 
-// ---------------------------------------------------------------------------
-// Owned jobs: a deep copy of a hook's job, usable after the proof
-
-/// A program and its arrays.
 struct OwnedProgram {
     ops: Vec<hooks::DeviceOp>,
     reads: Vec<hooks::DeviceRead>,
@@ -875,10 +791,8 @@ impl OwnedProgram {
     }
 }
 
-/// A deep copy of a quotient job: every polynomial and table owned, the
-/// aliasing of the original (one polynomial behind several pointers) kept.
-/// `abi` points into the owned storage, whose heap buffers never move (the
-/// vectors are only written in place).
+/// A deep copy of a hook's job that keeps the aliasing of the original. `abi`
+/// points into the owned storage, whose heap buffers never move.
 struct OwnedJob {
     abi: pa::QuotientJobAbi,
     /// The proof's polynomials (`2^k` each).
@@ -908,7 +822,6 @@ impl OwnedJob {
         let mut keys: Vec<Vec<Scalar>> = Vec::new();
         let mut pix: HashMap<usize, usize> = HashMap::new();
         let mut kix: HashMap<usize, usize> = HashMap::new();
-        // the owned index of each original pointer (null stays null)
         let mut proof_i = |p: *const Scalar| -> Option<usize> {
             (!p.is_null()).then(|| {
                 *pix.entry(p as usize).or_insert_with(|| {
@@ -941,7 +854,6 @@ impl OwnedJob {
             .map(|p| proof_i(*p))
             .collect();
         let lookups_in = unsafe { sl(j.lookups, j.nlookups) };
-        // (aggregator, multiplicities, helpers, programs)
         type L = (
             Option<usize>,
             Option<usize>,
@@ -1057,7 +969,6 @@ impl OwnedJob {
         self.keys.iter().map(|k| k.as_slice()).collect()
     }
 
-    /// The device quotient (asserted served) and the stages of the call.
     fn serve(&self) -> (Vec<Scalar>, metal::QuotientStages) {
         let mut out = vec![[0u64; 4]; self.abi.len];
         // SAFETY: the job's storage lives in `self`.
@@ -1069,19 +980,19 @@ impl OwnedJob {
         (out, qt::last_stages().unwrap())
     }
 
-    /// The reference quotient of the job's current contents.
     fn reference(&self) -> Vec<Scalar> {
-        reference_quotient(&self.abi).into_iter().map(scalar).collect()
+        // SAFETY: the job's storage lives in `self`.
+        let job = unsafe { job_of(&self.abi) };
+        let h = job.divide_reference(job.numerator_reference());
+        h.iter().map(|x| scalar(*x)).collect()
     }
 
-    /// Adds one to coefficient `at` of key polynomial `key` (stays reduced).
     fn bump_key(&mut self, key: usize, at: usize, by: u64) {
         let v = &mut self.keys[key][at];
         *v = scalar(from_scalar(*v) + Fq::from(by));
     }
 }
 
-/// Deep copies of the quotient jobs of the proofs `prove` makes.
 fn capture(prove: impl FnOnce()) -> Vec<OwnedJob> {
     static JOBS: Mutex<Vec<OwnedJob>> = Mutex::new(Vec::new());
     JOBS.lock().unwrap_or_else(|e| e.into_inner()).clear();
@@ -1095,27 +1006,23 @@ fn capture(prove: impl FnOnce()) -> Vec<OwnedJob> {
     std::mem::take(&mut *JOBS.lock().unwrap_or_else(|e| e.into_inner()))
 }
 
-/// One owned job of a random circuit.
 fn job_of_circuit(seed: u64, k: u32) -> OwnedJob {
     let mut jobs = capture(|| {
         RandomCircuit::new(seed, false, k).prove();
     });
     assert_eq!(jobs.len(), 1);
     let j = jobs.pop().unwrap();
-    // the owned copy gives the prover's quotient
     assert_eq!(j.serve().0, j.reference());
     j
 }
 
-/// A pattern for `out` that no quotient writes by chance.
 fn pattern(len: usize) -> Vec<Scalar> {
     (0..len as u64)
         .map(|i| [0x5eed_0000 + i, !i, i.rotate_left(17) ^ 0xa5a5, 7])
         .collect()
 }
 
-/// `j` declines with `reason` (counted once) and leaves `out`, filled with a
-/// pattern, byte-identical.
+/// `j` declines with `reason`, counted once, and leaves `out` unchanged.
 fn expect_decline(j: &pa::QuotientJobAbi, reason: &str) {
     let before = count(reason);
     let declines = metal::quotient_counts().1;
@@ -1144,17 +1051,6 @@ fn r_plus(d: u64) -> Scalar {
     ]
 }
 
-// ---------------------------------------------------------------------------
-// Declines on malformed tables and unreduced scalars
-
-/// Every element of the job's tables the program checks reject: an operand
-/// index, a slot index and a uniform index out of range, a null helper
-/// pointer, a null fixed column a program reads; and the scalars passed by
-/// value to the transforms (the shift, its inverse, the divisor, an element
-/// of `t_inv`) unreduced; and polynomials with an unreduced coefficient
-/// (found while copying, after device work began); and a memory decline
-/// after a registered key was lent. Each declines with its reason and leaves
-/// `out` byte-identical, and the job still serves afterwards.
 #[test]
 fn malformed_jobs_decline_and_leave_out_unchanged() {
     let _g = lock();
@@ -1165,7 +1061,6 @@ fn malformed_jobs_decline_and_leave_out_unchanged() {
     let gates = unsafe { OwnedProgram::of(&a.gates) };
     assert!(!gates.ops.is_empty() && !gates.reads.is_empty());
 
-    // operands, slots, uniforms out of range
     let with_op = |f: &dyn Fn(&mut hooks::DeviceOp)| {
         let mut p = unsafe { OwnedProgram::of(&a.gates) };
         f(&mut p.ops[0]);
@@ -1180,7 +1075,6 @@ fn malformed_jobs_decline_and_leave_out_unchanged() {
     with_op(&|op| op.a = (hooks::TAG_SLOT << 30) | a.nslots);
     with_op(&|op| op.dst = a.nslots);
     with_op(&|op| op.a = 3 << 30);
-    // an output operand out of range
     {
         let mut p = unsafe { OwnedProgram::of(&a.gates) };
         p.outputs[0] = (hooks::TAG_READ << 30) | nreads;
@@ -1189,7 +1083,6 @@ fn malformed_jobs_decline_and_leave_out_unchanged() {
         expect_decline(&bad, "shape");
     }
 
-    // a null helper pointer
     assert!(a.nlookups > 0, "the job has a lookup");
     {
         let mut lookups: Vec<pa::LookupAbi> = unsafe { sl(a.lookups, a.nlookups) }.to_vec();
@@ -1202,7 +1095,6 @@ fn malformed_jobs_decline_and_leave_out_unchanged() {
         expect_decline(&bad, "shape");
     }
 
-    // a null fixed column that a program reads
     let fixed_read = gates.reads.iter().find(|r| r.kind == hooks::COLUMN_FIXED);
     let fixed_read = fixed_read.expect("the gates read a fixed column");
     {
@@ -1213,8 +1105,8 @@ fn malformed_jobs_decline_and_leave_out_unchanged() {
         expect_decline(&bad, "shape");
     }
 
-    // unreduced scalars passed by value: the shift and its inverse (checked
-    // before the shift check: `shape`), the divisor and `t_inv` (`unreduced`)
+    // the shift and its inverse decline `shape`, the divisor and `t_inv`
+    // `unreduced`
     for v in [r_plus(0), [u64::MAX; 4]] {
         let mut bad = a;
         bad.zeta[0] = v;
@@ -1236,7 +1128,7 @@ fn malformed_jobs_decline_and_leave_out_unchanged() {
             expect_decline(&bad, "unreduced");
         }
     }
-    // the same shift, unreduced: `zeta + r` (equal mod r)
+    // `zeta + r`, equal to the shift mod r
     {
         let mut bad = a;
         let z = from_scalar(a.zeta[0]);
@@ -1254,8 +1146,7 @@ fn malformed_jobs_decline_and_leave_out_unchanged() {
         }
     }
 
-    // an unreduced coefficient of a proof polynomial (found while copying,
-    // with the device at work) and of a key polynomial
+    // found while copying, with the device at work
     {
         let mut adv: Vec<Scalar> = j.proof[0].clone();
         let last = adv.len() - 1;
@@ -1277,34 +1168,24 @@ fn malformed_jobs_decline_and_leave_out_unchanged() {
         bad.l_active = la.as_ptr();
         expect_decline(&bad, "unreduced");
     }
-    // a memory decline after planning, with a registered key lent and given
-    // back: the next call still serves the right quotient
+    // a memory decline after a registered key was lent
     {
         let handle = metal::register_key(&j.key_slices());
         // SAFETY: the job's storage lives in `j`.
         let need = unsafe { qt::need_bytes_job(j.ptr()) }.expect("checks pass") as u64;
         qt::set_memory_limit(Some(need - 1));
         expect_decline(&a, "memory");
-        // at the limit exactly the job is admitted
         qt::set_memory_limit(Some(need));
         assert_eq!(j.serve().0, j.reference());
         qt::set_memory_limit(None);
         drop(handle);
     }
-    // the job itself still serves
     assert_eq!(j.serve().0, j.reference());
     assert!(metal::end_request());
 }
 
-// ---------------------------------------------------------------------------
-// Resident copies: lengths, staleness, ABA
-
-/// One handle holding the key polynomials of two circuits of different
-/// extended lengths, keep-resident on: the jobs A, B, A, B each equal their
-/// reference, and the third and fourth serve from their copies without
-/// copying again; A registered first with a request per serve, B registered
-/// first within one request (each registration order numbers the slots of a
-/// length differently).
+/// One handle holding keys of two extended lengths, in both registration
+/// orders (which number the slots of a length differently).
 #[test]
 fn mixed_length_registration_serves_each_length() {
     let _g = lock();
@@ -1344,7 +1225,6 @@ fn mixed_length_registration_serves_each_length() {
         step(&b, &rb, nb, nb, 1);
         step(&a, &ra, na, 0, 2);
         step(&b, &rb, nb, 0, 3);
-        // outside any request too (every serve checks)
         if one_request {
             assert!(metal::end_request());
         }
@@ -1363,10 +1243,6 @@ fn mixed_length_registration_serves_each_length() {
     assert!(metal::end_request());
 }
 
-/// Without `begin_request` (hooks installed with no request calls), every
-/// serve checks its digests: a key polynomial changed in place after its copy
-/// was made is detected at the next serve, uploaded, and the quotient is the
-/// one of the new contents (debug and release builds alike).
 #[test]
 fn outside_a_request_every_serve_checks() {
     let _g = lock();
@@ -1377,7 +1253,6 @@ fn outside_a_request_every_serve_checks() {
     let (out, st) = j.serve();
     assert!(out == j.reference());
     assert_eq!((st.resident_polys, st.key_copies_made), (nkeys, nkeys));
-    // served again from the copy (checked, not copied)
     let (out, st) = j.serve();
     assert!(out == j.reference());
     assert_eq!((st.resident_polys, st.key_copies_made), (nkeys, 0));
@@ -1394,10 +1269,7 @@ fn outside_a_request_every_serve_checks() {
     assert!(metal::end_request());
 }
 
-/// Inside a request each registered polynomial is checked at its first
-/// serve of the request only (the CUDA crate's semantics): a polynomial
-/// changed in place after that is still served from the copy until the
-/// next request, which detects it.
+/// A change after the first serve of a request is seen at the next request.
 #[test]
 fn inside_a_request_checks_once() {
     let _g = lock();
@@ -1415,13 +1287,11 @@ fn inside_a_request_checks_once() {
     j.bump_key(0, 9, 5);
     let new = j.reference();
     assert!(old != new);
-    // not checked again in this request: the copy, the old contents
     let (out, st) = j.serve();
     assert!(out == old, "once per request: the copy");
     assert_eq!((st.resident_polys, st.key_copies_made), (nkeys, 0));
     assert_eq!(metal::key_stale(), stale);
     assert!(metal::end_request());
-    // the next request checks
     metal::begin_request();
     let (out, st) = j.serve();
     assert!(out == new, "the next request: the new contents");
@@ -1432,13 +1302,8 @@ fn inside_a_request_checks_once() {
     metal::set_keep_resident(false);
 }
 
-/// A slot is marked present only with content verified in the call that
-/// filled it: a polynomial registered with contents C1 and changed to C2
-/// before its first serve, in the request of the registration (where only
-/// the fill's own check sees it), is detected when its slot is filled, not
-/// marked present, and the quotient is the one of C2; changed back to C1 in
-/// a later request, the quotient is the one of C1 (the slot never served C2
-/// under the C1 digest).
+/// A key changed from C1 to C2 before its slot is filled is not marked
+/// present; changed back to C1 later, C1 is served.
 #[test]
 fn slot_filled_with_changed_contents_is_not_present() {
     let _g = lock();
@@ -1463,7 +1328,6 @@ fn slot_filled_with_changed_contents_is_not_present() {
     );
     assert_eq!(metal::keys_registered(), nkeys as usize - 1);
     assert!(metal::end_request());
-    // back to C1, a later request
     let v = &mut j.keys[victim][11];
     *v = scalar(from_scalar(*v) - Fq::ONE);
     assert!(j.reference() == c1);
@@ -1480,16 +1344,8 @@ fn slot_filled_with_changed_contents_is_not_present() {
     metal::set_keep_resident(false);
 }
 
-// ---------------------------------------------------------------------------
-// Memory need
-
-/// `need_bytes_job` (the admission's own sum) and `need_bytes` (the shape
-/// bound) are at least the device bytes a call adds, measured with an empty
-/// pool (every buffer new) from the start of a request: no key registered,
-/// a key registered (the copy made by the call), the copy resident, and a
-/// stale key uploaded again after the check; for a one-pass transform size
-/// (no transform scratch) and a two-pass one with a lookup of several
-/// chunks.
+/// `need_bytes_job` and `need_bytes` bound the device bytes a call adds, for
+/// a one-pass and a two-pass transform size.
 #[test]
 fn need_bytes_bounds_the_measured_peak() {
     let _g = lock();
@@ -1529,8 +1385,6 @@ fn need_bytes_bounds_the_measured_peak() {
         measure(j, &format!("job {i} copy made"));
         measure(j, &format!("job {i} resident"));
         drop(handle);
-        // a stale key: the second upload; the copy is new (outside the
-        // registration's request) and the polynomial changed after it
         let handle = metal::register_key(&j.key_slices());
         j.bump_key(0, 1, 1);
         measure(j, &format!("job {i} stale"));

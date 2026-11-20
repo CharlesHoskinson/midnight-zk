@@ -16,7 +16,7 @@
 
 #include <metal_stdlib>
 
-// out[i] = i: a smoke test of dispatch and read-back.
+// out[i] = i.
 kernel void diag_iota(device uint *out [[buffer(0)]],
                       constant uint &n [[buffer(1)]],
                       uint gid [[thread_position_in_grid]]) {

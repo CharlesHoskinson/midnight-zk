@@ -11,15 +11,13 @@
 // See the License for the specific language governing permissions and
 // limitations under the License.
 
-//! The quotient job as the quotient hook of `midnight_proofs::gpu` passes it:
-//! a copy of the `repr(C)` layout of `midnight_proofs::gpu::abi`, version
-//! [`QUOTIENT_ABI`] (this crate does not depend on midnight-proofs; the test
-//! `tests/quotient.rs` compares the layouts field by field).
+//! The quotient job as `midnight_proofs::gpu` passes it: a copy of the
+//! `repr(C)` layout of `midnight_proofs::gpu::abi`, version [`QUOTIENT_ABI`].
+//! `tests/quotient.rs` compares the layouts field by field.
 //!
-//! Every pointer is a host pointer, valid for the duration of the hook call.
-//! Polynomials of the proof point to `2^k` coefficients; polynomials of the
-//! proving key to `2^ext_k` values of the extended coset; a fixed column the
-//! job does not read is null.
+//! Every pointer is a host pointer valid for the hook call. Proof polynomials
+//! hold `2^k` coefficients, proving-key polynomials `2^ext_k` extended-coset
+//! values; a fixed column the job does not read is null.
 
 use crate::Scalar;
 
@@ -175,8 +173,7 @@ pub struct QuotientJobAbi {
     pub instance: *const *const Scalar,
     /// Their count.
     pub ninstance: usize,
-    /// The fixed columns, extended cosets; null for a column the job does not
-    /// read.
+    /// The fixed columns, extended cosets; null when not read.
     pub fixed: *const *const Scalar,
     /// Their count.
     pub nfixed: usize,

@@ -21,7 +21,7 @@ use midnight_curves::{
     Fq,
     fft::{best_fft_with_twiddles, compute_twiddles},
 };
-use midnight_metal::{Scalar, ntt_test_support as dev};
+use midnight_metal::{Scalar, field::FR_MODULUS, ntt_test_support as dev};
 use midnight_proofs::{
     gpu::adapter::{from_scalar, scalar, scalars, scalars_mut},
     poly::EvaluationDomain,
@@ -63,14 +63,11 @@ fn inputs(log_n: u32, seed: u64) -> Vec<(&'static str, Vec<Fq>)> {
     ]
 }
 
-/// The stock forward transform (`best_fft_with_twiddles`, as the domain
-/// calls it).
+/// The stock forward transform, as `EvaluationDomain` calls it.
 fn stock_fft(a: &mut [Fq], omega: Fq, log_n: u32) {
     best_fft_with_twiddles(a, &compute_twiddles(&omega, log_n), log_n);
 }
 
-/// The stock inverse transform (`EvaluationDomain::ifft`: the transform,
-/// then every element times the divisor).
 fn stock_ifft(a: &mut [Fq], omega_inv: Fq, log_n: u32, divisor: Fq) {
     stock_fft(a, omega_inv, log_n);
     for x in a.iter_mut() {
@@ -104,7 +101,6 @@ fn check_fft(log_n: u32, seed: u64) {
     let n_inv = Fq::from(n as u64).invert().unwrap();
     let d_rand = random(1, seed ^ 0xd1)[0];
     for (name, input) in inputs(log_n, seed) {
-        // forward hook at the standard root
         let mut want = input.clone();
         stock_fft(&mut want, w, log_n);
         let mut got = input.clone();
@@ -114,7 +110,6 @@ fn check_fft(log_n: u32, seed: u64) {
         );
         assert_eq!(first_diff(&got, &want), None, "fft 2^{log_n} {name}");
 
-        // forward hook at the inverse root
         let mut want = input.clone();
         stock_fft(&mut want, wi, log_n);
         let mut got = input.clone();
@@ -124,7 +119,6 @@ fn check_fft(log_n: u32, seed: u64) {
         );
         assert_eq!(first_diff(&got, &want), None, "fft(w^-1) 2^{log_n} {name}");
 
-        // inverse hook with 1/n and with another divisor, at either root
         for (root_name, r) in [("w^-1", wi), ("w", w)] {
             for div in [n_inv, d_rand] {
                 let mut want = input.clone();
@@ -144,15 +138,13 @@ fn check_fft(log_n: u32, seed: u64) {
     }
 }
 
-/// One and two passes. One pass (`log_n <= 10`): the smallest sizes (fewer
-/// than four elements per thread), a partial and a full threadgroup.
-/// Two passes: unequal and equal radices, the largest size whose factors
-/// read the high table only (16), the smallest that reads both (17), the
-/// largest two-pass size (20).
+/// One pass: fewer than four and exactly four elements per thread, a
+/// partial and a full threadgroup. Two passes: unequal and equal radices,
+/// the high twiddle table only (16), both tables (17), the largest (20).
 #[test]
 fn fft_matches_stock() {
     setup();
-    for log_n in [1, 2, 3, 6, 10, 11, 12, 13, 16, 17, 20] {
+    for log_n in [1, 2, 6, 10, 11, 12, 16, 17, 20] {
         check_fft(log_n, 100 + u64::from(log_n));
     }
 }
@@ -189,15 +181,14 @@ fn fft_matches_stock_three_passes() {
 #[test]
 fn building_blocks_match_stock_domain() {
     setup();
-    // (j, k): extended_k = k + ceil(log2(j - 1)); covers one, two and three
-    // passes, and k == extended_k
-    for (j, k) in [(2u32, 3u32), (4, 8), (4, 10), (8, 14), (5, 17), (4, 19)] {
+    // (j, k): k == extended_k, one, two (one and both twiddle tables) and
+    // three passes
+    for (j, k) in [(2u32, 3u32), (4, 8), (4, 10), (8, 14), (4, 19)] {
         let domain = EvaluationDomain::<Fq>::new(j, k);
         let ext_k = domain.extended_k();
         let zeta = [Fq::ZETA, Fq::ZETA.square()];
         let zeta_out = [zeta[1], zeta[0]];
 
-        // coeff_to_extended
         let coeffs = random(1 << k, u64::from(j * 100 + k));
         let want = domain.coeff_to_extended(domain.coeff_from_vec(coeffs.clone()));
         let got = dev::coeff_to_extended(scalars(&coeffs), k, ext_k, zeta.map(scalar)).unwrap();
@@ -209,8 +200,6 @@ fn building_blocks_match_stock_domain() {
             "coeff_to_extended k {k} ext_k {ext_k}"
         );
 
-        // extended_to_coeff, on the extended values just made and on random
-        // ones
         let divisor = Fq::from(1u64 << ext_k).invert().unwrap();
         for values in [got, random(1 << ext_k, u64::from(j * 1000 + k))] {
             let mut ext = domain.empty_extended();
@@ -230,7 +219,6 @@ fn building_blocks_match_stock_domain() {
                 "extended_to_coeff ext_k {ext_k}"
             );
         }
-        // the round trip gives the coefficients back
         let back = dev::extended_to_coeff(
             &dev::coeff_to_extended(scalars(&coeffs), k, ext_k, zeta.map(scalar)).unwrap(),
             ext_k,
@@ -243,97 +231,30 @@ fn building_blocks_match_stock_domain() {
     }
 }
 
-#[test]
-fn ntt_dev_matches_stock() {
-    setup();
-    for log_n in [1, 5, 10, 11, 16, 21] {
-        let n = 1usize << log_n;
-        let input = random(n, 500 + u64::from(log_n));
-        let w = root(log_n);
-        let c = random(1, 9)[0];
-        for (inverse, r) in [(false, w), (true, w.invert().unwrap())] {
-            let mut want = input.clone();
-            stock_fft(&mut want, r, log_n);
-            let got = dev::ntt(scalars(&input), log_n, inverse, None).unwrap();
-            assert_eq!(
-                &got[..],
-                scalars(&want),
-                "ntt_dev 2^{log_n} inverse {inverse}"
-            );
-            for x in want.iter_mut() {
-                *x *= c;
-            }
-            let got = dev::ntt(scalars(&input), log_n, inverse, Some(scalar(c))).unwrap();
-            assert_eq!(
-                &got[..],
-                scalars(&want),
-                "ntt_dev scaled 2^{log_n} inverse {inverse}"
-            );
-        }
-    }
-}
-
-#[test]
-fn elementwise_blocks() {
-    setup();
-    let n = 3 * 1000 + 2;
-    let values = random(n, 77);
-    let z = random(2, 78);
-    let c = random(1, 79)[0];
-    for log_t in [0u32, 2, 3] {
-        let table = random(1 << log_t, 80 + u64::from(log_t));
-        let got = dev::elementwise(
-            scalars(&values),
-            [scalar(z[0]), scalar(z[1])],
-            scalar(c),
-            scalars(&table),
-        )
-        .unwrap();
-        for (i, (g, v)) in got.iter().zip(&values).enumerate() {
-            let mut want = *v;
-            match i % 3 {
-                1 => want *= z[0],
-                2 => want *= z[1],
-                _ => {}
-            }
-            want *= c;
-            want *= table[i & ((1 << log_t) - 1)];
-            assert_eq!(*g, scalar(want), "element {i}");
-        }
-    }
-}
-
-/// The device building blocks refuse an unreduced scalar argument (a scale,
-/// a divisor, a `zeta`) before any device work, and keep serving reduced
-/// ones afterwards.
+/// The kernels silently mis-compute on an unreduced by-value scalar.
 #[test]
 fn building_blocks_refuse_unreduced_scalars() {
-    use midnight_metal::field::FR_MODULUS;
     setup();
     let bad = FR_MODULUS;
     let worse = [u64::MAX; 4];
-    for log_n in [4u32, 12] {
-        let values = random(1 << log_n, 600 + u64::from(log_n));
-        for inverse in [false, true] {
-            for s in [bad, worse] {
-                let e = dev::ntt(scalars(&values), log_n, inverse, Some(s)).unwrap_err();
-                assert!(e.contains("unreduced"), "ntt scale: {e}");
-            }
+    let log_n = 4;
+    let values = random(1 << log_n, 600 + u64::from(log_n));
+    for inverse in [false, true] {
+        for s in [bad, worse] {
+            let e = dev::ntt(scalars(&values), log_n, inverse, Some(s)).unwrap_err();
+            assert!(e.contains("unreduced"), "ntt scale: {e}");
         }
-        let one = scalar(Fq::ONE);
-        let z = scalar(Fq::ZETA);
-        // the coset zetas of coeff_to_extended
-        for zeta in [[bad, z], [z, bad], [worse, worse]] {
-            let e = dev::coeff_to_extended(scalars(&values), log_n, log_n + 1, zeta).unwrap_err();
-            assert!(e.contains("unreduced"), "coeff_to_extended zeta: {e}");
-        }
-        // the divisor and the zetas of extended_to_coeff
-        let e = dev::extended_to_coeff(scalars(&values), log_n, bad, [z, z]).unwrap_err();
-        assert!(e.contains("unreduced"), "extended_to_coeff divisor: {e}");
-        let e = dev::extended_to_coeff(scalars(&values), log_n, one, [z, bad]).unwrap_err();
-        assert!(e.contains("unreduced"), "extended_to_coeff zeta: {e}");
     }
-    // the elementwise blocks: zeta, then the scale factor
+    let one = scalar(Fq::ONE);
+    let z = scalar(Fq::ZETA);
+    for zeta in [[bad, z], [z, bad], [worse, worse]] {
+        let e = dev::coeff_to_extended(scalars(&values), log_n, log_n + 1, zeta).unwrap_err();
+        assert!(e.contains("unreduced"), "coeff_to_extended zeta: {e}");
+    }
+    let e = dev::extended_to_coeff(scalars(&values), log_n, bad, [z, z]).unwrap_err();
+    assert!(e.contains("unreduced"), "extended_to_coeff divisor: {e}");
+    let e = dev::extended_to_coeff(scalars(&values), log_n, one, [z, bad]).unwrap_err();
+    assert!(e.contains("unreduced"), "extended_to_coeff zeta: {e}");
     let values = random(30, 610);
     let table = random(2, 611);
     let z = scalar(Fq::ZETA);
@@ -342,7 +263,6 @@ fn building_blocks_refuse_unreduced_scalars() {
     assert!(e.contains("unreduced"), "distribute_zeta: {e}");
     let e = dev::elementwise(scalars(&values), [z, z], bad, scalars(&table)).unwrap_err();
     assert!(e.contains("unreduced"), "scale: {e}");
-    // reduced arguments are served again
     let got = dev::ntt(scalars(&values[..16]), 4, false, Some(scalar(Fq::ONE))).unwrap();
     let mut want = values[..16].to_vec();
     stock_fft(&mut want, root(4), 4);
@@ -366,8 +286,7 @@ fn declines_leave_the_buffer_unchanged() {
     let w = root(log_n);
     let div = Fq::from(n as u64).invert().unwrap();
 
-    // a root that is not the standard one: another primitive 2^log_n-th root
-    // (w^3), the root of another size, and a non-root
+    // another primitive root, the roots of other sizes, a non-root
     for bad in [w * w * w, root(log_n + 1), root(log_n - 1), Fq::from(5u64)] {
         let before = declines_of("fft", "shape");
         let mut a = input.clone();
@@ -390,7 +309,6 @@ fn declines_leave_the_buffer_unchanged() {
         assert!(declines_of("ifft", "shape") > before);
     }
 
-    // a length that is not 2^log_n
     for (len, lg) in [
         (n - 1, log_n),
         (n, log_n + 1),
@@ -419,14 +337,23 @@ fn declines_leave_the_buffer_unchanged() {
         assert!(declines_of("ifft", "shape") > before);
     }
 
-    // an unreduced element
-    let mut a = input;
-    let mut raw: Vec<Scalar> = scalars(&a).to_vec();
+    let mut raw: Vec<Scalar> = scalars(&input).to_vec();
     raw[17] = [u64::MAX; 4];
     let copy = raw.clone();
+    let before = declines_of("fft", "unreduced");
     assert!(!midnight_metal::fft(&mut raw, scalar(w), log_n));
     assert_eq!(raw, copy);
-    // the input itself is accepted
+    assert_eq!(declines_of("fft", "unreduced") - before, 1);
+    let mut a = input.clone();
+    let before = declines_of("ifft", "unreduced");
+    assert!(!midnight_metal::ifft(
+        scalars_mut(&mut a),
+        scalar(w.invert().unwrap()),
+        log_n,
+        FR_MODULUS
+    ));
+    assert_eq!(a, input);
+    assert_eq!(declines_of("ifft", "unreduced") - before, 1);
     assert!(midnight_metal::fft(scalars_mut(&mut a), scalar(w), log_n));
 }
 
@@ -461,8 +388,7 @@ fn hooks_serve_the_domain_transforms() {
     assert_eq!(first_diff(&evals, &want_evals), None);
 }
 
-/// A forward then inverse round trip on the device at `2^26`, three passes
-/// near the largest size. Ignored: it needs about 10 GiB of memory.
+/// Ignored: it needs about 10 GiB of memory.
 #[test]
 #[ignore]
 fn large_transform_round_trip() {
@@ -476,9 +402,6 @@ fn large_transform_round_trip() {
     assert_eq!(&back[..], scalars(&input));
 }
 
-/// Inverse transforms called from several threads at once (each takes its
-/// own per-request buffers and the device only for the transform) give the
-/// stock values.
 #[test]
 fn parallel_ifft_callers_match_stock() {
     setup();

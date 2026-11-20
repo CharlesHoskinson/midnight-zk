@@ -38,8 +38,8 @@ fn dbl(a: &mut blst_p1) {
     unsafe { blst_p1_double(a, &t) };
 }
 
-/// An XYZZ record as Jacobian coordinates `(X ZZ, Y ZZZ, ZZ)` (sppark's
-/// `xyzz_t` to `jacobian_t` conversion); infinity (`ZZ = 0`) stays infinity.
+/// An XYZZ record as Jacobian `(X ZZ, Y ZZZ, ZZ)`; infinity (`ZZ = 0`) stays
+/// infinity.
 fn p1_of_xyzz(r: &Xyzz) -> blst_p1 {
     let fp = |i: usize| {
         let mut l = [0u64; 6];
@@ -82,9 +82,9 @@ pub(super) fn limbs_of(p: &blst_p1) -> G1JacobianLimbs {
     out
 }
 
-/// sppark `integrate_row`: the window sum from the `2^nthrbits` pairs
-/// (weighted run sum, plain run sum) of `msm_integrate` in `row` (at least
-/// `2^(nthrbits + 1)` records); `lsbits` is the window's width.
+/// sppark `integrate_row`: the window sum from the `2^nthrbits` (weighted,
+/// plain) run-sum pairs of `msm_integrate` in `row`; `lsbits` is the window
+/// width.
 fn integrate_row(row: &[Xyzz], lsbits: u32, nthrbits: u32) -> blst_p1 {
     let rec = |i: usize, j: usize| p1_of_xyzz(&row[2 * i + j]);
     let mut i = (1usize << nthrbits) - 1;
@@ -124,10 +124,9 @@ fn integrate_row(row: &[Xyzz], lsbits: u32, nthrbits: u32) -> blst_p1 {
     res
 }
 
-/// The window sums of windows `[lo, hi)` (sppark `collect_rows`): out of
-/// line, so that its frames (and those of `integrate_row` and `blst`) lie
-/// below the worker's frame, where [`super::secret::scrub_stack`] runs
-/// afterwards. `rows` holds at least `hi * per_row` records.
+/// The window sums of windows `[lo, hi)` (sppark `collect_rows`). Out of line
+/// so its frames lie below the worker's frame, where
+/// [`super::secret::scrub_stack`] runs afterwards.
 #[inline(never)]
 fn collect_rows(
     rows: &[Xyzz],
@@ -148,12 +147,10 @@ fn collect_rows(
     out
 }
 
-/// sppark `collect`: the window sums (rows integrated in parallel, a part
-/// whose thread cannot be started on this thread), the doubling ladder from
-/// the top window, plus the bucket of digit 1 of window 0 (`ones`). `None`:
-/// the rows are short, or a worker panicked. Its inputs, the window sums and
-/// the partial results are guards (zeroed on every exit), and every worker
-/// scrubs its stack ([`ScrubOnExit`]); the caller scrubs this thread's.
+/// sppark `collect`: the window sums (rows in parallel), the doubling ladder
+/// from the top window, plus the digit-1 bucket of window 0 (`ones`). `None`:
+/// the rows are short or a worker panicked. Every worker scrubs its stack
+/// ([`ScrubOnExit`]); the caller scrubs this thread's.
 pub(super) fn collect(
     rows: SecretVec<Xyzz>,
     ones: SecretVec<Xyzz>,

@@ -11,14 +11,9 @@
 // See the License for the specific language governing permissions and
 // limitations under the License.
 
-//! The G1 MSM on the device: the curve kernels against blst, the MSM against
-//! the stock CPU MSM (`msm_pippenger`) as group elements on each window
-//! width class and path, registered tables, the admission rules, and the
-//! hook through a KZG commitment.
-//!
-//! The window widths 15 and 16 and the sizes with several chunks run in a
-//! release build only (`cargo test --release`), where the CPU reference and
-//! the point generation are fast enough.
+//! The G1 MSM on the device against blst and the stock CPU MSM
+//! (`msm_pippenger`). The window widths 15 and 16 and the sizes with several
+//! chunks run in a release build only.
 
 #![cfg(target_os = "macos")]
 
@@ -47,13 +42,8 @@ use rand_chacha::ChaCha8Rng;
 use rand_core::SeedableRng;
 use rayon::prelude::*;
 
-// ---------------------------------------------------------------------------
-// Set-up.
-
-/// The tests share process-wide thresholds, counters and the device: one at
-/// a time. Takes the lock, checks the device, and sets the thresholds
-/// (`min_k`: an explicit threshold; `None`: the defaults) and the CPU share
-/// (`MIDNIGHT_METAL_MSM_CPU_SHARE`).
+/// Serializes the tests (thresholds and counters are process-wide) and sets
+/// the threshold (`None`: the defaults) and the CPU share.
 fn setup(min_k: Option<u32>, cpu_share: bool) -> MutexGuard<'static, ()> {
     static LOCK: Mutex<()> = Mutex::new(());
     let g = LOCK.lock().unwrap_or_else(|e| e.into_inner());
@@ -66,8 +56,7 @@ fn setup(min_k: Option<u32>, cpu_share: bool) -> MutexGuard<'static, ()> {
     g
 }
 
-/// Whether `MIDNIGHT_METAL_MIN_K` overrides the defaults (the tests of the
-/// defaults are then skipped).
+/// Whether `MIDNIGHT_METAL_MIN_K` overrides the defaults.
 fn defaults_overridden() -> bool {
     let explicit = midnight_metal::thresholds().explicit;
     if explicit {
@@ -76,11 +65,9 @@ fn defaults_overridden() -> bool {
     explicit
 }
 
-/// Sets `MIDNIGHT_METAL_MSM_CPU_SHARE` (`off`: device only) or removes it.
-/// Called under the lock of [`setup`]; no other thread of this binary reads
-/// the environment meanwhile.
+/// Called under the lock of [`setup`].
 fn set_cpu_share(on: bool) {
-    // SAFETY: see above.
+    // SAFETY: no other thread of this binary reads the environment meanwhile.
     unsafe {
         if on {
             std::env::remove_var("MIDNIGHT_METAL_MSM_CPU_SHARE");
@@ -90,8 +77,7 @@ fn set_cpu_share(on: bool) {
     }
 }
 
-/// `n` distinct random points: chunks of consecutive multiples `P + i Q`
-/// from a random start, normalized together (fast for large `n`).
+/// `n` distinct points: chunks of `P + i Q` from random `P`, `Q`.
 fn random_points(n: usize, seed: u64) -> Vec<G1Affine> {
     const CHUNK: usize = 1 << 12;
     let mut out = vec![G1Affine::identity(); n];
@@ -110,7 +96,6 @@ fn random_points(n: usize, seed: u64) -> Vec<G1Affine> {
     out
 }
 
-/// The point set of the tests up to `2^20` points, made once.
 fn points_cache() -> &'static [G1Affine] {
     static P: OnceLock<Vec<G1Affine>> = OnceLock::new();
     P.get_or_init(|| random_points(1 << 20, 1))
@@ -127,9 +112,6 @@ fn random_scalars(n: usize, seed: u64) -> Vec<Fq> {
         .collect()
 }
 
-// ---------------------------------------------------------------------------
-// MSM helpers.
-
 fn device_msm(s: &[Fq], b: &[G1Affine]) -> G1Projective {
     let r = midnight_metal::msm_g1(adapter::scalars(s), adapter::affine(b));
     adapter::from_jacobian(r.unwrap_or_else(|| {
@@ -141,7 +123,7 @@ fn device_msm(s: &[Fq], b: &[G1Affine]) -> G1Projective {
     }))
 }
 
-/// The device MSM (served and counted) equals `msm_pippenger`.
+/// The device MSM is served and equals `msm_pippenger`.
 fn check(name: &str, s: &[Fq], b: &[G1Affine]) {
     let before = midnight_metal::stats().msm.served;
     let got = device_msm(s, b);
@@ -153,7 +135,7 @@ fn check(name: &str, s: &[Fq], b: &[G1Affine]) {
     assert_eq!(midnight_metal::stats().msm.served, before + 1, "{name}");
 }
 
-/// The path and plan of one MSM, its value checked against `msm_pippenger`.
+/// The path and plan of one MSM, its value checked.
 fn stages(s: &[Fq], b: &[G1Affine]) -> MsmStages {
     let (r, st) = midnight_metal::msm_g1_stages(adapter::scalars(s), adapter::affine(b))
         .unwrap_or_else(|| panic!("msm_g1_stages declined an MSM of {}", s.len()));
@@ -165,27 +147,20 @@ fn stages(s: &[Fq], b: &[G1Affine]) -> MsmStages {
     st
 }
 
-/// The hook as the prover uses it: the device value, or the stock CPU MSM
-/// when it declines.
+/// The device value, or the stock CPU MSM when it declines.
 fn hook_or_stock(s: &[Fq], b: &[G1Affine]) -> G1Projective {
     midnight_metal::msm_g1(adapter::scalars(s), adapter::affine(b))
         .map_or_else(|| msm_pippenger(s, b), adapter::from_jacobian)
 }
 
-/// `msm_sized` on the caller's slice.
 fn sized(b: &[G1Affine]) -> bool {
     midnight_metal::msm_sized(b.len(), adapter::affine(b))
 }
 
-/// The decline reason of an MSM no registered table serves, with the
-/// one-shot path off (the default thresholds).
 const UNREGISTERED: &str = "unregistered-bases";
 
-/// The decline reason of a base outside G1 (`msm::BASES_REASON`).
-const BASES_REASON: &str = "bases-not-in-subgroup";
-
-/// Checks that `msm_g1` declines `unregistered-bases` (the only decline)
-/// with no device MSM, no table upload and no G1 check of the bases.
+/// `msm_g1` declines `unregistered-bases` only, with no device MSM, no table
+/// upload and no G1 check of the bases.
 fn declines_unregistered(what: &str, s: &[Fq], b: &[G1Affine]) {
     midnight_metal::reset_stats();
     let counts = midnight_metal::msm_counts();
@@ -223,32 +198,13 @@ fn cuda_mask_vector(n: usize) -> Vec<Scalar> {
     (0..n).map(|_| [next(), next(), next(), next() >> 3]).collect()
 }
 
-/// The mask vector of the device MSM as scalars (`mask_is_the_cuda_vector`
-/// checks it against the kernel).
 fn mask_fq(n: usize) -> Vec<Fq> {
     cuda_mask_vector(n).into_iter().map(adapter::from_scalar).collect()
 }
 
-/// The eight indices a sampled identity check of a table would read.
-fn sampled(n: usize) -> [usize; 8] {
-    [
-        0,
-        n / 7,
-        2 * n / 7,
-        3 * n / 7,
-        4 * n / 7,
-        5 * n / 7,
-        6 * n / 7,
-        n - 1,
-    ]
-}
-
-// ---------------------------------------------------------------------------
-// Curve kernels.
-
 type Xyzz = [u64; 24];
 
-/// Operation codes of `msm_test_g1` (msm_test.metal).
+// Operation codes of `msm_test_g1` (msm_test.metal).
 const OP_MADD: u32 = 0;
 const OP_ADD: u32 = 1;
 const OP_FROM_AFFINE: u32 = 2;
@@ -284,8 +240,7 @@ fn p1_of_affine(a: &G1AffineLimbs) -> blst_p1 {
     p
 }
 
-/// The XYZZ form of an affine point scaled by `z`: `(x z^2, y z^3, z^3,
-/// z^2)`; infinity is all zero.
+/// `(x z^2, y z^3, z^3, z^2)`; infinity is all zero.
 fn xyzz_of(a: &G1AffineLimbs, z: &blst_fp) -> Xyzz {
     let mut r = [0u64; 24];
     if a.iter().all(|&w| w == 0) {
@@ -300,8 +255,7 @@ fn xyzz_of(a: &G1AffineLimbs, z: &blst_fp) -> Xyzz {
     r
 }
 
-/// An XYZZ record as a blst point (`(X ZZ, Y ZZZ, ZZ)`); checks the
-/// representation invariants (`ZZ^3 = ZZZ^2`; infinity has both zero).
+/// An XYZZ record as a blst point, checking `ZZ^3 = ZZZ^2`.
 fn p1_of_xyzz(r: &Xyzz) -> blst_p1 {
     let (x, y, zzz, zz) = (fp(&r[..6]), fp(&r[6..12]), fp(&r[12..18]), fp(&r[18..]));
     let zz_zero = zz.l.iter().all(|&w| w == 0);
@@ -334,7 +288,6 @@ fn peq(a: &blst_p1, b: &blst_p1) -> bool {
     unsafe { blst_p1_is_equal(a, b) }
 }
 
-/// Runs `msm_test_g1` on the cases.
 fn g1_kernel(op: u32, a: &[Xyzz], b: &[Xyzz], b_aff: &[G1AffineLimbs], flags: &[u32]) -> Vec<Xyzz> {
     let n = a.len() as u32;
     let s = ctx::lock().unwrap();
@@ -365,8 +318,6 @@ fn g1_kernel(op: u32, a: &[Xyzz], b: &[Xyzz], b_aff: &[G1AffineLimbs], flags: &[
     out.as_slice::<Xyzz>().to_vec()
 }
 
-/// The additions of g1.h (with their doubling and opposite-point branches)
-/// and the affine conversion, against blst.
 #[test]
 fn g1_kernels_match_blst() {
     let _g = setup(Some(14), true);
@@ -377,7 +328,6 @@ fn g1_kernels_match_blst() {
     let lim = |p: &G1Affine| adapter::affine(std::slice::from_ref(p))[0];
     let inf = G1Affine::identity();
 
-    // (a, b) pairs: random, a + inf, inf + b, inf + inf, P + P, P + (-P).
     let mut pts_pairs: Vec<(G1Affine, G1Affine)> = Vec::new();
     for i in 0..32 {
         pts_pairs.push((pts[i], pts[i + 32]));
@@ -400,7 +350,6 @@ fn g1_kernels_match_blst() {
     let pa: Vec<blst_p1> = pairs.iter().map(|p| p1_of_affine(&p.0)).collect();
     let pb: Vec<blst_p1> = pairs.iter().map(|p| p1_of_affine(&p.1)).collect();
 
-    // the inputs themselves are what they claim
     for i in 0..m {
         assert!(peq(&p1_of_xyzz(&a[i]), &pa[i]), "input a {i}");
         assert!(peq(&p1_of_xyzz(&b[i]), &pb[i]), "input b {i}");
@@ -431,7 +380,6 @@ fn g1_kernels_match_blst() {
     for i in 0..m {
         assert!(peq(&p1_of_xyzz(&got[i]), &padd(&pa[i], &pb[i])), "add {i}");
     }
-    // an opposite pair gives infinity stored as all zero
     for (i, (pa, pb)) in pts_pairs.iter().enumerate() {
         if *pa != inf && *pb == -*pa {
             assert_eq!(got[i], [0u64; 24], "P + (-P) at {i}");
@@ -460,13 +408,7 @@ fn mask_is_the_cuda_vector() {
     assert!(want.iter().all(midnight_metal::field::is_reduced));
 }
 
-// ---------------------------------------------------------------------------
-// The MSM against the CPU.
-
-/// The sizes of the differential, `(log2 n, wbits of the device share)`:
-/// one per window width class the one-shot path takes with the CPU share
-/// (`split`) or without it. Width 15 is device only, in a release build;
-/// width 16 is in [`wide_windows_and_chunks_match_cpu`].
+/// `(log2 n, wbits)`: one size per window width class of the one-shot path.
 fn sizes(split: bool) -> &'static [(u32, u32)] {
     if split || cfg!(debug_assertions) {
         &[(14, 11), (16, 13)]
@@ -475,15 +417,9 @@ fn sizes(split: bool) -> &'static [(u32, u32)] {
     }
 }
 
-/// The differential set on the one-shot path, with the CPU share on or off.
-/// Every case spreads its special inputs (infinity points, equal and
-/// opposite points, repeated scalars) over all indices, so with the split
-/// both the device share and the CPU share hold them, and a point of one
-/// share repeats in the other (`odd[i] = odd[i / 2]`).
+/// Special inputs are spread over all indices so both shares of a split
+/// hold them, and `odd[i] = odd[i / 2]` repeats points across the shares.
 fn differential(split: bool) {
-    // an explicit threshold of 2^0: the cases whose effective size
-    // (non-zero scalars) is under the default thresholds, the all-zero one
-    // included, still run on the device
     let _g = setup(Some(0), split);
     midnight_metal::reset_stats();
     let all = points_cache();
@@ -509,7 +445,6 @@ fn differential(split: bool) {
         let repeated: Vec<Fq> = (0..n).map(|i| few[(i * 7 + i / 13) % few.len()]).collect();
         check("repeated", &repeated, bases);
 
-        // infinity points and repeated points (equal and opposite pairs)
         let mut odd = bases.to_vec();
         for i in (0..n).step_by(7) {
             odd[i] = G1Affine::identity();
@@ -539,9 +474,8 @@ fn msm_matches_cpu() {
     differential(false);
 }
 
-/// MSMs issued from rayon workers, as the prover issues them: from the
-/// global pool, and from a small pool whose every worker calls at once (they
-/// all wait on the device lock while the holder's CPU share runs).
+/// Every worker of a small pool waits on the device lock while the holder's
+/// CPU share runs on the same pool.
 #[test]
 fn msm_from_rayon_pool() {
     let _g = setup(Some(14), true);
@@ -558,8 +492,7 @@ fn msm_from_rayon_pool() {
     assert!(got == want);
 }
 
-/// Lengths that are not powers of two: below and above a multiple of 32
-/// (the chunk stride), below the plan table, and a split one.
+/// Around the chunk stride of 32, below the plan table, and a split one.
 #[test]
 fn msm_odd_lengths() {
     let _g = setup(Some(0), true);
@@ -567,7 +500,6 @@ fn msm_odd_lengths() {
     for n in [1usize, 2, 31, 33, 193, 1000, (1 << 14) + 5] {
         let s = random_scalars(n, n as u64);
         check("odd length", &s, &all[..n]);
-        // the one-shot path splits from 2^14 points
         assert_eq!(
             stages(&s, &all[..n]).device_points < n as u64,
             n >= 1 << 14,
@@ -576,10 +508,8 @@ fn msm_odd_lengths() {
     }
 }
 
-/// Scalars at the boundary of the `abs` step of `msm_digits`, given raw and
-/// as `B - mask_i` (so that the masked value on the device is `B`): `(r-1)/2`,
-/// `(r+1)/2`, `r-1`, `2^254 - 1` reduced, and two scalars whose top 32-bit
-/// limb equals (or is next to) that of `r - s`.
+/// Scalars at the boundary of the `abs` step of `msm_digits`, raw and as
+/// `B - mask_i` so the masked value on the device is `B`.
 #[test]
 fn abs_boundary_scalars_match_cpu() {
     let _g = setup(Some(0), true);
@@ -612,7 +542,6 @@ fn abs_boundary_scalars_match_cpu() {
                 &s,
                 bases,
             );
-            // the boundary values alone
             let s: Vec<Fq> = (0..n)
                 .map(|i| {
                     let b = boundary[i % boundary.len()];
@@ -628,10 +557,6 @@ fn abs_boundary_scalars_match_cpu() {
     }
 }
 
-/// The window widths 15 and 16 on a registered table with the CPU share,
-/// the second with two chunks (the command-buffer bound), and two chunks on
-/// the one-shot path; in a release build only (the `2^22` points and the CPU
-/// reference are slow in a debug build).
 #[test]
 fn wide_windows_and_chunks_match_cpu() {
     let _g = setup(Some(14), true);
@@ -653,7 +578,6 @@ fn wide_windows_and_chunks_match_cpu() {
     }
     drop(h);
 
-    // device only: 2^21 + 4096 points take the 2^21 entry and two chunks
     set_cpu_share(false);
     let m = (1usize << 21) + 4096;
     let st = stages(&scal[..m], &bases[..m]);
@@ -661,13 +585,8 @@ fn wide_windows_and_chunks_match_cpu() {
     assert_eq!((st.wbits, st.batches), (16, 2), "{st:?}");
 }
 
-/// `s_i = c - mask_i`: every masked scalar is `c`, so every point of a
-/// window falls into one bucket, summed by one GPU thread. Up to
-/// `HOT_BUCKET_LIMIT` (`2^16`) points per bucket the result is exact (`2^16`
-/// points: on a table, device only, exactly the limit; one-shot, 3/4 of
-/// it); above it the call declines `device-error` before the accumulation
-/// (`2^17` points: device shares of 54/64 and 52/64), and the stock MSM
-/// results.
+/// `s_i = c - mask_i` puts every point of a window in one bucket: exact up
+/// to `HOT_BUCKET_LIMIT` points, a `device-error` decline above it.
 #[test]
 fn hot_bucket_is_exact_or_declined() {
     let _g = setup(Some(14), true);
@@ -698,10 +617,7 @@ fn hot_bucket_is_exact_or_declined() {
     }
 }
 
-// ---------------------------------------------------------------------------
-// Admission: the effective size, unregistered bases, unequal lengths.
-
-/// `n` scalars, zero except `nz` of them (random, at spread positions).
+/// `n` scalars, zero except `nz` of them at spread positions.
 fn sparse_scalars(n: usize, nz: usize, seed: u64) -> Vec<Fq> {
     let mut s = vec![Fq::ZERO; n];
     let mut rng = ChaCha8Rng::seed_from_u64(seed);
@@ -712,8 +628,7 @@ fn sparse_scalars(n: usize, nz: usize, seed: u64) -> Vec<Fq> {
     s
 }
 
-/// The device MSM, or `None` when it declined; panics on any decline other
-/// than `below-min-k`, and checks a decline left the counters unchanged.
+/// The device MSM, or `None` on a `below-min-k` decline with no device work.
 fn try_device_msm(s: &[Fq], b: &[G1Affine]) -> Option<G1Projective> {
     midnight_metal::reset_stats();
     let counts = midnight_metal::msm_counts();
@@ -728,7 +643,6 @@ fn try_device_msm(s: &[Fq], b: &[G1Affine]) -> Option<G1Projective> {
                 vec![("msm", "below-min-k", 1)],
                 "only a below-min-k decline"
             );
-            // no device work: no table upload, no MSM of either path
             assert_eq!(midnight_metal::msm_counts(), counts);
             assert_eq!(midnight_metal::stats().msm.served, 0);
             None
@@ -736,10 +650,8 @@ fn try_device_msm(s: &[Fq], b: &[G1Affine]) -> Option<G1Projective> {
     }
 }
 
-/// The sparse rule: with the default thresholds, `2^12 + n/5` non-zero
-/// scalars on a registered table, a decline `below-min-k` below it, and no
-/// MSM at all without a table; an explicit threshold replaces the need by
-/// `2^k` on both paths.
+/// With the defaults a table needs `2^12 + n/5` non-zero scalars; an
+/// explicit threshold needs `2^k` on both paths.
 #[test]
 fn sparse_msm_declines_below_min_k() {
     let _g = setup(None, true);
@@ -755,13 +667,10 @@ fn sparse_msm_declines_below_min_k() {
         assert!(got == msm_pippenger(&s, bases), "{nz}");
     };
 
-    // without a table: every MSM declines `unregistered-bases`, sparse or
-    // dense, before any scan of the scalars
     for nz in [0, 2, 11, n / 3, n] {
         declines_unregistered(&format!("{nz}"), &sparse_scalars(n, nz, nz as u64), bases);
     }
 
-    // a registered table: its own need
     let h = midnight_metal::register_srs(adapter::affine(bases));
     for nz in [2, 1 << t.msm_table, need - 1] {
         assert!(
@@ -771,9 +680,8 @@ fn sparse_msm_declines_below_min_k() {
     }
     served(need, 6);
 
-    // at the table threshold: a dense MSM with a few zero scalars (a column
-    // with zero rows before its blinding rows) is served, a half-zero one is
-    // not; the multi-open's length m - 1 is in the class of m
+    // a column with zero rows before its blinding rows; the multi-open's
+    // length m - 1
     let m = 1usize << t.msm_table;
     for len in [m, m - 1] {
         let mut s = random_scalars(len, 13);
@@ -785,7 +693,6 @@ fn sparse_msm_declines_below_min_k() {
     }
     assert!(try_device_msm(&sparse_scalars(m, m / 2, 14), &bases[..m]).is_none());
 
-    // an explicit threshold replaces the need: 2^k alone, on both paths
     assert!(midnight_metal::set_min_k(14));
     served(1 << 14, 7);
     assert!(try_device_msm(&sparse_scalars(n, (1 << 14) - 1, 8), bases).is_none());
@@ -794,11 +701,6 @@ fn sparse_msm_declines_below_min_k() {
     assert!(try_device_msm(&sparse_scalars(n, (1 << 14) - 1, 10), bases).is_none());
 }
 
-/// With the default thresholds an MSM on bases no registered table serves
-/// declines `unregistered-bases` with no device MSM and no G1 check, and the
-/// stock value results; once the slice is registered the device serves it
-/// from the table, still with no per-call G1 check; dropped, it declines
-/// again. `msm_sized` agrees in each case.
 #[test]
 fn unregistered_bases_decline_by_default() {
     let _g = setup(None, true);
@@ -810,12 +712,10 @@ fn unregistered_bases_decline_by_default() {
     let bases = &points_cache()[..n];
     let s = random_scalars(n, 516);
 
-    // never registered
     assert!(!sized(bases));
     declines_unregistered("unregistered", &s, bases);
     assert!(hook_or_stock(&s, bases) == msm_pippenger(&s, bases));
 
-    // registered: served from the table
     let h = midnight_metal::register_srs(adapter::affine(bases));
     assert!(sized(bases));
     let checks = midnight_metal::one_shot_g1_checks();
@@ -826,16 +726,12 @@ fn unregistered_bases_decline_by_default() {
     assert_eq!(midnight_metal::one_shot_g1_checks(), checks);
     drop(h);
 
-    // dropped: unregistered again
     assert!(!sized(bases));
     declines_unregistered("dropped", &s, bases);
 }
 
-/// Points at infinity among the bases, every scalar non-zero, on the
-/// one-shot and the table paths (the G1 check takes infinity); and unequal
-/// lengths decline `shape`.
 #[test]
-fn infinity_bases_and_unequal_lengths() {
+fn infinity_bases_and_malformed_calls() {
     let _g = setup(Some(14), true);
     let n = 1usize << 14;
     let mut bases = points_cache()[..n].to_vec();
@@ -862,16 +758,16 @@ fn infinity_bases_and_unequal_lengths() {
         );
         assert_eq!(midnight_metal::declines(), vec![("msm", "shape", 1)]);
     }
+    let mut unreduced = adapter::scalars(&s).to_vec();
+    unreduced[7] = midnight_metal::field::FR_MODULUS;
+    midnight_metal::reset_stats();
+    assert!(midnight_metal::msm_g1(&unreduced, adapter::affine(&bases)).is_none());
+    assert_eq!(midnight_metal::declines(), vec![("msm", "unreduced", 1)]);
     drop(h);
 }
 
-// ---------------------------------------------------------------------------
-// Registered tables.
-
-/// A registered table serves its prefixes: the first MSM uploads it, a
-/// second MSM of the same length has `MSM(r)` cached (one pass), and a
-/// longer prefix and the whole slice split with the CPU (the device takes a
-/// prefix of the table, the CPU the caller's points after it).
+/// The first MSM uploads the table, the second has `MSM(r)` cached (one
+/// pass), and longer prefixes split with the CPU.
 #[test]
 fn registered_table_prefixes() {
     let _g = setup(Some(14), true);
@@ -901,13 +797,9 @@ fn registered_table_prefixes() {
     drop(handle);
 }
 
-/// A registered table whose memory changed at ONE point that a sampled
-/// check would not read: every point is compared, so the table is dropped
-/// (counted stale). With the default thresholds the call then declines
-/// `unregistered-bases` with no device MSM and no G1 check (whether
-/// `msm_sized` or `msm_g1` finds it stale), and the stock MSM on the current
-/// points results; with an explicit threshold the one-shot path serves it,
-/// its G1 check included, on the whole slice and on a prefix.
+/// A table changed at one point a sampled check would not read is dropped:
+/// with the defaults the call declines, with an explicit threshold the
+/// one-shot path serves it.
 #[test]
 fn stale_table_declines_by_default_and_one_shot_when_explicit() {
     let _g = setup(None, true);
@@ -918,9 +810,7 @@ fn stale_table_declines_by_default_and_one_shot_when_explicit() {
     let fresh = random_points(3, 4711);
     let s = random_scalars(n, 4712);
     let i = 3 * n / 7 + 5;
-    assert!(!sampled(n).contains(&i));
 
-    // the defaults, `msm_sized` first
     let mut bases = points_cache()[..n].to_vec();
     let h = midnight_metal::register_srs(adapter::affine(&bases));
     check("table", &s, &bases);
@@ -933,7 +823,6 @@ fn stale_table_declines_by_default_and_one_shot_when_explicit() {
     assert_eq!(midnight_metal::srs_stale(), stale + 1);
     drop(h);
 
-    // the defaults, `msm_g1`'s own lookup drops the table
     let mut bases = points_cache()[..n].to_vec();
     let h = midnight_metal::register_srs(adapter::affine(&bases));
     bases[i] = fresh[1];
@@ -943,7 +832,6 @@ fn stale_table_declines_by_default_and_one_shot_when_explicit() {
     assert!(!sized(&bases));
     drop(h);
 
-    // an explicit threshold: the one-shot path, with its per-call G1 check
     assert!(midnight_metal::set_min_k(14));
     let mut bases = points_cache()[..n].to_vec();
     let h = midnight_metal::register_srs(adapter::affine(&bases));
@@ -959,14 +847,12 @@ fn stale_table_declines_by_default_and_one_shot_when_explicit() {
     assert_eq!(midnight_metal::one_shot_g1_checks(), checks + 1);
     drop(h);
 
-    // an explicit threshold, one point of a served prefix changed
     let mut bases = points_cache()[..n].to_vec();
     let h = midnight_metal::register_srs(adapter::affine(&bases));
     let m = 1usize << 14;
     let s = random_scalars(m, 62);
     check("prefix", &s, &bases[..m]);
     let j = 2 * m / 7 + 3;
-    assert!(!sampled(m).contains(&j));
     bases[j] = fresh[2];
     let stale = midnight_metal::srs_stale();
     let (c0, o0, u0) = midnight_metal::msm_counts();
@@ -976,11 +862,6 @@ fn stale_table_declines_by_default_and_one_shot_when_explicit() {
     drop(h);
 }
 
-/// `msm_g1_sized` gives `msm_sized` of the call with the result of `msm_g1`,
-/// from one lookup: on bases never registered (not sized, declined), on a
-/// registered table (sized, the stock value), on a table changed at one
-/// point (not sized, declined, the table dropped once) and with unequal
-/// lengths (not sized, `shape`).
 #[test]
 fn msm_g1_sized_reports_both_entries() {
     let _g = setup(None, true);
@@ -1019,8 +900,7 @@ fn msm_g1_sized_reports_both_entries() {
     assert_eq!(midnight_metal::declines(), vec![("msm", "shape", 1)]);
 }
 
-/// A point on the curve `y^2 = x^3 + 4` outside the prime-order subgroup (no
-/// cofactor clearing), as limbs.
+/// A point on the curve outside the prime-order subgroup.
 fn non_subgroup_point() -> G1AffineLimbs {
     use blst::{
         blst_fp_add, blst_fp_from_uint64, blst_fp_sqrt, blst_p1_affine_in_g1,
@@ -1063,10 +943,6 @@ fn affine_of(l: G1AffineLimbs) -> G1Affine {
     unsafe { std::mem::transmute::<G1AffineLimbs, G1Affine>(l) }
 }
 
-/// A base on the curve but outside G1, with the scalar `r - 1` or one above
-/// `r / 2`, registered and not: the call declines with no device MSM (the
-/// stock MSM then runs) and the decline is counted; so does a base off the
-/// curve. A prefix of the table that stops before the bad point is served.
 #[test]
 fn bases_outside_g1_decline() {
     let _g = setup(Some(14), true);
@@ -1090,21 +966,19 @@ fn bases_outside_g1_decline() {
                 assert!(got.is_none(), "{case}");
                 assert_eq!(
                     midnight_metal::declines(),
-                    vec![("msm", BASES_REASON, 1)],
+                    vec![("msm", "bases-not-in-subgroup", 1)],
                     "{case}"
                 );
                 assert_eq!(midnight_metal::stats().msm.served, 0, "{case}");
                 assert_eq!(midnight_metal::msm_counts(), counts, "{case}");
                 drop(h);
             }
-            // the reference the caller falls back to runs on this input (in a
-            // release build: a debug build of midnight-curves asserts that
-            // every point it converts is in the subgroup)
+            // the fallback runs on this input (a debug build of
+            // midnight-curves asserts every point is in the subgroup)
             if what == "not in the subgroup" && !cfg!(debug_assertions) {
                 let _ = msm_pippenger(&s, &bases);
             }
         }
-        // a prefix of the registered table before the bad point is served
         assert!(midnight_metal::set_min_k(0));
         let h = midnight_metal::register_srs(adapter::affine(&bases));
         let s = random_scalars(k, 73);
@@ -1114,24 +988,7 @@ fn bases_outside_g1_decline() {
     }
 }
 
-// ---------------------------------------------------------------------------
-// The hook.
-
-/// Installs the MSM hook (once per process).
-fn install_hooks() {
-    static ONCE: OnceLock<()> = OnceLock::new();
-    ONCE.get_or_init(|| {
-        assert!(install(GpuHooks {
-            msm_g1: Some(midnight_metal::msm_g1),
-            ..Default::default()
-        }));
-    });
-}
-
-/// KZG commitments through the hook with the default thresholds on a
-/// registered SRS: a sparse polynomial declines `below-min-k` and a dense one
-/// is served, each equal to the stock commitment; a suspended hook serves
-/// nothing.
+/// KZG commitments through the hook equal the stock ones, served or not.
 #[test]
 fn hook_commitment_matches_stock() {
     let _g = setup(None, true);
@@ -1143,7 +1000,10 @@ fn hook_commitment_matches_stock() {
     let params = ParamsKZG::<Bls12>::unsafe_setup(K, &mut rng);
     let h = midnight_metal::register_srs(adapter::affine(params.bases::<Coeff>()));
     let domain = EvaluationDomain::<Fq>::new(1, K);
-    install_hooks();
+    assert!(install(GpuHooks {
+        msm_g1: Some(midnight_metal::msm_g1),
+        ..Default::default()
+    }));
     let label = || PolynomialLabel::Custom("p".into());
     for (nz, device) in [(5usize, false), (1usize << K, true)] {
         let mut poly = domain.empty_coeff();

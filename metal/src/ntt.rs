@@ -11,73 +11,23 @@
 // See the License for the specific language governing permissions and
 // limitations under the License.
 
-//! The scalar-field NTT on the device, and the device-side building blocks
-//! of the coset transforms (for the quotient).
+//! The scalar-field NTT on the device, and device-side building blocks of the
+//! coset transforms for the quotient.
 //!
-//! # Entry points
+//! [`fft`] and [`ifft`] take only the standard `2^log_n`-th root of unity (as
+//! `EvaluationDomain` derives it) or its inverse; any other root declines
+//! `shape`.
 //!
-//! [`crate::fft`] / [`crate::ifft`] have admitted the call (`a.len() ==
-//! 2^log_n`, `1 <= log_n <= MAX_LOG_N`, `log_n` at least the class's
-//! threshold of [`crate::thresholds`], a usable device, `a`, `omega` and the
-//! divisor reduced) before they call [`fft`] / [`ifft`]. Those take only the
-//! standard `2^log_n`-th root of unity of `Fr` (`ROOT_OF_UNITY` squared `32 -
-//! log_n` times, as `EvaluationDomain` derives it) or its inverse, and decline
-//! `shape` for any other root. Each ends with exactly one of `account::served`
-//! or `account::decline`, and writes `a` only with the complete result, after
-//! the last command buffer has completed. Field arithmetic is exact, so the
-//! device value is the stock value bit for bit.
+//! The kernel (`shaders/ntt.metal`) is a Stockham transform with natural
+//! order in and out: `ceil(log_n / 10)` passes of near-equal radix up to
+//! `2^10`, each done in threadgroup memory (32 KiB holds 1024 elements).
+//! The transform is bound by field multiplications, not memory, so the design
+//! minimises passes. Passes ping-pong with a scratch buffer, and an inverse
+//! transform's divisor is folded into the last pass.
 //!
-//! # Algorithm (`shaders/ntt.metal`)
-//!
-//! A Stockham transform: `ceil(log_n / 10)` passes of near-equal radix
-//! `2^d` (`d <= 10`). A pass is one threadgroup per `2^10` elements (one or
-//! more strided columns of `2^d`), one thread per four elements; it loads
-//! its columns into threadgroup memory with the inter-pass factors applied,
-//! runs a radix-2 decimation in frequency there and writes the outputs in
-//! natural order. Natural order in and out: no bit-reversal pass. Passes
-//! ping-pong between the data buffer and a scratch buffer of the same
-//! length; the last pass reads and writes the same positions, so it runs in
-//! place when the ping-pong would end in the scratch. An inverse transform's
-//! divisor is folded into the last pass (a scaled copy of one twiddle
-//! table), so it costs no extra pass.
-//!
-//! Why (measured on an M4 Max): the transform is bound by field
-//! multiplications, not memory (`2^24` moves about 60 GB/s), so the design
-//! minimises multiplications and passes. The
-//! threadgroup memory (32 KiB, 1024 elements) bounds the radix; two passes
-//! cover `2^20`, three `2^28`. One thread per four elements beat 32 to 256
-//! threads per group and smaller groups; a radix-4 variant holding four
-//! elements in registers (two stages per exchange) was slower at every size,
-//! by up to 45 % at `2^20`.
-//!
-//! Twiddles: per direction, `w_{2^16}^j` (`j < 2^16`) and `w_{2^28}^j`
-//! (`j < 2^12`) serve every size up to `2^28`: a local butterfly reads one
-//! entry, an inter-pass factor one entry while the pass spans at most
-//! `2^16` points and the product of two above. They are public, made at the
-//! first use and kept on the device for the life of the process (2 MiB, one
-//! set for all sizes). A larger high table (up to `2^20`) gained under 1 %.
-//!
-//! A large transform is split into several command buffers (at most about
-//! [`RUN_BUDGET`] field multiplications each, a fraction of a second).
-//!
-//! # Building blocks for the quotient
-//!
-//! The `pub(crate)` functions [`ntt_dev`], [`coeff_to_extended_dev_at`],
-//! [`divide_extended_to_coeff_dev`], [`encode_distribute_zeta`] and
-//! [`encode_mul_periodic`] work on [`Buffer`]s already on the device and
-//! read nothing back. The caller holds the device ([`ctx::lock`]) for the
-//! whole sequence. They mirror `mgpu_ntt_dev`, `mgpu_coeff_to_extended_dev`,
-//! `mgpu_distribute_zeta_dev`, `mgpu_scale_dev` and `mgpu_mul_periodic_dev`
-//! of the CUDA crate.
-//!
-//! Their contract: every element of the device data and every scalar
-//! argument (a divisor, a scale, a `zeta` pair) is reduced (below `r`), the
-//! field arithmetic of the kernels being exact only on reduced inputs. A
-//! scalar argument that is not reduced is an [`Error::Unreduced`] before any
-//! device work; the element data is not checked (it is on the device), so
-//! the caller checks it before upload. After any `Err` the contents of the
-//! data buffer (and of the scratch) are undefined: a job of several command
-//! buffers may have transformed it in part.
+//! Twiddles: per direction, `w_{2^16}^j` and `w_{2^28}^j` (`j < 2^12`) serve
+//! every size up to `2^28` with at most one product per factor. They are
+//! public and stay on the device for the life of the process.
 
 use std::sync::{Mutex, OnceLock};
 
@@ -96,8 +46,7 @@ const SCALAR_BYTES: usize = 32;
 /// `2^S` is the largest power of two dividing `r - 1`.
 const S: u32 = 32;
 
-/// `ROOT_OF_UNITY` of `midnight_curves::Fq` (the `2^S`-th root of unity),
-/// Montgomery limbs. The tests check it against midnight-curves.
+/// `ROOT_OF_UNITY` of `midnight_curves::Fq`, Montgomery limbs.
 const ROOT_OF_UNITY: Scalar = [
     0xb9b5_8d8c_5f0e_466a,
     0x5b1b_4c80_1819_d7ec,
@@ -113,9 +62,8 @@ const _: () = assert!(MAX_LOG_N <= UNIVERSAL_LOG);
 /// low table (`w_{2^28}^j`) has `2^(28 - HI_BITS)` elements.
 const HI_BITS: u32 = 16;
 
-/// Bytes of the scaled low twiddle table (`2^(UNIVERSAL_LOG - HI_BITS)`
-/// elements) that a transform with a divisor allocates for its call. The
-/// quotient's memory need counts it from here.
+/// Bytes of the scaled low twiddle table a transform with a divisor
+/// allocates; the quotient's memory need counts it.
 pub(crate) const SCALE_TABLE_BYTES: usize = SCALAR_BYTES << (UNIVERSAL_LOG - HI_BITS);
 
 /// The largest radix (log2) of a pass: `2^MAX_PASS_LOG` elements fill a
@@ -125,9 +73,8 @@ const MAX_PASS_LOG: u32 = 10;
 /// Log2 of the elements one threadgroup holds (radix times columns).
 const GROUP_LOG: u32 = 10;
 
-/// Estimated field multiplications per command buffer: about 0.35 s at the
-/// 4 to 5 G multiplications per second the passes reach on an M4 Max. A
-/// pass is never split, so from `2^27` each command buffer holds one pass.
+/// Field multiplications per command buffer, a fraction of a second of GPU
+/// time. A pass is never split.
 const RUN_BUDGET: u64 = 1_500_000_000;
 
 /// The direction of a transform.
@@ -310,16 +257,13 @@ fn group_columns_log(log_n: u32, r: u32) -> u32 {
     GROUP_LOG.saturating_sub(r).min(log_n - r)
 }
 
-/// The threads of one threadgroup of a pass holding `2^e_log` elements: one
-/// thread per four elements (two butterflies of each stage), the best of 32
-/// to 256 threads per 1024 elements measured on an M4 Max.
+/// Threads of one threadgroup of a pass holding `2^e_log` elements: one per
+/// four elements, the measured best.
 fn group_threads(e_log: u32) -> usize {
     1usize << e_log.saturating_sub(2)
 }
 
-/// The threadgroup size of each `ntt_pass` dispatch of a `2^log_n`
-/// transform (the tests hold the pipeline's `maxTotalThreadsPerThreadgroup`
-/// to it: a smaller maximum would decline every such transform).
+/// The threadgroup size of each `ntt_pass` dispatch of a `2^log_n` transform.
 #[cfg(test)]
 pub(crate) fn pass_group_threads(log_n: u32) -> Vec<usize> {
     plan(log_n)
@@ -328,9 +272,8 @@ pub(crate) fn pass_group_threads(log_n: u32) -> Vec<usize> {
         .collect()
 }
 
-/// The scratch a [`ntt_dev`] or [`coeff_to_extended_dev`] of `2^log_n`
-/// elements needs, in bytes: none for a one-pass size (`log_n <= 10`), else
-/// a buffer of the transform's length.
+/// Scratch bytes of a [`ntt_dev`] or [`coeff_to_extended_dev_at`] of `2^log_n`:
+/// none for one pass (`log_n <= 10`), else the transform's length.
 pub(crate) fn scratch_bytes(log_n: u32) -> usize {
     if plan(log_n).len() > 1 {
         SCALAR_BYTES << log_n
@@ -353,14 +296,12 @@ struct Job<'b> {
     /// The divisor folded into the last pass.
     scale: Option<Scalar>,
     /// `(n_src, [z1, z2])`: the first pass reads `src` as coeff_to_extended
-    /// does (index `i < n_src` times `[1, z1, z2][i mod 3]`, zero beyond).
+    /// does: `src[i] * [1, z1, z2][i mod 3]` for `i < n_src`, zero beyond.
     coset: Option<(usize, [Scalar; 2])>,
     /// `(t, log_tn)`: before the first pass, `src[i] *= t[i mod 2^log_tn]`
-    /// ([`encode_mul_periodic`], in the first command buffer; `src` is then
-    /// `dst` at offset 0).
+    /// (`src` is then `dst` at offset 0).
     pre_mul: Option<(&'b Buffer, u32)>,
-    /// After the last pass, `dst[i] *= [1, z1, z2][i mod 3]`
-    /// ([`encode_distribute_zeta`], in the last command buffer).
+    /// After the last pass, `dst[i] *= [1, z1, z2][i mod 3]`.
     post_zeta: Option<[Scalar; 2]>,
 }
 
@@ -379,13 +320,9 @@ fn check_len(b: &Buffer, elems: usize, what: &str) -> Result<(), Error> {
 /// A buffer and a byte offset in it.
 type At<'b> = (&'b Buffer, usize);
 
-/// Checks the scalar arguments, the size and the buffers of `job` before
-/// any device work.
-///
-/// Every by-value scalar of the job (the scale, the coset's `z1`, `z2`, the
-/// final `zeta`) must be reduced: one that is not is an
-/// [`Error::Unreduced`] (the kernels' arithmetic silently mis-computes on
-/// such inputs).
+/// Checks the scalar arguments, size and buffers of `job` before any device
+/// work. An unreduced scalar is [`Error::Unreduced`]: the kernels silently
+/// mis-compute on such inputs.
 fn check_job(job: &Job<'_>) -> Result<(), Error> {
     let by_value = job
         .scale
@@ -435,9 +372,8 @@ fn check_job(job: &Job<'_>) -> Result<(), Error> {
     }
 }
 
-/// The (input, output) of each of `passes` passes: the passes before the
-/// last alternate between `tmp` and `dst` (never writing their own input);
-/// the last pass writes `dst`, in place when its input is `dst` already.
+/// The (input, output) of each pass: passes alternate between `tmp` and
+/// `dst`, never writing their own input; the last writes `dst`.
 fn pass_io<'b>(job: &Job<'b>, passes: usize) -> Vec<(At<'b>, At<'b>)> {
     let mut cur = (job.src, 0);
     (0..passes)
@@ -508,12 +444,8 @@ fn run_end(params: &[PassParams], q: usize, n: usize) -> usize {
     end
 }
 
-/// Runs the passes of `job`, in as many command buffers as [`RUN_BUDGET`]
+/// Runs the passes of `job` in as many command buffers as [`RUN_BUDGET`]
 /// asks. Returns the GPU time.
-///
-/// The checks of [`check_job`] come first. After an `Err` from a later step
-/// the contents of `dst` (and `tmp`) are undefined: the command buffers that
-/// completed before the failure have transformed it in part.
 fn run_job(ctx: &Ctx, job: &Job<'_>) -> Result<u64, Error> {
     check_job(job)?;
     let n = 1usize << job.log_n;
@@ -523,9 +455,8 @@ fn run_job(ctx: &Ctx, job: &Job<'_>) -> Result<u64, Error> {
     let d = job.dir.index();
     let hi = &tables.hi[d];
 
-    // the divisor, folded into the low table of the last pass (a scaled copy
-    // made in the first command buffer; the quotient's memory need counts
-    // its size, `SCALE_TABLE_BYTES`)
+    // the divisor is folded into a scaled copy of the low table, made in the
+    // first command buffer
     let scaled = match job.scale {
         Some(_) => Some(ctx.alloc_pooled(SCALE_TABLE_BYTES)?),
         None => None,
@@ -590,22 +521,15 @@ fn run_job(ctx: &Ctx, job: &Job<'_>) -> Result<u64, Error> {
 // ---------------------------------------------------------------------------
 // Building blocks (device buffers, nothing read back)
 //
-// Contract of each: the elements of the data must already be reduced, and
-// every scalar argument too (an unreduced one is `Error::Unreduced`, with no
-// device work). After an `Err` the contents of the data buffer (and of the
-// scratch) are undefined: a transform of several command buffers may have
-// transformed it in part.
+// The caller holds the device for the whole sequence. The data must already
+// be reduced, and so must every scalar argument (else `Error::Unreduced`
+// before any device work). After an `Err` the data and scratch are undefined:
+// earlier command buffers may have transformed them in part.
 
-/// The NTT of the first `2^log_n` elements of `a`, in place, natural order:
-/// at the standard root `w_n` (`Dir::Forward`) or `w_n^-1`
-/// (`Dir::Inverse`), then every element times `scale` if given (folded into
-/// the last pass). `tmp` is scratch of at least [`scratch_bytes`]`(log_n)`
-/// bytes (not read for `log_n <= 10`; it may then be `a` itself); its
-/// contents afterwards are intermediate values. `1 <= log_n <= 28`.
-///
-/// Runs one or more command buffers and returns the GPU time in
-/// nanoseconds. The CUDA counterpart is `mgpu_ntt_dev` (plus
-/// `mgpu_scale_dev`).
+/// The NTT of the first `2^log_n` elements of `a`, in place, natural order,
+/// at `w_n` or `w_n^-1`, then times `scale` if given. `tmp` is scratch of at
+/// least [`scratch_bytes`]`(log_n)` bytes (unused, and may be `a`, for
+/// `log_n <= 10`). Returns the GPU time.
 pub(crate) fn ntt_dev(
     ctx: &Ctx,
     a: &Buffer,
@@ -631,18 +555,11 @@ pub(crate) fn ntt_dev(
     )
 }
 
-/// `coeff_to_extended` on the device: `2^ext_k` elements of `dst` from the
-/// byte offset `dst_off` (a multiple of 32, so that a coset is written
-/// straight into its place in a larger buffer) = the forward NTT at the
-/// standard `2^ext_k` root of `src[i] * [1, zeta[0], zeta[1]][i mod 3]` for
-/// `i < 2^k`, zero-padded to `2^ext_k`. `src` (at least `2^k` elements) is
-/// not modified; the distribution and the padding happen inside the first
-/// pass, with no extra pass. `tmp` is scratch of at least
-/// [`scratch_bytes`]`(ext_k)` bytes. `1 <= k <= ext_k <= 28`. `zeta` is
-/// `[g_coset, g_coset_inv]` of the domain (`coset_zetas`).
-///
-/// Returns the GPU time. The CUDA counterpart is
-/// `mgpu_coeff_to_extended_dev`.
+/// `coeff_to_extended` on the device: writes `2^ext_k` elements of `dst` from
+/// byte offset `dst_off` (a multiple of 32, so a coset lands in place in a
+/// larger buffer): the forward NTT of `src[i] * [1, zeta[0], zeta[1]][i mod 3]`
+/// for `i < 2^k`, zero-padded. The distribution and padding happen in the
+/// first pass. `zeta` is `[g_coset, g_coset_inv]`. Returns the GPU time.
 #[allow(clippy::too_many_arguments)]
 pub(crate) fn coeff_to_extended_dev_at(
     ctx: &Ctx,
@@ -681,12 +598,9 @@ pub(crate) fn coeff_to_extended_dev_at(
     )
 }
 
-/// `extended_to_coeff` on the device, in place on `a[..2^ext_k]`: the NTT at
-/// `w^-1` of the `2^ext_k` domain, every element times `divisor` (the
-/// domain's `extended_ifft_divisor`, folded into the last pass), then
-/// [`encode_distribute_zeta`] with `zeta_out` (`[g_coset_inv, g_coset]`, in
-/// the last command buffer of the transform). `tmp` as for [`ntt_dev`].
-/// Returns the GPU time.
+/// `extended_to_coeff` in place on `a[..2^ext_k]`: the inverse NTT times
+/// `divisor`, then [`encode_distribute_zeta`] with `zeta_out`. Returns the GPU
+/// time.
 #[cfg(any(test, feature = "test-support"))]
 pub(crate) fn extended_to_coeff_dev(
     ctx: &Ctx,
@@ -713,12 +627,9 @@ pub(crate) fn extended_to_coeff_dev(
     )
 }
 
-/// [`encode_mul_periodic`] of `a` by `t` (`2^log_tn` elements: the division
-/// by the vanishing polynomial), then `extended_to_coeff` on the device (the
-/// NTT at `w^-1` of the `2^ext_k` domain, every element times `divisor`,
-/// then [`encode_distribute_zeta`] with `zeta_out`), with the multiplication
-/// in the transform's first command buffer and the distribution in its last.
-/// The elements of `t` must be reduced too. Returns the GPU time.
+/// [`encode_mul_periodic`] by `t` (the division by the vanishing polynomial),
+/// then `extended_to_coeff` as [`extended_to_coeff_dev`], fused into the same
+/// command buffers. `t` must be reduced too. Returns the GPU time.
 #[allow(clippy::too_many_arguments)]
 pub(crate) fn divide_extended_to_coeff_dev(
     ctx: &Ctx,
@@ -747,8 +658,7 @@ pub(crate) fn divide_extended_to_coeff_dev(
     )
 }
 
-/// The length check of an elementwise block: `a` holds `n <= 2^MAX_LOG_N`
-/// scalars.
+/// Checks that `a` holds `n <= 2^MAX_LOG_N` scalars.
 fn elementwise_len(a: &Buffer, n: usize) -> Result<(), Error> {
     check_len(a, n, "data")?;
     if n > 1usize << MAX_LOG_N {
@@ -768,10 +678,8 @@ static MASKS: [u32; 32] = {
     m
 };
 
-/// Encodes `a[i] *= [1, zeta[0], zeta[1]][i mod 3]` for `i < n` into `cmd`
-/// (`distribute_powers_zeta`). `zeta` must be reduced
-/// ([`Error::Unreduced`] otherwise, nothing encoded). The CUDA counterpart is
-/// `mgpu_distribute_zeta_dev`.
+/// Encodes `a[i] *= [1, zeta[0], zeta[1]][i mod 3]` for `i < n`. `zeta` must be
+/// reduced.
 pub(crate) fn encode_distribute_zeta<'a>(
     cmd: &mut Command<'a>,
     a: &'a Buffer,
@@ -789,9 +697,7 @@ pub(crate) fn encode_distribute_zeta<'a>(
     )
 }
 
-/// Encodes `a[i] *= c` for `i < n` into `cmd`. `c` must be reduced
-/// ([`Error::Unreduced`] otherwise, nothing encoded). The CUDA counterpart
-/// is `mgpu_scale_dev`.
+/// Encodes `a[i] *= c` for `i < n`. `c` must be reduced.
 #[cfg(any(test, feature = "test-support"))]
 pub(crate) fn encode_scale<'a>(
     cmd: &mut Command<'a>,
@@ -806,11 +712,8 @@ pub(crate) fn encode_scale<'a>(
     cmd.dispatch("ntt_scale", n, &[Arg::Buffer(a), Arg::value(c)])
 }
 
-/// Encodes `a[i] *= t[i mod 2^log_tn]` for `i < n` into `cmd`, `t` a buffer
-/// of at least `2^log_tn` elements (`divide_by_vanishing_poly`: `t` the
-/// inverse evaluations of the vanishing polynomial on the coset, whose count
-/// `2^(ext_k - k)` is a power of two, and the stock code indexes them with
-/// `i & (len - 1)`). The CUDA counterpart is `mgpu_mul_periodic_dev`.
+/// Encodes `a[i] *= t[i mod 2^log_tn]` for `i < n`, as
+/// `divide_by_vanishing_poly` does with its power-of-two table.
 pub(crate) fn encode_mul_periodic<'a>(
     cmd: &mut Command<'a>,
     a: &'a Buffer,
@@ -837,12 +740,10 @@ pub(crate) fn encode_mul_periodic<'a>(
 // ---------------------------------------------------------------------------
 // Host transforms
 
-/// The transform of a host slice through per-request buffers (`ntt-data`,
-/// and `ntt-scratch` above one pass) that the call takes for itself
-/// ([`ctx::take_request_buffer`]): the copies in and out run without the
-/// device, so the copies of calls made from several threads overlap the
-/// device work of the others. `a` is written only after every command
-/// buffer has completed. Returns the GPU time.
+/// The transform of a host slice through per-request buffers taken without
+/// the device ([`ctx::take_request_buffer`]), so the host copies of calls on
+/// several threads overlap each other's device work. `a` is written only after
+/// every command buffer completed. Returns the GPU time.
 fn transform_host(
     class: Class,
     a: &mut [Scalar],
@@ -859,8 +760,7 @@ fn transform_host(
     } else {
         None
     };
-    // the test panic comes with the request buffers taken and filled, and
-    // `a` unchanged
+    // the test panic fires with the request buffers filled and `a` unchanged
     crate::test_switch::hook_panic(class);
     let ns = {
         let _device = ctx::lock()?;
@@ -918,8 +818,8 @@ pub(crate) fn ifft(a: &mut [Scalar], omega_inv: Scalar, log_n: u32, divisor: Sca
 // ---------------------------------------------------------------------------
 // Test support
 
-/// Host-to-host wrappers of the device building blocks, for the crate's
-/// integration tests (feature `test-support`; not a stable interface).
+/// Host-to-host wrappers of the device building blocks (not a stable
+/// interface).
 #[cfg(any(test, feature = "test-support"))]
 pub mod test_support {
     use super::*;
@@ -990,9 +890,8 @@ pub mod test_support {
         })
     }
 
-    /// The elementwise blocks on a copy of `values`, in one command buffer:
-    /// [`encode_distribute_zeta`] with `zeta`, then [`encode_scale`] by `c`,
-    /// then [`encode_mul_periodic`] with `table` (a power-of-two length).
+    /// The elementwise blocks on a copy of `values` in one command buffer:
+    /// distribute by `zeta`, scale by `c`, multiply by `table` periodically.
     pub fn elementwise(
         values: &[Scalar],
         zeta: [Scalar; 2],

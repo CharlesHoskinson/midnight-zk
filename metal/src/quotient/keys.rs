@@ -11,60 +11,25 @@
 // See the License for the specific language governing permissions and
 // limitations under the License.
 
-//! Resident proving-key copies: the counterpart of `register_key` and
-//! `KeyHandle` of the CUDA crate (`gpu/src/quotient.rs`).
+//! Resident proving-key copies (the CUDA crate's `register_key` and
+//! `KeyHandle`).
 //!
-//! # Registration
+//! [`register_key`] records extended-coset polynomials by address, length and
+//! content digest, each with a slot in the handle's device copy for that
+//! length. [`plan`] lends one copy to a quotient for the call;
+//! [`Lent::give_back`] returns it, or drops it if the handle is gone or the
+//! copies were evicted meanwhile.
 //!
-//! [`register_key`] records proving-key polynomials (extended cosets, as
-//! `ProvingKey::gpu_resident_polys` lists them) by address, length and a
-//! content digest ([`digest_many`]), each with its slot in the device copy
-//! of its length (slots are numbered per length). A copy is one shared Metal
-//! buffer per handle and polynomial length, holding the handle's
-//! polynomials of that length one after the other; the numerator kernel
-//! reads it as one bank of `2^ext_k`-value slots (`shaders/quotient.metal`),
-//! so a job of extended length `2^ext_k` reads only the copy laid out for
-//! that length. A polynomial registered again moves to the new handle.
+//! Digest checks: inside a request a polynomial is checked at its first serve
+//! and trusted after that (the registrant keeps it unchanged during the
+//! request). Outside a request every serve checks every registered polynomial
+//! it reads. A slot this call fills is hashed over the bytes copied into it,
+//! so a slot is never marked present with unverified content. A polynomial
+//! whose content changed is counted ([`key_stale`]), loses its registration
+//! and is uploaded for the call only.
 //!
-//! # Lending
-//!
-//! [`plan`] lends one copy to a quotient for the call (the handle with the
-//! most of the job's polynomials, its copy for the job's length): the
-//! registry holds no buffer for it until [`Lent::give_back`] returns it. A
-//! copy that does not exist yet is allocated by the quotient, and its slots
-//! are filled by it. [`Lent::give_back`] drops the copy instead (zeroed,
-//! like every buffer of this crate) when the handle is gone or the copies
-//! were evicted while it was lent (the registry counts evictions).
-//!
-//! # Digest checks
-//!
-//! - Inside a request ([`crate::begin_request`] .. [`crate::end_request`]), a
-//!   polynomial is checked against its digest at its first serve in the request
-//!   and served from the copy without a check after that (the CUDA crate's
-//!   semantics; the registrant keeps a registered polynomial unchanged while
-//!   the request runs). Each request is a new epoch; an entry records the epoch
-//!   in which its content last matched.
-//! - Outside a request (no [`crate::begin_request`] open, as when the hooks are
-//!   installed without the request calls), every serve checks the digests of
-//!   all the registered polynomials it reads.
-//! - Whenever a quotient fills a slot, the bytes copied into the slot are
-//!   hashed in that call, and [`settle`] marks the slot present only when they
-//!   match the registered digest. A slot is never present with content that was
-//!   not verified.
-//!
-//! The digests are computed while the device transforms the proof's
-//! polynomials, and [`settle`] settles the placement before the numerator,
-//! the first kernel that reads a slot. A polynomial whose content changed is
-//! counted ([`key_stale`]), loses its registration and its slot, and is
-//! uploaded for the call only.
-//!
-//! # Eviction
-//!
-//! The copies are freed at [`crate::end_request`] unless [`keep_resident`]
-//! (`set_keep_resident`, or `MIDNIGHT_METAL_KEEP_KEYS=1`), by
-//! [`evict_key_copies`], and when the handle is dropped; the registrations
-//! stay until the handle is dropped. The copies hold public data only, and
-//! are zeroed when freed like every buffer of this crate.
+//! The copies are freed at [`crate::end_request`] unless [`keep_resident`], by
+//! [`evict_key_copies`], or when the handle is dropped.
 
 use std::{
     collections::HashMap,
@@ -86,10 +51,9 @@ fn sha256(b: &[u8]) -> [u8; 32] {
     out
 }
 
-/// The content digest of each of `vs` (public data): SHA-256 of the length
-/// and the SHA-256 of each 16 MiB chunk, the same function as the CUDA
-/// crate's `ident::digest`. The chunks of all of them are hashed together on
-/// all cores (a polynomial of a few chunks alone would keep most idle).
+/// The content digest of each of `vs`: SHA-256 of the length and of each
+/// 16 MiB chunk's SHA-256, as the CUDA crate's `ident::digest`. All chunks are
+/// hashed together on all cores.
 pub(crate) fn digest_many(vs: &[&[Scalar]]) -> Vec<[u8; 32]> {
     let bytes: Vec<&[u8]> = vs
         .iter()
@@ -126,9 +90,8 @@ pub(crate) fn digest_many(vs: &[&[Scalar]]) -> Vec<[u8; 32]> {
                 })
                 .collect();
             for h in hs {
-                // `sha256` does not panic: a digest thread fails only when
-                // its allocation does, and that panic propagates (the hook
-                // turns it into a decline)
+                // `sha256` does not panic; only a failed allocation can, and the
+                // hook turns that into a decline
                 for (i, d) in h.join().expect("a digest thread") {
                     ds[i] = d;
                 }
@@ -168,8 +131,7 @@ struct KeyCopy {
     /// The handle's polynomials of this length (slots of the copy).
     npolys: usize,
     /// The copy, `npolys * len` values; `None` before the first quotient,
-    /// after an eviction, and while a quotient uses it (it is lent, see
-    /// [`Lent`]).
+    /// after an eviction, or while lent.
     buf: Option<Buffer>,
     /// Which slots hold their polynomial, verified against its digest.
     present: Vec<bool>,
@@ -186,11 +148,10 @@ struct Registry {
 }
 
 impl Registry {
-    /// Checks the registered polynomial at `key` against `digest`, the
-    /// digest of its content now. `planned`: its `(handle, slot)` when the
-    /// call was planned. A match marks it checked in request `epoch`; a
-    /// mismatch counts it stale and drops its registration and its slot.
-    /// Returns whether it is still registered as planned with that content.
+    /// Checks the polynomial at `key` against `digest`, its content's digest
+    /// now. A match marks it checked in `epoch`; a mismatch counts it stale and
+    /// drops its registration and slot. Returns whether it is still
+    /// registered as `planned` with that content.
     fn check(
         &mut self,
         key: (usize, usize),
@@ -226,8 +187,7 @@ static NEXT_ID: AtomicU64 = AtomicU64::new(1);
 static KEY_STALE: AtomicU64 = AtomicU64::new(0);
 /// The current request ([`begin_request`] and [`end_request`] increment it).
 static EPOCH: AtomicU64 = AtomicU64::new(1);
-/// Whether a request is open: between [`begin_request`] and
-/// [`end_request`]. Outside one every serve checks its digests.
+/// Whether a request is open. Outside one every serve checks its digests.
 static OPEN: AtomicBool = AtomicBool::new(false);
 static KEEP: OnceLock<AtomicBool> = OnceLock::new();
 
@@ -252,15 +212,13 @@ pub fn set_keep_resident(on: bool) {
     keep().store(on, Relaxed);
 }
 
-/// A new request: the digests are checked again at the next serve, and then
-/// once per request until [`end_request`].
+/// A new request: each digest is checked again at its next serve.
 pub(crate) fn begin_request() {
     EPOCH.fetch_add(1, Relaxed);
     OPEN.store(true, Relaxed);
 }
 
-/// The end of a request: every later serve checks its digests until the
-/// next [`begin_request`]; frees the copies unless [`keep_resident`].
+/// The end of a request: frees the copies unless [`keep_resident`].
 pub(crate) fn end_request() {
     OPEN.store(false, Relaxed);
     // a request begun after this one ended checks again (a new epoch)
@@ -270,10 +228,8 @@ pub(crate) fn end_request() {
     }
 }
 
-/// Frees every device copy of a registered polynomial (the registrations
-/// stay; the next quotient makes the copies again). Returns the bytes freed;
-/// a copy in use by a running quotient is freed when that quotient returns
-/// it and is not counted.
+/// Frees every device copy (registrations stay). Returns the bytes freed; a
+/// copy lent to a running quotient is freed when returned and not counted.
 pub fn evict_key_copies() -> u64 {
     let mut freed = Vec::new();
     {
@@ -285,17 +241,15 @@ pub fn evict_key_copies() -> u64 {
             c.present.iter_mut().for_each(|p| *p = false);
         }
     }
-    // zeroed (in the background) and put back into the pool outside the
-    // lock
+    // zeroed in the background and pooled, outside the lock
     let bytes = freed.iter().map(|b| b.len_bytes() as u64).sum();
     crate::ctx::release_later(freed);
     bytes
 }
 
-/// The registration of proving-key polynomials. While it lives the
-/// registrant keeps them alive and, within a request, unchanged; the device
-/// copy is made at the first quotient that reads them and freed when this is
-/// dropped.
+/// The registration of proving-key polynomials. While it lives the registrant
+/// keeps them alive and, within a request, unchanged. Dropping it frees the
+/// device copies.
 #[derive(Debug)]
 pub struct KeyHandle {
     id: u64,
@@ -319,9 +273,8 @@ impl KeyHandle {
         })
     }
 
-    /// The bytes of this handle's device copies now (0 before the first
-    /// quotient that reads them, after an eviction, or while a quotient uses
-    /// them).
+    /// The bytes of this handle's device copies now (0 when not made, evicted
+    /// or lent).
     pub fn resident_bytes(&self) -> u64 {
         registry().as_ref().map_or(0, |r| {
             r.copies
@@ -353,11 +306,9 @@ impl Drop for KeyHandle {
     }
 }
 
-/// Registers proving-key polynomials by their digests. A polynomial registered
-/// again moves to the new handle. Polynomials of any lengths may be
-/// registered together: each length has its own device copy (slots numbered
-/// per length), and a quotient serves from the copy of its extended length
-/// only.
+/// Registers proving-key polynomials by their digests. A polynomial
+/// registered again moves to the new handle. Each length has its own device
+/// copy, and a quotient serves from the copy of its extended length only.
 pub fn register_key(polys: &[&[Scalar]]) -> KeyHandle {
     let id = NEXT_ID.fetch_add(1, Relaxed);
     // hash before taking the lock
@@ -424,12 +375,10 @@ pub(crate) struct Lent {
     id: u64,
     /// The length of its polynomials: the job's extended length.
     len: usize,
-    /// The copy (`None`: to be allocated by the caller with
-    /// [`Lent::bytes`] bytes).
+    /// The copy (`None`: the caller allocates [`Lent::bytes`] bytes).
     pub(crate) buf: Option<Buffer>,
     pub(crate) npolys: usize,
-    /// Which slots hold their verified polynomial. Only [`settle`] sets a
-    /// slot, after the digest of the bytes copied into it matched.
+    /// Which slots hold their verified polynomial; only [`settle`] sets one.
     pub(crate) present: Vec<bool>,
     /// The registry's evictions when it was lent.
     evictions: u64,
@@ -441,8 +390,8 @@ impl Lent {
         self.npolys * self.len * size_of::<Scalar>()
     }
 
-    /// Returns the copy to the registry when its handle still lives and no
-    /// eviction happened meanwhile; drops it (zeroed) otherwise.
+    /// Returns the copy to the registry when its handle lives and no eviction
+    /// happened; drops it otherwise.
     pub(crate) fn give_back(self) {
         let back = {
             let mut r = registry();
@@ -465,18 +414,16 @@ impl Lent {
     }
 }
 
-/// The placement of a job's proving-key polynomials before their digests
-/// are checked ([`plan`]), settled by [`settle`].
+/// The placement of a job's proving-key polynomials, made by [`plan`] and
+/// settled by [`settle`].
 pub(crate) struct Plan {
     /// Where each polynomial is read from, assuming that every registered
     /// one still has its content; [`settle`] makes a stale one `Temp`.
     pub(crate) places: Vec<Place>,
     /// The copy lent for the call.
     pub(crate) lent: Option<Lent>,
-    /// Indices (into the job's polynomials) of the registered ones whose
-    /// digest is to be checked, ascending: every one outside a request, the
-    /// ones not checked yet in the request inside one, and every one placed
-    /// in a slot this call fills ([`Plan::fills`]).
+    /// Indices of the registered polynomials whose digest is checked in this
+    /// call, ascending.
     pub(crate) check: Vec<usize>,
     /// `(handle, slot)` of each registered polynomial as [`plan`] found it.
     regs: Vec<Option<(u64, usize)>>,
@@ -485,9 +432,8 @@ pub(crate) struct Plan {
 }
 
 impl Plan {
-    /// Whether polynomial `i` is placed in a slot this call fills (not
-    /// present in the lent copy): its digest is then computed over the bytes
-    /// copied into the slot.
+    /// Whether polynomial `i` goes in a slot this call fills; its digest is
+    /// then computed over the bytes copied into the slot.
     pub(crate) fn fills(&self, i: usize) -> bool {
         match (self.places[i], self.lent.as_ref()) {
             (Place::Resident(slot), Some(l)) => !l.present[slot],
@@ -495,8 +441,7 @@ impl Plan {
         }
     }
 
-    /// Placed polynomials whose digest is checked in this call: a stale one
-    /// among them becomes `Temp` at [`settle`].
+    /// Placed polynomials whose digest is checked in this call.
     pub(crate) fn resident_checked(&self) -> usize {
         self.check
             .iter()
@@ -505,8 +450,8 @@ impl Plan {
     }
 }
 
-/// The handle with the most registered polynomials of length `en` among
-/// `regs` (the lowest id among equals).
+/// The handle with the most registered polynomials of length `en` (lowest id
+/// on ties).
 fn most_registered(regs: &[Option<(u64, usize)>], keys: &[&[Scalar]], en: usize) -> Option<u64> {
     let mut counts: HashMap<u64, usize> = HashMap::new();
     for ((id, _), k) in regs.iter().zip(keys).filter_map(|(f, k)| f.map(|f| (f, k))) {
@@ -517,16 +462,11 @@ fn most_registered(regs: &[Option<(u64, usize)>], keys: &[&[Scalar]], en: usize)
     counts.into_iter().max_by_key(|(id, n)| (*n, u64::MAX - id)).map(|c| c.0)
 }
 
-/// Plans the placement of the job's proving-key polynomials (`keys`: start
-/// and length of each, distinct, all of length `en`, the job's extended
-/// length) without hashing them: the handle with the most registered
-/// polynomials of the job is lent for the call (its copy for length `en`),
-/// and its polynomials are placed in their slots; the others are uploaded.
-/// The registered polynomials to check against their digests are listed in
-/// [`Plan::check`]; the caller hashes them ([`digest_many`]; for a slot it
-/// fills, the bytes copied into the slot) while the device works on the
-/// proof's polynomials, and [`settle`] drops a stale one before any slot is
-/// read.
+/// Plans the placement of the job's proving-key polynomials (`keys`, all of
+/// length `en`) without hashing them: the handle with the most of them lends
+/// its copy and its polynomials go in their slots; the others are uploaded.
+/// The caller hashes [`Plan::check`] while the device works, and [`settle`]
+/// drops stale ones before any slot is read.
 pub(crate) fn plan(keys: &[&[Scalar]], en: usize) -> Plan {
     let now = EPOCH.load(Relaxed);
     let open = OPEN.load(Relaxed);
@@ -560,10 +500,8 @@ pub(crate) fn plan(keys: &[&[Scalar]], en: usize) -> Plan {
             && c.present.len() == c.npolys
         {
             // memory-safety guards, unreachable for a registry built by
-            // `register_key` (a copy is made for its key's length and its
-            // slots are numbered below `npolys`): a buffer not laid out for
-            // this length is freed, not read, and a slot past the copy is not
-            // placed in it
+            // `register_key`: a buffer not laid out for this length is freed,
+            // not read, and a slot past the copy is not used
             let bytes = c.npolys * en * size_of::<Scalar>();
             if c.buf.as_ref().is_some_and(|b| b.len_bytes() != bytes) {
                 released.extend(c.buf.take());
@@ -604,14 +542,10 @@ pub(crate) fn plan(keys: &[&[Scalar]], en: usize) -> Plan {
     p
 }
 
-/// Settles a [`plan`] with the digests of its [`Plan::check`] polynomials
-/// (in that order; for a polynomial whose slot this call filled, the digest
-/// of the bytes in the slot): a polynomial whose digest matches its
-/// registration is marked checked for the request, and its slot, if this
-/// call filled it, present; one whose content changed is counted
-/// ([`key_stale`]), loses its registration and its slot of the lent copy,
-/// and becomes `Temp`, as does one whose registration went away meanwhile.
-/// Returns whether a polynomial placed in a slot became `Temp`.
+/// Settles a [`plan`] with the digests of [`Plan::check`], in order. A match
+/// marks the polynomial checked and its filled slot present; a mismatch, or a
+/// registration gone meanwhile, makes it `Temp` and drops its registration and
+/// slot. Returns whether a polynomial placed in a slot became `Temp`.
 pub(crate) fn settle(p: &mut Plan, keys: &[&[Scalar]], digests: &[[u8; 32]]) -> bool {
     debug_assert_eq!(p.check.len(), digests.len());
     let mut moved = false;

@@ -11,10 +11,8 @@
 // See the License for the specific language governing permissions and
 // limitations under the License.
 
-//! Decline and service accounting of the hook entry points.
-//!
-//! A kernel module ends every call with exactly one of [`served`] (the device
-//! value was written) or [`decline`] (nothing of the caller's was changed).
+//! Decline and service accounting. A kernel module ends every call with
+//! exactly one of [`served`] or [`decline`].
 
 use std::{
     collections::BTreeMap,
@@ -64,19 +62,16 @@ pub(crate) enum Reason {
     Shape,
     /// A scalar not below the modulus.
     Unreduced,
-    /// The buffers do not fit (`maxBufferLength`, allocation failure, a
-    /// budget).
+    /// A buffer above `maxBufferLength`, a failed allocation, or a budget.
     Memory,
     /// A pipeline, encoder or command buffer failed.
     DeviceError,
     /// The backend panicked; the hook entry caught it (`crate::guarded`).
     Panic,
-    /// An MSM base that is not a point of G1 (off the curve or outside the
-    /// prime-order subgroup).
+    /// An MSM base outside G1.
     BasesNotInSubgroup,
-    /// An MSM whose bases no registered table serves (never registered, or
-    /// the registered table no longer holds the caller's points), with the
-    /// one-shot path off (the default thresholds, see `crate::thresholds`).
+    /// An MSM whose bases no registered table serves, with the one-shot path
+    /// off.
     UnregisteredBases,
 }
 

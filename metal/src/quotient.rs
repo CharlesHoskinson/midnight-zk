@@ -11,100 +11,29 @@
 // See the License for the specific language governing permissions and
 // limitations under the License.
 
-//! The quotient on the device, and the resident proving-key copies: the
-//! counterpart of the CUDA crate's `gpu/src/quotient.rs` and
-//! `gpu/cuda/quotient.cuh`.
+//! The quotient on the device and the resident proving-key copies; the
+//! counterpart of the CUDA crate's `gpu/src/quotient.rs`.
 //!
 //! [`quotient`] takes the job of the `midnight_proofs::gpu` quotient hook
-//! (`QuotientJobAbi`, a copy of its layout in [`abi`]), moves the proof's
-//! polynomials to the extended coset on the device, runs the numerator
-//! kernel over the job's programs (gates, permutation, LogUp lookups,
-//! trash), divides by the vanishing polynomial, transforms back and writes
-//! the first `len` coefficients into the caller's buffer. It ends with
-//! exactly one of `account::served` or `account::decline`; a declined job
-//! leaves `out` unchanged and the prover computes the quotient on the CPU.
+//! ([`abi`]), moves the proof's polynomials to the extended coset, runs the
+//! numerator kernel over the job's programs, divides by the vanishing
+//! polynomial, transforms back and writes the first `len` coefficients.
 //!
-//! # Trust boundary
+//! Trust boundary: the caller guarantees that the job's pointers are valid
+//! for reads of their counts and not written during the call. Everything else
+//! (version, sizes, roots, coset shift, table ranges, reduction of every
+//! scalar and polynomial, memory need) is checked here before any polynomial
+//! is read.
 //!
-//! [`crate::quotient`] checks that `job` is not null and that a device is
-//! usable before it calls [`quotient`]. The caller guarantees that `job`
-//! points to a `QuotientJobAbi` whose pointers are valid for reads of their
-//! counts for the whole call (a proof polynomial `2^k` values, a proving-key
-//! polynomial `2^ext_k`, see [`abi`]) and are not written meanwhile. This
-//! module checks everything else before it reads a polynomial: the ABI
-//! version, the sizes (`k <= ext_k <= MAX_LOG_N`, so no slice is made from
-//! an unchecked length), the extended size against the quotient threshold
-//! (`quotient` of [`crate::thresholds`]), the roots and the coset shift, the
-//! output length, every table entry (null pointers, operand, slot and column
-//! ranges), the reduction of every scalar and polynomial, and the memory
-//! need.
-//!
-//! # Steps
-//!
-//! 1. The checks on the header and the tables ([`checked`], [`tables`]), in the
-//!    order and with the reasons of the CUDA crate.
-//! 2. The proving-key polynomials: read from the resident copy of a registered
-//!    handle ([`keys`]) or uploaded for the call. [`keys::plan`] places them
-//!    before their digests are checked; CPU threads copy the uploads, fill the
-//!    empty slots of the resident copy and hash the registered polynomials to
-//!    check while the device runs step 3, and [`keys::settle`] settles the
-//!    placement before step 4, the first kernel that reads a slot.
-//! 3. The proof's polynomials (advice, instance, permutation accumulators,
-//!    lookup aggregators, multiplicities and helpers, trash) to the extended
-//!    coset: each one is copied into a buffer of `2^k` coefficients (checked
-//!    reduced on the way; the copy of the next one runs on the CPU while the
-//!    device transforms this one) and transformed by
-//!    `ntt::coeff_to_extended_dev_at` straight into its place in the flat
-//!    buffer of the proof's cosets, one command buffer per polynomial.
-//! 4. The numerator kernel (`shaders/quotient.metal`) over row ranges, one
-//!    command buffer per range of about [`TARGET_NANOS`] of GPU time.
-//! 5. The division by the vanishing polynomial (`ntt::encode_mul_periodic` with
-//!    the job's `t_inv`), the inverse transform and the removal of the coset
-//!    factors, in the command buffers of the inverse transform
-//!    (`ntt::divide_extended_to_coeff_dev`). Meanwhile CPU threads zero the
-//!    buffers of steps 3 and 4 and put them back into the pool
-//!    (`ctx::release_later`; `end_request` waits for them).
-//! 6. The first `len` coefficients are copied into `out`, after every step that
-//!    can fail or panic, by a copy that cannot fail. No extended-domain vector
-//!    goes back.
-//!
-//! Every buffer that holds a witness-dependent value is zeroed before it is
-//! used again or reported erased: the transform scratch is per-request
-//! scratch (`quotient-tmp`, zeroed by [`crate::end_request`]); every other
-//! buffer is owned by the call, comes from the pool of zeroed buffers and is
-//! zeroed before it goes back to it (in the background, finished by
-//! [`crate::end_request`] at the latest).
-//!
-//! # Departures from the CUDA backend
-//!
-//! - A Metal kernel takes at most 31 buffer arguments and the device context
-//!   binds buffers, not GPU addresses, so the CUDA job's tables of device
-//!   pointers are flat buffers with index tables: the proof's cosets one
-//!   buffer, the proving-key polynomials two (the lent resident copy, the
-//!   uploads of the call), the programs and descriptors a buffer of words, the
-//!   uniforms a buffer of field elements (see `shaders/include/quotient.h`). A
-//!   job whose flat buffer would exceed `maxBufferLength` declines `memory`.
-//! - The CUDA kernel runs one grid-stride launch over the whole domain; here
-//!   the domain is split into row ranges of about [`TARGET_NANOS`] of GPU time
-//!   each (the first range sized from an estimate, the next ones from the
-//!   measured time per row), so that no command buffer runs long.
-//! - The scratch of the programs' intermediates has the CUDA layout
-//!   (`scratch[slot * threads + thread]`) with [`threads`] threads per dispatch
-//!   (`MIDNIGHT_METAL_QUOTIENT_THREADS`, the counterpart of
-//!   `MIDNIGHT_GPU_QUOTIENT_THREADS`).
-//! - The proving-key polynomials are checked reduced when they are copied (the
-//!   CUDA crate checks only the proof's polynomials); an unreduced one declines
-//!   `unreduced`.
-//! - A resident copy is one buffer per [`KeyHandle`] and polynomial length; a
-//!   job whose key polynomials are registered under several handles reads the
-//!   handle with the most of them from its copy for the job's extended length
-//!   and uploads the others for the call.
-//! - Outside a request (no [`crate::begin_request`] open) every serve checks
-//!   the digests of the registered polynomials it reads; the CUDA crate checks
-//!   once per request only.
-//! - The memory limit is the device's free working set
-//!   (`recommendedMaxWorkingSetSize - currentAllocatedSize`) and
-//!   `maxBufferLength` for each buffer.
+//! Departures from the CUDA backend:
+//! - A Metal kernel takes at most 31 buffers, so the CUDA tables of device
+//!   pointers become flat buffers with index tables
+//!   (`shaders/include/quotient.h`).
+//! - The numerator runs over row ranges of about [`TARGET_NANOS`] each, so no
+//!   command buffer runs long.
+//! - Proving-key polynomials are also checked reduced.
+//! - Outside a request every serve checks the digests of the registered
+//!   polynomials it reads; the CUDA crate checks once per request.
 
 pub mod abi;
 mod keys;
@@ -192,10 +121,8 @@ pub fn quotient_counts() -> (u64, u64) {
     (RUNS.load(Relaxed), DECLINES.load(Relaxed))
 }
 
-/// The default of [`threads`]. Numerator GPU time at `2^21` rows on an M4
-/// Max (40 GPU cores): 53 ms with 2^12 threads, 18.8 ms with 2^14, 15.5 ms
-/// with 2^16, 14.4 ms with 2^18, 17.4 ms with 2^20; 2^16 is within 8% of the
-/// best and keeps the scratch at `nslots * 2 MiB`.
+/// The default of [`threads`]: near the measured best numerator time while
+/// keeping the scratch at `nslots * 2 MiB`.
 const DEFAULT_THREADS: u32 = 1 << 16;
 
 /// A thread count rounded down to a multiple of 256 in `[256, 2^24]`.
@@ -203,8 +130,8 @@ fn normalize_threads(t: u64) -> u32 {
     (t / 256 * 256).clamp(256, 1 << 24) as u32
 }
 
-/// The threads of one numerator dispatch, the stride of the scratch slots:
-/// `MIDNIGHT_METAL_QUOTIENT_THREADS`, else 2^16; a multiple of 256 in
+/// The threads of one numerator dispatch, which is also the scratch slot
+/// stride: `MIDNIGHT_METAL_QUOTIENT_THREADS`, else 2^16; a multiple of 256 in
 /// `[256, 2^24]`.
 pub fn threads() -> u32 {
     let t = THREADS.load(Relaxed);
@@ -228,12 +155,10 @@ fn stride(ext_k: u32) -> usize {
 // ---------------------------------------------------------------------------
 // Memory need
 
-/// Every device allocation one quotient call can make, in bytes ([`run`]
-/// allocates exactly these buffers, each at most once; Metal makes a buffer
-/// of at least 16 bytes). Their sum is an upper bound of the device bytes
-/// the call adds, whatever the pool of zeroed buffers gives back meanwhile.
-/// [`run`]'s admission and [`need_bytes`] both sum it, so the two cannot
-/// drift.
+/// Every device allocation one quotient call can make, in bytes. [`run`]
+/// allocates exactly these, each at most once, so the sum bounds the bytes the
+/// call adds. [`run`]'s admission and [`need_bytes`] both sum it, so the two
+/// cannot drift.
 #[derive(Clone, Copy, Debug)]
 struct Need {
     /// One extended coset: `2^ext_k * 32`.
@@ -246,8 +171,8 @@ struct Need {
     ntemp: usize,
     /// The resident copy, when the call allocates it (0: it exists).
     lent_new: usize,
-    /// Polynomials of the second upload after a stale key at [`keys::settle`]
-    /// (0: no polynomial placed in a slot is checked, so none can move).
+    /// The second upload after a stale key at [`keys::settle`] (0: no slot is
+    /// checked, so none can move).
     restale: usize,
     /// The programs' scratch slots.
     slots_bytes: usize,
@@ -309,24 +234,11 @@ impl Need {
     }
 }
 
-/// An upper bound of the device bytes one quotient job allocates: the
-/// [`Need`] of [`run`] at its worst over what the shape does not fix (the
-/// base size `k <= ext_k`, which key polynomials sit in a resident copy that
-/// the call makes, a stale key uploaded again after the check). It holds
-/// every buffer of the call: the proof's cosets, the coefficient buffers of
-/// the coset phase, the key uploads, the resident copy, the second upload
-/// after a stale key, the numerator, the transform scratch, the programs'
-/// scratch slots (`nslots * stride * 32`, stride [`threads`] capped at
-/// `2^ext_k`), `t_inv` and the scaled twiddle table of the inverse.
-///
-/// Two terms are outside the shape and assumed: the resident copy holds the
-/// job's key polynomials only (a handle registered with the job's
-/// `gpu_resident_polys`, as the prover binding does; a handle holding more
-/// polynomials of this length lends all of them), and the programs' words
-/// and uniforms (a few KiB) are not counted beyond their 16-byte minimum.
-/// `test_support::need_bytes_job` gives the exact bound of a job.
-///
-/// The arguments are the fields of `midnight_proofs::gpu::QuotientShape`.
+/// An upper bound of the device bytes one quotient job allocates: the `Need`
+/// of `run` at its worst over what the shape does not fix. It assumes the
+/// resident copy holds only the job's key polynomials and ignores the few KiB
+/// of program words and uniforms. The arguments are the fields of
+/// `midnight_proofs::gpu::QuotientShape`.
 pub fn need_bytes(ext_k: u32, proof_polys: usize, key_polys: usize, nslots: u32) -> usize {
     let e = SCALAR_BYTES << ext_k;
     let mut worst = 0;
@@ -352,10 +264,7 @@ pub fn need_bytes(ext_k: u32, proof_polys: usize, key_polys: usize, nslots: u32)
     worst
 }
 
-/// The [`Need`] of a planned call: the proof's cosets, the uploads of the
-/// plan, the resident copy when the call makes it, the second upload when a
-/// polynomial placed in a slot is checked (it may be stale), the transform
-/// scratch unless the request has one long enough, the job's tables.
+/// The [`Need`] of a planned call.
 fn need_of(
     j: &QuotientJobAbi,
     tab: &Tables<'_>,
@@ -394,9 +303,8 @@ fn need_of(
     }
 }
 
-/// Bytes the device allows this call to allocate: the free working set (the
-/// idle buffers of the pool included, see [`ctx::mem_info`]) or the test
-/// limit, the smaller.
+/// Bytes this call may allocate: the free working set (idle pool buffers
+/// included) or the test limit, whichever is smaller.
 fn memory_limit() -> u64 {
     let free = ctx::mem_info().map_or(0, |(free, _)| free as u64);
     free.min(MEMORY_LIMIT.load(Relaxed))
@@ -405,8 +313,7 @@ fn memory_limit() -> u64 {
 // ---------------------------------------------------------------------------
 // Test support
 
-/// The placement counts of the last quotient served (read through
-/// `test_support::last_stages`).
+/// The placement counts of the last quotient served.
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
 pub struct QuotientStages {
     /// Command buffers of the numerator.
@@ -422,16 +329,14 @@ pub struct QuotientStages {
 #[cfg(any(test, feature = "test-support"))]
 static LAST_STAGES: std::sync::Mutex<Option<QuotientStages>> = std::sync::Mutex::new(None);
 
-/// Test entry points (not a stable interface; only with the `test-support`
-/// feature: [`test_support::numerator`] returns witness-dependent values).
+/// Test entry points (not a stable interface; [`test_support::numerator`]
+/// returns witness-dependent values).
 #[cfg(any(test, feature = "test-support"))]
 pub mod test_support {
     use super::*;
 
-    /// The exact [`Need`] total of `job` now (the registry and the
-    /// per-request scratch as they are): an upper bound of the device bytes
-    /// the hook call would add. `Err`: the decline reason of the checks
-    /// before the admission.
+    /// The exact [`Need`] total of `job` now. `Err`: the decline reason of the
+    /// checks before admission.
     ///
     /// # Safety
     /// As [`crate::quotient`].
@@ -461,14 +366,14 @@ pub mod test_support {
         *LAST_STAGES.lock().unwrap_or_else(|e| e.into_inner())
     }
 
-    /// A device-memory limit in bytes for the quotient's admission (`None`:
-    /// the device's free working set).
+    /// A device-memory limit for the admission (`None`: the free working
+    /// set).
     pub fn set_memory_limit(limit: Option<u64>) {
         MEMORY_LIMIT.store(limit.unwrap_or(u64::MAX), Relaxed);
     }
 
-    /// Sets the GPU time a numerator command buffer aims at (`None`:
-    /// [`TARGET_NANOS`]), so that a test can split a small domain.
+    /// Sets the numerator's target GPU time per command buffer (`None`:
+    /// [`TARGET_NANOS`]).
     pub fn set_target_nanos(ns: Option<u64>) {
         TARGET.store(ns.unwrap_or(TARGET_NANOS).max(1), Relaxed);
     }
@@ -478,9 +383,8 @@ pub mod test_support {
         THREADS.store(t.map_or(0, |t| normalize_threads(t.into())), Relaxed);
     }
 
-    /// The numerator of a job on the device, all `2^ext_k` values read back
-    /// (a test of the kernel against `QuotientJob::numerator_reference`; the
-    /// hook never reads it back). `Err`: the decline reason.
+    /// The numerator of a job, all `2^ext_k` values read back, for testing the
+    /// kernel. `Err`: the decline reason.
     ///
     /// # Safety
     /// As [`crate::quotient`].
@@ -504,8 +408,7 @@ pub mod test_support {
 ///
 /// # Safety
 /// `job` is not null and points to a valid `QuotientJobAbi` whose pointers
-/// are valid for reads of their counts and not written for the whole call
-/// (see the module's trust boundary).
+/// are valid for reads of their counts and not written during the call.
 pub(crate) unsafe fn quotient(job: *const c_void, out: &mut [Scalar]) -> bool {
     // SAFETY: the caller's contract.
     let j = unsafe { &*(job as *const QuotientJobAbi) };
@@ -527,20 +430,16 @@ pub(crate) unsafe fn quotient(job: *const c_void, out: &mut [Scalar]) -> bool {
     }
 }
 
-/// The coset shift is a primitive cube root of unity `z` (`z != 1`,
-/// `z^3 = 1`), the job gives `[z, z^2]` into the coset and `[z^2, z]` out of
-/// it (the CUDA crate's `cube_root_shift`).
+/// The coset shift is a primitive cube root of unity `z`; the job gives
+/// `[z, z^2]` into the coset and `[z^2, z]` out of it.
 fn cube_root_shift(zeta: [Scalar; 2], zeta_out: [Scalar; 2]) -> bool {
     let z = zeta[0];
     let z2 = square(&z);
     z != ONE && mul(&z2, &z) == ONE && zeta[1] == z2 && zeta_out == [z2, z]
 }
 
-/// The header checks of the CUDA crate, in its order: the ABI version and
-/// sizes (`shape`), the coset shift (`shape`), the minimum size
-/// (`below-min-k`), then the roots, lengths and counts (`shape`) and the
-/// reduction of the job's scalars (`unreduced`). `out_len`: the length of
-/// `out`, which must be the job's `len` (`None`: the numerator test path).
+/// The header checks, in the CUDA crate's order and with its reasons.
+/// `out_len` must be the job's `len` (`None`: the numerator test path).
 fn checked(j: &QuotientJobAbi, out_len: Option<usize>) -> Result<(), Reason> {
     if j.abi != abi::QUOTIENT_ABI || j.k < 1 || j.k > j.ext_k || j.ext_k > MAX_LOG_N {
         return Err(Reason::Shape);
@@ -588,12 +487,9 @@ fn checked(j: &QuotientJobAbi, out_len: Option<usize>) -> Result<(), Reason> {
     Ok(())
 }
 
-/// `t_inv` and the scalars passed by value to the transform helpers, whose
-/// shader arithmetic needs reduced inputs, are reduced (`unreduced`).
-/// [`checked`] has checked the scalars already (the shift and its inverse,
-/// `zeta_out` and the divisor directly, the roots by equality with the
-/// standard roots); they are checked again here, next to their use, so that
-/// a change to [`checked`] cannot let an unreduced one reach the device.
+/// Checks that `t_inv` and the by-value transform scalars are reduced. Most
+/// were checked by [`checked`]; checking again next to their use keeps a
+/// change there from letting an unreduced value reach the device.
 fn check_transform_inputs(j: &QuotientJobAbi, t_inv: &[Scalar]) -> Result<(), Reason> {
     if !field::all_reduced(t_inv) {
         return Err(Reason::Unreduced);
@@ -621,8 +517,7 @@ fn err(e: Error) -> Reason {
 // Host copies
 
 /// Copies `src` into the start of `dst` on several threads, checking every
-/// element reduced in the same pass; `false` when one is not (the copy may
-/// then be partial).
+/// element reduced; `false` when one is not (the copy may be partial).
 fn copy_checked(dst: &mut [Scalar], src: &[Scalar]) -> bool {
     const PART: usize = 1 << 16;
     let dst = &mut dst[..src.len()];
@@ -687,8 +582,7 @@ unsafe impl Pod for Params {}
 const _: () = assert!(size_of::<Params>() == 96 + 7 * 32);
 
 /// The quotient of `j` into `out`, or with `numerator` the whole numerator
-/// read back into it (and `out` untouched). Returns the GPU time and the
-/// placement counts.
+/// (and `out` untouched). Returns the GPU time and the placement counts.
 ///
 /// # Safety
 /// As [`quotient`].
@@ -722,7 +616,7 @@ unsafe fn run(
     r
 }
 
-/// Steps 2 to 6 of an admitted job (see the module text).
+/// The device steps of an admitted job.
 #[allow(clippy::too_many_arguments)]
 fn device_run(
     j: &QuotientJobAbi,
@@ -742,8 +636,8 @@ fn device_run(
     let mut stages = QuotientStages::default();
     let mut gpu = 0u64;
 
-    // the call's buffers. The transform scratch is per-request scratch (it
-    // holds witness values; zeroed at the end of the request)
+    // the transform scratch is per-request (it holds witness values; zeroed at
+    // the end of the request)
     let tmp_need = ntt::scratch_bytes(ext_k);
     if tmp_need > 0 {
         s.scratch("quotient-tmp", tmp_need).map_err(err)?;
@@ -768,9 +662,9 @@ fn device_run(
     let dummy = c.alloc(0).map_err(err)?;
     let tmp = tmp_ref.unwrap_or(&dummy);
 
-    // steps 2 and 3: the keys on CPU threads, the proof's cosets on the
-    // device. The copy of the first proof polynomial comes first, alone on
-    // the CPU, as the device waits for it
+    // keys on CPU threads while the device moves the proof's polynomials to
+    // the coset; the first proof polynomial is copied first, as the device
+    // waits for it
     if let Some(first) = tab.proof.first()
         && !copy_checked(src_a.as_mut_slice::<Scalar>(), first)
     {
@@ -819,7 +713,7 @@ fn device_run(
         .filter(|s| plan.lent.as_ref().is_some_and(|l| l.present[**s]))
         .count() as u32;
 
-    // step 4: the numerator, into `nu`
+    // the numerator, into `nu`
     let nu = c.alloc_pooled(ebytes).map_err(err)?;
     let scratch = c
         .alloc_pooled((j.nslots as usize).max(1) * threads * SCALAR_BYTES)
@@ -848,8 +742,7 @@ fn device_run(
         l.give_back();
     }
     // zeroed on the CPU in the background while the device divides and
-    // transforms; the zeroing ends before the request ends (`end_request`
-    // waits for it)
+    // transforms; `end_request` waits for it
     ctx::release_later(vec![scratch, proof_buf, key_tmp, words, unis]);
 
     if let Some(v) = numerator {
@@ -859,8 +752,8 @@ fn device_run(
         return Ok((gpu, stages));
     }
 
-    // step 5: h = nu / t on the coset, then extended_to_coeff, in the
-    // command buffers of the inverse transform
+    // h = nu / t on the coset, then extended_to_coeff, in the inverse
+    // transform's command buffers
     let tinv = c.upload(t_inv).map_err(err)?;
     gpu += ntt::divide_extended_to_coeff_dev(
         c,
@@ -874,14 +767,11 @@ fn device_run(
     )
     .map_err(err)?;
 
-    // step 6: the first `len` coefficients. Everything that can fail or
-    // panic is done before the first byte of `out` is written (a panic
-    // becomes a decline, which must leave `out` unchanged): `tinv` is
-    // released, the source is sliced (`checked` has held `out.len()` to
-    // `j.len <= en`) and the resident copy was given back after the
-    // numerator. What follows the copy cannot fail: `ctx::par_copy` and
-    // `ctx::release_later` never panic, and the rest of `run` and of
-    // `quotient` stores counters and takes poison-tolerant locks.
+    // Write `out` last: a panic becomes a decline, which must leave `out`
+    // unchanged, so everything that can fail or panic happens first. What
+    // follows the copy cannot fail: `ctx::par_copy` and `ctx::release_later`
+    // never panic, and the rest only stores counters and takes poison-tolerant
+    // locks.
     drop(tinv);
     debug_assert!(plan.lent.is_none());
     let src = &nu.as_slice::<Scalar>()[..out.len()];
@@ -903,14 +793,11 @@ struct KeyWork {
     filled: Vec<usize>,
 }
 
-/// The CPU side of the key placement, run while the device moves the proof's
-/// polynomials to the coset: copies each `Temp` polynomial into its coset of
-/// `key_tmp` and each polynomial placed in a slot this call fills
-/// (`fills`) into the slot of the lent copy, checking them reduced, and
-/// hashes the polynomials of `check`: a registered polynomial read from host
-/// memory on a thread of its own during the copies, a filled slot over the
-/// bytes copied into it, so that a slot is only ever marked present (at
-/// [`keys::settle`]) with verified content.
+/// The CPU side of the key placement, run while the device builds the proof's
+/// cosets: copies `Temp` polynomials into `key_tmp` and `fills` into the lent
+/// copy's slots (checking them reduced), and hashes the polynomials of
+/// `check`. A filled slot is hashed over the bytes copied into it, so a slot is
+/// only marked present at [`keys::settle`] with verified content.
 fn copy_and_hash_keys(
     keys: &[&[Scalar]],
     places: &[Place],
@@ -980,11 +867,9 @@ fn copy_and_hash_keys(
     }
 }
 
-/// Step 3: moves the proof's polynomials of `j` to the extended coset,
-/// polynomial `i` into its place `i` of `cosets`. `src[0]` holds the first
-/// polynomial already; the copy of polynomial `i + 1` into one coefficient
-/// buffer (checked reduced) runs on a CPU thread while the device transforms
-/// polynomial `i` from the other. Returns the GPU time.
+/// Moves the proof's polynomials to the extended coset, polynomial `i` into
+/// place `i` of `cosets`. The CPU copies polynomial `i + 1` (checking it
+/// reduced) while the device transforms polynomial `i`. Returns the GPU time.
 fn proof_cosets(
     c: &Ctx,
     j: &QuotientJobAbi,
@@ -1019,8 +904,8 @@ fn proof_cosets(
 }
 
 /// The uploads again after [`keys::settle`] moved a stale polynomial out of
-/// its slot: a new buffer with every `Temp` polynomial. The call's other
-/// buffers are allocated already, so this one is held to the limits alone.
+/// its slot. The call's other buffers already exist, so this one is held to
+/// the limits alone.
 fn upload_again(
     c: &Ctx,
     info: &MetalInfo,
@@ -1099,12 +984,9 @@ fn numerator_params(
     }
 }
 
-/// Step 4: the numerator over the `en` rows, one command buffer per row
-/// range. `bufs` are the kernel's buffers 0 to 6 (`quotient_numerator` of
-/// `shaders/quotient.metal`). The first range is sized from an estimate of
-/// about 0.5 ns per field multiplication of a row, the next ones from the
-/// measured time per row, each aiming at the target GPU time. Returns the
-/// GPU time and the command buffers.
+/// The numerator over `en` rows, one command buffer per row range. The first
+/// range is sized from an estimate, the next ones from the measured time per
+/// row. Returns the GPU time and the command buffers.
 fn numerator_ranges(
     c: &Ctx,
     bufs: [&Buffer; 7],

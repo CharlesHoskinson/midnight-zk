@@ -11,9 +11,8 @@
 // See the License for the specific language governing permissions and
 // limitations under the License.
 
-//! Host passes over the points: the identity comparison of a table with the
-//! caller's slice, and the G1 check ("Bases outside G1" in the module text).
-//! Each runs on several threads and checks every point.
+//! Host passes over every point, on several threads: the identity comparison
+//! of a table with the caller's slice, and the G1 check.
 
 use std::sync::atomic::{AtomicBool, Ordering::Relaxed};
 
@@ -22,12 +21,11 @@ use blst::{blst_p1_affine, blst_p1_affine_on_curve};
 use super::par::{host_threads, par_parts};
 use crate::G1AffineLimbs;
 
-/// Points compared or checked per step before the shared flag is read
-/// again.
+/// Points per step between reads of the shared flag.
 const POINT_BLOCK: usize = 1 << 12;
 
-/// Whether `a == b` (equal lengths), every point compared (a `2^20`-point
-/// table is 96 MiB); a part that panicked counts as a difference.
+/// Whether `a == b`, comparing every point; a panicked part counts as a
+/// difference.
 pub(super) fn points_equal(a: &[G1AffineLimbs], b: &[G1AffineLimbs]) -> bool {
     if a.len() != b.len() {
         return false;
@@ -48,9 +46,8 @@ pub(super) fn points_equal(a: &[G1AffineLimbs], b: &[G1AffineLimbs]) -> bool {
     done.is_some() && !differs.load(Relaxed)
 }
 
-/// Whether `p` is a point of G1: the point at infinity (all zero), or a
-/// point on the curve (blst) in the prime-order subgroup (midnight-curves
-/// `is_torsion_free`, blst `blst_p1_affine_in_g1`).
+/// Whether `p` is in G1: all zero (infinity), or on the curve and in the
+/// prime-order subgroup.
 pub(super) fn in_g1(p: &G1AffineLimbs) -> bool {
     if p.iter().all(|&w| w == 0) {
         return true;
@@ -69,8 +66,8 @@ pub(super) fn in_g1(p: &G1AffineLimbs) -> bool {
     on_curve && bool::from(aff.is_torsion_free())
 }
 
-/// The first index of `bases` whose point is not in G1 ([`in_g1`]), or
-/// `bases.len()`. A part that panicked counts from its start.
+/// The first index of `bases` not in G1, or `bases.len()`. A panicked part
+/// counts from its start.
 pub(super) fn first_not_in_g1(bases: &[G1AffineLimbs]) -> usize {
     let n = bases.len();
     let firsts = par_parts(n, host_threads(), POINT_BLOCK, |lo, hi| {
@@ -79,8 +76,8 @@ pub(super) fn first_not_in_g1(bases: &[G1AffineLimbs]) -> usize {
     firsts.map_or(0, |f| f.into_iter().min().unwrap_or(n))
 }
 
-/// Whether every point of `bases` is in G1 ([`in_g1`]), stopping at the
-/// first that is not; a part that panicked counts as a failure.
+/// Whether every point of `bases` is in G1; a panicked part counts as a
+/// failure.
 pub(super) fn all_in_g1(bases: &[G1AffineLimbs]) -> bool {
     let bad = AtomicBool::new(false);
     let done = par_parts(bases.len(), host_threads(), POINT_BLOCK, |lo, hi| {

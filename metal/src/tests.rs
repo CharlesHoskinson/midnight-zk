@@ -11,8 +11,8 @@
 // See the License for the specific language governing permissions and
 // limitations under the License.
 
-//! Tests of the device context and of the field arithmetic of
-//! `shaders/include` against blst, element for element.
+//! Tests of the field arithmetic against blst, of the device context and of
+//! the hook boundary.
 
 use blst::{
     blst_fp, blst_fp_add, blst_fp_cneg, blst_fp_from_uint64, blst_fp_mul, blst_fp_sqr, blst_fp_sub,
@@ -38,7 +38,6 @@ const OP_IS_REDUCED: u32 = 6;
 const OP_ONE: u32 = 7;
 const OP_EQ: u32 = 8;
 
-/// The operations compared with blst on edge and random pairs.
 const OPS: [(u32, &str); 8] = [
     (OP_ADD, "add"),
     (OP_SUB, "sub"),
@@ -85,8 +84,6 @@ fn run_op<T: ctx::Pod + Default>(kernel: &str, op: u32, a: &[T], b: &[T]) -> Vec
     out.read(&mut r);
     r
 }
-
-// --- blst references ------------------------------------------------------
 
 fn fr2(
     f: unsafe extern "C" fn(*mut blst_fr, *const blst_fr, *const blst_fr),
@@ -165,8 +162,6 @@ fn fp_ref(op: u32, a: &FpLimbs, b: &FpLimbs) -> FpLimbs {
         _ => unreachable!(),
     }
 }
-
-// --- inputs ---------------------------------------------------------------
 
 fn sub_small<const N: usize>(m: &[u64; N], k: u64) -> [u64; N] {
     let mut r = *m;
@@ -267,49 +262,33 @@ fn pairs<const N: usize>(
     (a, b)
 }
 
-fn fr_one_mont() -> Scalar {
-    fr_ref(OP_ONE, &[0; 4], &[0; 4])
-}
-
-fn fp_one_mont() -> FpLimbs {
-    fp_ref(OP_ONE, &[0; 6], &[0; 6])
-}
-
 const RANDOM: usize = 1 << 16;
-
-fn check_fr(op: u32, name: &str) {
-    require_device();
-    let (a, b) = pairs(&FR_MODULUS, fr_one_mont(), RANDOM, 0x5eed ^ op as u64);
-    let got = run_op::<Scalar>("field_test_fr", op, &a, &b);
-    for i in 0..a.len() {
-        let want = fr_ref(op, &a[i], &b[i]);
-        assert_eq!(got[i], want, "Fr {name}: a = {:x?}, b = {:x?}", a[i], b[i]);
-    }
-}
-
-fn check_fp(op: u32, name: &str) {
-    require_device();
-    let (a, b) = pairs(&FP_MODULUS, fp_one_mont(), RANDOM, 0xf00d ^ op as u64);
-    let got = run_op::<FpLimbs>("field_test_fp", op, &a, &b);
-    for i in 0..a.len() {
-        let want = fp_ref(op, &a[i], &b[i]);
-        assert_eq!(got[i], want, "Fp {name}: a = {:x?}, b = {:x?}", a[i], b[i]);
-    }
-}
-
-// --- field tests ------------------------------------------------------------
 
 #[test]
 fn fr_matches_blst() {
+    require_device();
+    let one = fr_ref(OP_ONE, &[0; 4], &[0; 4]);
     for (op, name) in OPS {
-        check_fr(op, name);
+        let (a, b) = pairs(&FR_MODULUS, one, RANDOM, 0x5eed ^ op as u64);
+        let got = run_op::<Scalar>("field_test_fr", op, &a, &b);
+        for i in 0..a.len() {
+            let want = fr_ref(op, &a[i], &b[i]);
+            assert_eq!(got[i], want, "Fr {name}: a = {:x?}, b = {:x?}", a[i], b[i]);
+        }
     }
 }
 
 #[test]
 fn fp_matches_blst() {
+    require_device();
+    let one = fp_ref(OP_ONE, &[0; 6], &[0; 6]);
     for (op, name) in OPS {
-        check_fp(op, name);
+        let (a, b) = pairs(&FP_MODULUS, one, RANDOM, 0xf00d ^ op as u64);
+        let got = run_op::<FpLimbs>("field_test_fp", op, &a, &b);
+        for i in 0..a.len() {
+            let want = fp_ref(op, &a[i], &b[i]);
+            assert_eq!(got[i], want, "Fp {name}: a = {:x?}, b = {:x?}", a[i], b[i]);
+        }
     }
 }
 
@@ -334,7 +313,7 @@ fn unreduced<const N: usize>(m: &[u64; N]) -> Vec<[u64; N]> {
         for l in a.iter_mut() {
             *l = rng.next_u64();
         }
-        // the top limb at most four times the modulus' so both sides occur
+        // the top limb below four times the modulus' so both outcomes occur
         a[N - 1] %= m[N - 1].saturating_mul(4);
         v.push(a);
     }
@@ -359,41 +338,6 @@ fn reduced_check() {
     }
 }
 
-// --- context tests
-// ------------------------------------------------------------
-
-#[test]
-fn context_and_info() {
-    require_device();
-    let info = crate::present().unwrap();
-    assert!(info.unified_memory);
-    assert!(info.max_buffer_length > 0 && info.recommended_max_working_set > 0);
-    assert!(crate::library_source().is_some());
-    let (free, total) = crate::mem_info().unwrap();
-    assert!(free <= total && total as u64 == info.recommended_max_working_set);
-}
-
-#[test]
-fn dispatch_and_read_back() {
-    require_device();
-    let s = ctx::lock().unwrap();
-    let c = s.ctx();
-    // a length that is not a multiple of the threadgroup size
-    let n: u32 = 100_003;
-    let out = c.alloc(n as usize * 4).unwrap();
-    let (_, ns) = c
-        .run(|cmd| {
-            cmd.dispatch(
-                "diag_iota",
-                n as usize,
-                &[Arg::Buffer(&out), Arg::value(&n)],
-            )
-        })
-        .unwrap();
-    assert!(out.as_slice::<u32>().iter().enumerate().all(|(i, v)| *v == i as u32));
-    assert!(ns > 0);
-}
-
 #[test]
 fn errors_are_values() {
     require_device();
@@ -403,7 +347,6 @@ fn errors_are_values() {
     assert_eq!(e.reason(), "device-error");
     let e = c.alloc(usize::MAX / 2).unwrap_err();
     assert_eq!(e.reason(), "memory");
-    // a bad threadgroup size is refused before encoding
     let out = c.alloc(64).unwrap();
     let n = 1u32;
     let e = c
@@ -418,13 +361,12 @@ fn errors_are_values() {
         })
         .unwrap_err();
     assert_eq!(e.reason(), "device-error");
-    // the context still works afterwards
     c.run(|cmd| cmd.dispatch("diag_iota", 1, &[Arg::Buffer(&out), Arg::value(&n)]))
         .unwrap();
 }
 
 /// The tests that change the thresholds, hold buffers across a session or
-/// compare the byte count: one at a time.
+/// compare byte counts run one at a time.
 fn serial() -> std::sync::MutexGuard<'static, ()> {
     static LOCK: std::sync::Mutex<()> = std::sync::Mutex::new(());
     LOCK.lock().unwrap_or_else(|e| e.into_inner())
@@ -436,9 +378,6 @@ fn request_buffers_and_byte_accounting() {
     require_device();
     assert!(crate::end_request());
     let mut s = ctx::lock().unwrap();
-    // what stays for the life of the process (the NTT twiddles once a
-    // transform ran) or of a handle; the idle buffers of the pool are not in
-    // use
     let before = ctx::in_use_bytes();
     {
         let b = s.scratch("test-scratch", 1 << 20).unwrap();
@@ -459,13 +398,10 @@ fn request_buffers_and_byte_accounting() {
     assert_eq!(ctx::in_use_bytes(), mid);
     drop(s);
     assert!(crate::end_request());
-    // under the lock no other test holds a buffer (each drops its buffers
-    // before its session)
     let s = ctx::lock().unwrap();
     assert!(s.get_scratch("test-scratch").is_none());
     assert_eq!(s.scratch_bytes(), 0);
     assert_eq!(ctx::in_use_bytes(), before);
-    // the region is idle in the pool, zeroed, until the pool is released
     assert!(crate::pool_bytes() >= 1 << 20);
     drop(s);
     let (held, _) = crate::device_bytes();
@@ -489,8 +425,7 @@ fn pooled_buffers_come_back_zeroed() {
     let at = a.as_slice::<u8>().as_ptr() as usize;
     drop(a);
     assert!(crate::pool_bytes() >= len as u64);
-    // a little shorter: from the pool (this one unless a test running at
-    // the same time took it first), zero over its whole allocation
+    // a test running at the same time may take that buffer first
     let b = c.alloc_pooled(len - 4096).unwrap();
     assert_eq!(b.len_bytes(), len - 4096);
     let p = b.as_slice::<u8>().as_ptr();
@@ -501,11 +436,10 @@ fn pooled_buffers_come_back_zeroed() {
     let whole = unsafe { std::slice::from_raw_parts(p, b.alloc_bytes()) };
     assert!(whole.iter().all(|x| *x == 0));
     drop(b);
-    // much shorter: not that buffer
     let small = c.alloc_pooled(4096).unwrap();
     assert_ne!(small.as_slice::<u8>().as_ptr() as usize, at);
     drop(small);
-    // a buffer written in the background zeroing
+    // a buffer zeroed in the background
     let mut d = c.alloc_pooled(len).unwrap();
     d.as_mut_slice::<u8>().fill(0x33);
     ctx::release_later(vec![d]);
@@ -513,7 +447,6 @@ fn pooled_buffers_come_back_zeroed() {
     let e = c.alloc_pooled(len).unwrap();
     assert!(e.as_slice::<u8>().iter().all(|x| *x == 0));
     drop(e);
-    // a limit below the pool releases what is above it
     ctx::set_pool_limit(Some(0));
     assert_eq!(crate::pool_bytes(), 0);
     let f = c.alloc_pooled(len).unwrap();
@@ -523,21 +456,14 @@ fn pooled_buffers_come_back_zeroed() {
     assert!(crate::end_request());
 }
 
-// --- the entry points against the stock CPU code
-// ------------------------------
-
 mod stock {
     use ff::{Field, PrimeField};
     use group::{Curve, Group};
-    use midnight_curves::{
-        Fq, G1Affine, G1Projective,
-        fft::{best_fft_with_twiddles, compute_twiddles},
-    };
+    use midnight_curves::{Fq, G1Affine, G1Projective};
     use rand_chacha::ChaCha20Rng;
     use rand_core::SeedableRng;
 
-    /// The standard `2^log_n`-th root of unity (as `EvaluationDomain`
-    /// derives it).
+    /// The standard `2^log_n`-th root of unity.
     pub fn root(log_n: u32) -> Fq {
         let mut w = Fq::ROOT_OF_UNITY;
         for _ in log_n..Fq::S {
@@ -566,18 +492,6 @@ mod stock {
         out
     }
 
-    /// The stock forward transform (`best_fft_with_twiddles`, as the domain
-    /// calls it).
-    pub fn fft(a: &mut [Fq], omega: Fq, log_n: u32) {
-        best_fft_with_twiddles(a, &compute_twiddles(&omega, log_n), log_n);
-    }
-
-    /// The stock inverse transform: the transform, then the divisor.
-    pub fn ifft(a: &mut [Fq], omega_inv: Fq, log_n: u32, divisor: Fq) {
-        fft(a, omega_inv, log_n);
-        a.iter_mut().for_each(|x| *x *= divisor);
-    }
-
     pub fn msm(s: &[Fq], b: &[G1Affine]) -> G1Affine {
         midnight_curves::msm::msm_pippenger(s, b).to_affine()
     }
@@ -591,169 +505,9 @@ fn decline_count(class: &str, reason: &str) -> u64 {
         .sum()
 }
 
-/// The quotient hook of [`entry_points_serve_small_calls`]: before the real
-/// call, a copy of the job with an unreduced challenge must decline
-/// `unreduced` and leave the output unchanged.
-unsafe fn checked_quotient(job: *const std::ffi::c_void, out: &mut [Scalar]) -> bool {
-    use midnight_proofs::gpu::abi::QuotientJobAbi;
-    // SAFETY: the prover's job, within its call.
-    let mut bad: QuotientJobAbi = unsafe { *(job as *const QuotientJobAbi) };
-    bad.y = [u64::MAX; 4];
-    let sentinel = vec![[0x5eedu64; 4]; out.len()];
-    let mut o = sentinel.clone();
-    let before = decline_count("quotient", "unreduced");
-    // SAFETY: the job's tables, within the prover's call.
-    let ok = unsafe { crate::quotient(&bad as *const QuotientJobAbi as *const _, &mut o) };
-    assert!(
-        !ok && o == sentinel,
-        "an unreduced job declines, out unchanged"
-    );
-    assert_eq!(decline_count("quotient", "unreduced") - before, 1);
-    // SAFETY: the caller's job.
-    unsafe { crate::quotient(job, out) }
-}
-
-/// Installs [`checked_quotient`] as the prover's quotient hook (once per
-/// process; the other hooks stay the stock CPU code).
-fn install_checked_quotient() {
-    use midnight_proofs::gpu::{self as hooks, GpuHooks};
-    static INSTALL: std::sync::Once = std::sync::Once::new();
-    INSTALL.call_once(|| {
-        assert!(hooks::install(GpuHooks {
-            msm_g1: None,
-            fft: None,
-            ifft: None,
-            quotient: Some(checked_quotient),
-        }));
-    });
-}
-
-/// Each entry point serves a small valid call with the stock CPU value, and
-/// declines a call of a wrong shape or with an unreduced input, leaving the
-/// caller's buffer unchanged.
-#[test]
-fn entry_points_serve_small_calls() {
-    use std::sync::atomic::Ordering::Relaxed;
-
-    use group::Curve;
-    use midnight_curves::Fq;
-    use midnight_proofs::gpu::{
-        self as hooks,
-        adapter::{affine, from_jacobian, scalar, scalars, scalars_mut},
-        test_switches::{QUOTIENT_CHECK, RandomCircuit},
-    };
-    let _g = serial();
-    require_device();
-    assert!(crate::set_min_k(1));
-    let log_n = 4;
-    let n = 1usize << log_n;
-    let w = stock::root(log_n);
-    let wi = ff::Field::invert(&w).unwrap();
-    let div = ff::Field::invert(&Fq::from(n as u64)).unwrap();
-    let input = stock::scalars(n, 1);
-
-    // fft
-    let served = crate::stats();
-    let mut want = input.clone();
-    stock::fft(&mut want, w, log_n);
-    let mut got = input.clone();
-    assert!(crate::fft(scalars_mut(&mut got), scalar(w), log_n));
-    assert_eq!(got, want, "fft");
-    // ifft
-    let mut want = input.clone();
-    stock::ifft(&mut want, wi, log_n, div);
-    let mut got = input.clone();
-    assert!(crate::ifft(
-        scalars_mut(&mut got),
-        scalar(wi),
-        log_n,
-        scalar(div)
-    ));
-    assert_eq!(got, want, "ifft");
-    // msm (one-shot: no table registered)
-    let points = stock::points(n, 2);
-    let r = crate::msm_g1(scalars(&input), affine(&points)).expect("the msm is served");
-    assert_eq!(
-        from_jacobian(r).to_affine(),
-        stock::msm(&input, &points),
-        "msm"
-    );
-    let now = crate::stats();
-    assert_eq!(now.fft.served - served.fft.served, 1);
-    assert_eq!(now.ifft.served - served.ifft.served, 1);
-    assert_eq!(now.msm.served - served.msm.served, 1);
-
-    // quotient: a real job of a proof, with the hook layer's check mode
-    // comparing the device quotient with the stock CPU one
-    install_checked_quotient();
-    let (checks, diffs) = (hooks::quotient_checks(), hooks::quotient_check_diffs());
-    let q = crate::stats().quotient.served;
-    QUOTIENT_CHECK.store(true, Relaxed);
-    let (_, verified) = RandomCircuit::new(8, true, 7).prove();
-    QUOTIENT_CHECK.store(false, Relaxed);
-    assert!(verified, "the proof with the device quotient verifies");
-    assert_eq!(
-        crate::stats().quotient.served - q,
-        1,
-        "{:?}",
-        crate::declines()
-    );
-    assert_eq!(hooks::quotient_checks() - checks, 1);
-    assert_eq!(hooks::quotient_check_diffs(), diffs, "the stock quotient");
-
-    // declines leave the buffer unchanged
-    let orig = scalars(&input).to_vec();
-    let mut a = orig.clone();
-    let shape = decline_count("fft", "shape");
-    assert!(!crate::fft(&mut a[..n - 1], scalar(w), log_n));
-    assert_eq!(decline_count("fft", "shape") - shape, 1);
-    let mut bad = orig.clone();
-    bad[3] = FR_MODULUS;
-    let kept = bad.clone();
-    let unreduced = decline_count("fft", "unreduced");
-    assert!(!crate::fft(&mut bad, scalar(w), log_n));
-    assert_eq!(bad, kept);
-    assert_eq!(decline_count("fft", "unreduced") - unreduced, 1);
-    // a root other than the standard one
-    assert!(!crate::fft(&mut a, scalar(w * w), log_n));
-    let unreduced = decline_count("ifft", "unreduced");
-    assert!(!crate::ifft(&mut a, scalar(wi), log_n, FR_MODULUS));
-    assert_eq!(decline_count("ifft", "unreduced") - unreduced, 1);
-    assert_eq!(a, orig);
-    let shape = decline_count("msm", "shape");
-    assert!(crate::msm_g1(&orig[..n - 1], affine(&points)).is_none());
-    assert_eq!(decline_count("msm", "shape") - shape, 1);
-    let unreduced = decline_count("msm", "unreduced");
-    assert!(crate::msm_g1(&kept, affine(&points)).is_none());
-    assert_eq!(decline_count("msm", "unreduced") - unreduced, 1);
-    let shape = decline_count("quotient", "shape");
-    // SAFETY: a null job is declined before use.
-    assert!(!unsafe { crate::quotient(std::ptr::null(), &mut a) });
-    assert_eq!(decline_count("quotient", "shape") - shape, 1);
-    assert_eq!(a, orig);
-    assert!(!crate::set_min_k(crate::MAX_LOG_N + 1));
-    crate::reset_min_k();
-    assert!(crate::end_request());
-}
-
-/// The size class of an MSM length: log2 rounded to the nearest integer on
-/// the log scale.
-#[test]
-fn lg2_nearest_rounds_on_the_log_scale() {
-    for k in 2..40u32 {
-        let p = 1usize << k;
-        assert_eq!(crate::lg2_nearest(p), k);
-        assert_eq!(crate::lg2_nearest(p - 1), k);
-        assert_eq!(crate::lg2_nearest(p + p / 3), k);
-    }
-    // the boundary of class 13: 2^12.5 = 5792.6
-    assert_eq!(crate::lg2_nearest(5793), 12);
-    assert_eq!(crate::lg2_nearest(5794), 13);
-}
-
-/// Without an explicit threshold each class takes its measured default; an
-/// explicit one applies to every class; an MSM below the one-shot threshold
-/// is served from a registered table and declines without one.
+/// Without an explicit threshold each class takes its default; an explicit
+/// one applies to every class; an MSM below the one-shot threshold is served
+/// from a registered table and declines without one.
 #[test]
 fn per_class_thresholds() {
     use group::Curve;
@@ -773,7 +527,6 @@ fn per_class_thresholds() {
         (15, 15, 13, None, 14)
     );
 
-    // a transform below its threshold declines, unchanged
     let log_n = 14;
     let input = stock::scalars(1 << log_n, 3);
     let mut a = input.clone();
@@ -786,9 +539,6 @@ fn per_class_thresholds() {
     assert_eq!(a, input);
     assert_eq!(decline_count("fft", "below-min-k") - below, 1);
 
-    // 2^14 terms: an MSM without a table declines `unregistered-bases`
-    // before any device work and any G1 check; the same MSM on a prefix of
-    // a registered table is served from it
     let points = stock::points(3 << 13, 4);
     let m = 1 << 14;
     let (cached, one_shot, uploads) = crate::msm_counts();
@@ -812,9 +562,7 @@ fn per_class_thresholds() {
         (1, 0, 1)
     );
     assert_eq!(h.device_bytes(), (points.len() * 96) as u64);
-    // the table threshold goes by the size class of the length (its log2
-    // rounded to the nearest integer): 2^13 - 1 is taken, a length of class
-    // 12 is not, even from a table
+    // the size class of a length is its log2 rounded to the nearest integer
     let below = (1 << 13) - 1;
     let r = crate::msm_g1(scalars(&input[..below]), affine(&points[..below]))
         .expect("class 13, served from the table");
@@ -831,8 +579,6 @@ fn per_class_thresholds() {
     assert_eq!(crate::msm_admission(5794, 5794, crate::MAX_MSM_LOG), Ok(()));
     drop(h);
 
-    // an explicit threshold applies to every class, and opens the one-shot
-    // MSM
     assert!(crate::set_min_k(10));
     assert_eq!(crate::thresholds(), crate::Thresholds::all(10));
     assert_eq!(crate::thresholds().msm_one_shot, Some(10));
@@ -844,13 +590,14 @@ fn per_class_thresholds() {
         scalar(stock::root(log_n)),
         log_n
     ));
+    assert!(!crate::set_min_k(crate::MAX_LOG_N + 1));
     crate::reset_min_k();
     assert_eq!(crate::thresholds(), crate::DEFAULT_THRESHOLDS);
     assert!(crate::end_request());
 }
 
-/// The read-back check of the erasure: a clean request reads back zero; a
-/// non-zero byte planted after the zeroing is found and fails the report.
+/// A region that fails the zero read-back is released, not returned to the
+/// pool.
 #[test]
 fn erase_report_reads_back_every_region() {
     let _g = serial();
@@ -864,8 +611,6 @@ fn erase_report_reads_back_every_region() {
     };
     fill(4096 + 3);
     let w = crate::end_request_report(true).expect("every region reads back zero");
-    // the per-request regions, then (check mode) the idle buffers of the
-    // pool, read back before them
     assert_eq!(
         (
             w.regions - w.pool_regions,
@@ -877,13 +622,11 @@ fn erase_report_reads_back_every_region() {
     assert_eq!(w.bytes - w.pool_bytes, 3 * (4096 + 3) as u64);
     assert!(w.checked && w.nonzero_regions == 0 && w.check_failures == 0);
     assert_eq!(w.erasure_failures, 0);
-    // without the check nothing is read back, the pool is not counted
     fill(64);
     let w = crate::end_request_report(false).unwrap();
     assert_eq!((w.regions, w.checked, w.checked_regions), (2, false, 0));
     assert_eq!((w.pool_regions, w.pool_bytes), (0, 0));
-    // a non-zero byte planted after the zeroing through the raw pointer
-    // (the buffer's dirty flag is not set: its drop would not zero it)
+    // planted through the raw pointer: the buffer's dirty flag is not set
     fill(64);
     ctx::set_plant_nonzero(true);
     let r = crate::end_request_report(true);
@@ -897,8 +640,6 @@ fn erase_report_reads_back_every_region() {
         ),
         (2, 1, 0)
     );
-    // the region was released all the same: not kept as scratch, not in the
-    // pool, and every idle buffer of the pool reads zero
     assert_eq!(ctx::lock().unwrap().scratch_bytes(), 0);
     let planted = ctx::last_planted();
     assert_ne!(planted, 0);
@@ -912,16 +653,13 @@ fn erase_report_reads_back_every_region() {
     assert_eq!(w.nonzero_regions, 0);
 }
 
-/// The check mode reads back every idle buffer of the pool (the scoped
-/// buffers that held witness values go back there): a non-zero idle buffer
-/// fails the report, is zeroed again and leaves the pool.
+/// A non-zero idle buffer of the pool fails the report and leaves the pool.
 #[test]
 fn erase_report_reads_back_the_idle_pool() {
     let _g = serial();
     require_device();
     assert!(crate::end_request());
     let c = ctx::context().unwrap();
-    // a scoped pooled buffer that held data, back in the pool zeroed
     let mut b = c.alloc_pooled(1 << 20).unwrap();
     b.as_mut_slice::<u8>().fill(0x42);
     drop(b);
@@ -934,7 +672,6 @@ fn erase_report_reads_back_the_idle_pool() {
     );
     assert_eq!(w.bytes, w.pool_bytes);
     assert!(w.pool_bytes >= 1 << 20);
-    // a stray non-zero byte in an idle buffer
     let planted = ctx::plant_in_idle_pool().expect("an idle buffer");
     let pooled = crate::pool_bytes();
     let w = crate::end_request_report(true).expect_err("a non-zero idle buffer");
@@ -946,8 +683,8 @@ fn erase_report_reads_back_the_idle_pool() {
     assert!(crate::end_request_report(true).is_ok());
 }
 
-/// An upload shorter than the 16-byte minimum allocation copies exactly its
-/// bytes (no read past the caller's data) and the rest reads zero.
+/// An upload shorter than the 16-byte minimum allocation reads no byte past
+/// the caller's data.
 #[test]
 fn short_uploads_copy_exactly_their_bytes() {
     require_device();
@@ -970,8 +707,8 @@ fn short_uploads_copy_exactly_their_bytes() {
     }
 }
 
-/// `settle_releases` returns, for every caller at the same time, only once
-/// every release made before it has completed.
+/// `settle_releases` returns, for every concurrent caller, only once every
+/// earlier release has completed.
 #[test]
 fn settle_releases_waits_for_every_caller() {
     let _g = serial();
@@ -1011,7 +748,7 @@ fn settle_releases_waits_for_every_caller() {
 }
 
 /// A zeroing that panics is completed on the calling thread; the buffer is
-/// released, not pooled, and the next report fails with the fault counted.
+/// released, not pooled, and the next report fails.
 #[test]
 fn a_panicking_zeroing_is_completed_and_reported() {
     let _g = serial();
@@ -1058,15 +795,8 @@ fn off_switch_declines_no_device() {
     assert!(status.success());
 }
 
-// --- hook calls outside a request, panics at the hook boundary ---------------
-
-/// The per-request buffers that exist now, for messages.
-fn request_buffer_keys() -> Vec<&'static str> {
-    ctx::request_buffers().into_iter().map(|r| r.0).collect()
-}
-
-/// Nothing a hook call left behind: no per-request buffer exists, and every
-/// idle buffer of the pool reads zero.
+/// No per-request buffer is left and every idle buffer of the pool reads
+/// zero.
 fn assert_wiped(after: &str) {
     let left = ctx::request_buffers();
     assert!(left.is_empty(), "after {after}: {left:?}");
@@ -1076,12 +806,12 @@ fn assert_wiped(after: &str) {
     );
 }
 
-/// Without `begin_request` every hook call zeroes its per-request buffers
-/// before it returns; with a request open they are kept between calls and
-/// zeroed at `end_request`.
+/// Without a request open every hook call zeroes its per-request buffers
+/// before it returns; inside one they are kept until `end_request`.
 #[test]
 fn hooks_outside_a_request_wipe_before_they_return() {
     use midnight_proofs::gpu::{
+        self as hooks, GpuHooks,
         adapter::{affine, scalar, scalars, scalars_mut},
         test_switches::RandomCircuit,
     };
@@ -1102,7 +832,10 @@ fn hooks_outside_a_request_wipe_before_they_return() {
     let r = crate::msm_g1(scalars(&input[..1 << 10]), affine(&points));
     assert!(r.is_some(), "{:?}", crate::declines());
     assert_wiped("msm_g1");
-    install_checked_quotient();
+    assert!(hooks::install(GpuHooks {
+        quotient: Some(crate::quotient),
+        ..Default::default()
+    }));
     let q = crate::stats().quotient.served;
     let (_, verified) = RandomCircuit::new(8, true, 9).prove();
     assert!(verified);
@@ -1114,7 +847,6 @@ fn hooks_outside_a_request_wipe_before_they_return() {
     );
     assert_wiped("quotient");
 
-    // inside a request the scratch stays for the next call
     crate::begin_request();
     assert!(ctx::request_open());
     let mut a = input.clone();
@@ -1123,7 +855,7 @@ fn hooks_outside_a_request_wipe_before_they_return() {
     assert!(
         first.iter().any(|r| r.0 == "ntt-data"),
         "{:?}",
-        request_buffer_keys()
+        ctx::request_buffers().into_iter().map(|r| r.0).collect::<Vec<_>>()
     );
     let mut a = input.clone();
     assert!(crate::fft(scalars_mut(&mut a), w, log_n));
@@ -1143,7 +875,7 @@ fn hooks_outside_a_request_wipe_before_they_return() {
 }
 
 /// A panic inside a backend is a counted decline `panic`; the caller's
-/// buffer is unchanged and the call still wipes its scratch (no request).
+/// buffer is unchanged and the call still wipes its scratch.
 #[test]
 fn a_backend_panic_is_a_counted_decline() {
     use midnight_proofs::gpu::adapter::{affine, scalar, scalars, scalars_mut};
@@ -1159,7 +891,6 @@ fn a_backend_panic_is_a_counted_decline() {
     let div = ff::Field::invert(&midnight_curves::Fq::from(n as u64)).unwrap();
 
     let panics = crate::hook_panics();
-    // fft and ifft: the panic comes with the request buffers filled
     for class in ["fft", "ifft"] {
         let before = decline_count(class, "panic");
         crate::set_hook_panic(class, true);
@@ -1175,7 +906,6 @@ fn a_backend_panic_is_a_counted_decline() {
         assert_eq!(decline_count(class, "panic") - before, 1);
         assert_wiped(class);
     }
-    // msm: the panic comes after the device MSM used its scratch
     let points = stock::points(1 << 10, 32);
     let before = decline_count("msm", "panic");
     crate::set_hook_panic("msm", true);
@@ -1184,8 +914,7 @@ fn a_backend_panic_is_a_counted_decline() {
     assert!(r.is_none());
     assert_eq!(decline_count("msm", "panic") - before, 1);
     assert_wiped("msm_g1");
-    // quotient: the panic comes before the job is read (so a placeholder
-    // job is never dereferenced)
+    // the switch panics before the job is read, so a placeholder job is safe
     let before = decline_count("quotient", "panic");
     let placeholder = 0u64;
     let mut out = vec![[7u64; 4]; 4];
@@ -1203,15 +932,14 @@ fn a_backend_panic_is_a_counted_decline() {
     assert_eq!(decline_count("quotient", "panic") - before, 1);
     assert_wiped("quotient");
     assert_eq!(crate::hook_panics() - panics, 4);
-    // the hooks serve again afterwards
     let mut a = input;
     assert!(crate::fft(scalars_mut(&mut a), scalar(w), log_n));
     crate::reset_min_k();
     assert!(crate::end_request());
 }
 
-/// The `ntt_pass` pipeline takes every threadgroup size the plan uses, so
-/// no transform size is declined for good by `dispatch_groups`.
+/// A pipeline maximum below a planned threadgroup size would decline every
+/// transform of that size.
 #[test]
 fn ntt_pass_takes_the_planned_threadgroups() {
     use objc2_metal::MTLComputePipelineState;

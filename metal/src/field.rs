@@ -11,18 +11,12 @@
 // See the License for the specific language governing permissions and
 // limitations under the License.
 
-//! The two BLS12-381 fields on host limbs.
-//!
-//! A [`Scalar`] is a `blst_fr`: four little-endian `u64` limbs of the
-//! Montgomery form `a * 2^256 mod r`, reduced. An [`FpLimbs`] is a
-//! `blst_fp`: six limbs of `a * 2^384 mod p`. The device types `Fr` and `Fp`
-//! of `shaders/include/fr.h` and `fp.h` are the same bytes. Arithmetic on the
-//! host goes through `blst`; this module only holds the moduli and the
-//! reduction check every entry point applies to its scalars.
+//! The BLS12-381 moduli on host limbs and the reduction check every entry
+//! point applies. Arithmetic on the host goes through `blst`.
 
 use crate::Scalar;
 
-/// A base-field element: `blst_fp` limbs.
+/// A base-field element: `blst_fp`, six limbs, Montgomery form.
 pub type FpLimbs = [u64; 6];
 
 /// The scalar-field modulus `r`, little-endian limbs.
@@ -72,8 +66,7 @@ pub fn all_reduced(a: &[Scalar]) -> bool {
     }
     let threads = std::thread::available_parallelism().map_or(4, |t| t.get()).min(16);
     let per = a.len().div_ceil(threads).max(PART);
-    // a part whose thread cannot be made (or failed) is checked on this
-    // thread: no panic on thread exhaustion
+    // a part whose thread cannot be made is checked on this thread
     std::thread::scope(|s| {
         let hs: Vec<_> = a
             .chunks(per)

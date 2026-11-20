@@ -11,15 +11,11 @@
 // See the License for the specific language governing permissions and
 // limitations under the License.
 
-// The G1 MSM kernels: a port of sppark's Pippenger MSM to Metal.
-//
-// Transcribed from sppark `msm/pippenger.cuh` (breakdown, accumulate,
-// integrate), `msm/sort.cuh` (the per-window counting sort) and
-// `msm/batch_addition.cuh` (batch_addition), Copyright Supranational LLC,
-// Apache-2.0 (https://github.com/supranational/sppark, commit
-// 08033103c14ff3c742e710b9463dde42acc0f058, vendored in
-// gpu/third_party/sppark). `src/msm.rs` drives them; its module text lists
-// where the port departs from sppark.
+// The G1 MSM kernels, driven by `src/msm.rs`. Ported from sppark
+// `msm/pippenger.cuh`, `msm/sort.cuh` and `msm/batch_addition.cuh`
+// (Copyright Supranational LLC, Apache-2.0,
+// https://github.com/supranational/sppark, commit
+// 08033103c14ff3c742e710b9463dde42acc0f058).
 //
 // Layout (per batch of `len` points, `stride` the batch capacity):
 // - digits: `nwins` rows of `stride` uint. `msm_digits` writes the signed
@@ -75,9 +71,8 @@ MONT_INLINE uint booth_encode(uint wval, uint wmask, uint wbits) {
 
 } // namespace msm
 
-// `hot` (one uint, see `msm_bucket_guard`) is reset here, at the start of
-// each chunk's command buffer. In the mask mode `scalars` is not read (the
-// host binds the scalars buffer, never the output).
+// Resets `hot` at the start of each chunk's command buffer. In the mask mode
+// `scalars` is bound but not read.
 kernel void msm_digits(device const Fr *scalars [[buffer(0)]],
                        device uint *digits [[buffer(1)]],
                        constant msm::DigitsParams &p [[buffer(2)]],
@@ -133,18 +128,11 @@ kernel void msm_digits(device const Fr *scalars [[buffer(0)]],
 // ---------------------------------------------------------------------------
 // The per-window sort (sppark `sort.cuh`, the two-level path of `sort_row`).
 //
-// sppark runs `upper_sort` (count, prefix sums across blocks, scatter by the
-// top bits) and `lower_sort` (one block per top bucket: count, prefix sums,
-// scatter by the low bits) in one cooperative kernel with grid-wide barriers.
-// Metal has no grid-wide barrier: each barrier is a dispatch boundary here,
-// so the sort is four kernels in one command buffer:
-//   msm_sort_count   (upper_sort: count_digits, counters to memory)
-//   msm_sort_scan    (upper_sort: prefix sums of the counters across groups)
-//   msm_sort_scatter (upper_sort: scatter)
-//   msm_sort_lower   (lower_sort)
-// The per-group counters live in their own buffer instead of the spare
-// entries of the histogram row. A pass sorts `pass` windows from `win0`; the
-// group index is `window * G + group`.
+// Metal has no grid-wide barrier, so sppark's cooperative `upper_sort` and
+// `lower_sort` become four kernels in one command buffer: `msm_sort_count`,
+// `msm_sort_scan` (prefix sums across groups), `msm_sort_scatter` and
+// `msm_sort_lower`. A pass sorts `pass` windows from `win0`; the group index
+// is `window * G + group`.
 
 namespace msm {
 
@@ -181,11 +169,9 @@ MONT_INLINE void slice_of(uint len, uint groups, uint g, thread uint &base, thre
         base = slice * g + rem;
 }
 
-// Exclusive prefix sum over the threadgroup of one value per thread; the
-// threadgroup is whole SIMD-groups of `width` (at least 32, so that the
-// `nsg <= 32` group totals fit one SIMD-group; the host checks that the
-// width is 32). `total` is the sum of all values. (sppark builds this from
-// `shfl.sync.up`; here the SIMD-group prefix sum.)
+// Exclusive prefix sum over the threadgroup, one value per thread; `total` is
+// the sum of all values. The threadgroup is whole SIMD-groups of 32 (the host
+// checks the width), so the group totals fit one SIMD-group.
 MONT_INLINE uint group_exclusive_sum(uint x, threadgroup uint *sg_tot, uint lane, uint sg, uint nsg,
                                      uint width, thread uint &total) {
     uint incl = simd_prefix_inclusive_sum(x);
@@ -373,14 +359,11 @@ kernel void msm_sort_lower(device uint *digits [[buffer(0)]],
 }
 
 // ---------------------------------------------------------------------------
-// sppark `batch_addition` (the digits-only form): the bucket of digit 1 in
-// window 0 (the first `hist[0]` sorted entries of row 0), summed by every
-// thread of the grid, then reduced within each SIMD-group (sppark's
-// `shfl_down` reduction with `simd_shuffle_down`). One partial sum per 32
-// threads of the grid, written by the thread whose grid index is a multiple
-// of 32: with SIMD-groups of 32 (the host checks the width) or any multiple
-// of 32, each run of 32 lanes reduces into its first lane, so every one of
-// the `threads / 32` records the host reads is written at every run.
+// sppark `batch_addition`: the bucket of digit 1 in window 0 (the first
+// `hist[0]` sorted entries of row 0), summed by the whole grid, then reduced
+// in runs of 32 lanes. The thread whose grid index is a multiple of 32 writes
+// one partial sum, so every one of the `threads / 32` records is written at
+// every run.
 
 namespace msm {
 
@@ -430,10 +413,8 @@ kernel void msm_ones(device g1::Xyzz *ones [[buffer(0)]],
 
 // ---------------------------------------------------------------------------
 // sppark `accumulate`: one thread per bucket (window y, bucket x) sums its
-// sorted points with mixed additions into XYZZ. sppark hands out buckets
-// through a global atomic counter to persistent warps; here each bucket is
-// one thread of the grid and the hardware schedules the threads. The bucket
-// of digit 1 in window 0 is left to `msm_ones`, as in sppark.
+// sorted points with mixed additions into XYZZ. The bucket of digit 1 in
+// window 0 is left to `msm_ones`.
 
 namespace msm {
 struct AccParams {

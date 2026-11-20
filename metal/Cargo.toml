@@ -16,11 +16,8 @@ workspace = true
 
 [features]
 default = []
-# Test only, never a default: the test switches (the erasure check's planted
-# non-zero byte, injected panics, the pool inspection helpers, the quotient's
-# numerator entry point) and the test kernels (`shaders/field_test.metal`,
-# `msm_test.metal`, `diag.metal`), for this crate's tests and those of
-# `midnight-gpu-prover`.
+# Test only: the test switches, test entry points and test kernels, for this
+# crate's tests and those of `midnight-gpu-prover`.
 test-support = []
 
 [dependencies]

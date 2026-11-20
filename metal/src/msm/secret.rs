@@ -12,8 +12,7 @@
 // limitations under the License.
 
 //! Host values derived from the scalars: guards that zero them when dropped,
-//! and the stack scrub ("Values derived from the scalars" in the module
-//! text).
+//! and the stack scrub.
 
 use std::{
     mem::size_of,
@@ -21,9 +20,8 @@ use std::{
     sync::atomic::{Ordering::SeqCst, compiler_fence},
 };
 
-/// Writes zero over `len` bytes at `p` with volatile writes (words where
-/// aligned), then a compiler fence: the zeroing is never elided, even right
-/// before the memory is freed.
+/// Zeroes `len` bytes at `p` with volatile writes and a compiler fence, so the
+/// zeroing is never elided, even right before the memory is freed.
 ///
 /// # Safety
 /// `p` is valid for writes of `len` bytes.
@@ -53,8 +51,8 @@ pub(super) fn wipe<T: Copy>(v: &mut T) {
     unsafe { zero_volatile((v as *mut T).cast::<u8>(), size_of::<T>()) };
 }
 
-/// One value derived from the scalars (a partial sum, a bucket sum): zeroed
-/// when dropped, on every exit, unwinding included.
+/// One value derived from the scalars, zeroed when dropped (unwinding
+/// included).
 pub(super) struct Secret<T: Copy>(pub(super) T);
 
 impl<T: Copy> Deref for Secret<T> {
@@ -78,10 +76,9 @@ impl<T: Copy> Drop for Secret<T> {
     }
 }
 
-/// A host vector of values derived from the scalars (copies of the bucket
-/// sums, window sums): its whole allocation is zeroed when it is dropped, on
-/// every exit, unwinding included. It is made with its final capacity and
-/// never grows past it (a reallocation would leave the old block unzeroed).
+/// A vector of values derived from the scalars; its whole allocation is
+/// zeroed when dropped. It never grows past its initial capacity, because a
+/// reallocation would leave the old block unzeroed.
 pub(super) struct SecretVec<T: Copy>(Vec<T>);
 
 impl<T: Copy> SecretVec<T> {
@@ -89,8 +86,7 @@ impl<T: Copy> SecretVec<T> {
         SecretVec(Vec::with_capacity(n))
     }
 
-    /// Appends `s` if it fits in the capacity; `false` (nothing appended)
-    /// otherwise.
+    /// Appends `s` if it fits in the capacity; `false` otherwise.
     pub(super) fn extend_within(&mut self, s: &[T]) -> bool {
         if self.0.capacity() - self.0.len() < s.len() {
             return false;
@@ -128,12 +124,10 @@ impl<T: Copy> Drop for SecretVec<T> {
 pub(super) const SCRUB_BYTES: usize = 64 * 1024;
 
 /// Zeroes [`SCRUB_BYTES`] of the calling thread's stack below the caller's
-/// frame, where the host collection (`integrate_row`, the window ladder,
-/// `blst` additions and their spilled coordinates: functions of the scalar
-/// digits) or the CPU share kept its temporaries; the counterpart of the
-/// CUDA patch's `scrub_stack` (`explicit_bzero` plus an asm barrier). The
-/// writes are volatile and the buffer escapes through `black_box`, so neither
-/// is elided; out of line, so the buffer lies below the caller's frame.
+/// frame, where the host collection, `blst` or the CPU share left temporaries
+/// derived from the scalars. The writes are volatile and the buffer escapes
+/// through `black_box`; the function is out of line so the buffer lies below
+/// the caller's frame.
 #[inline(never)]
 pub(super) fn scrub_stack() {
     let mut buf = std::mem::MaybeUninit::<[u64; SCRUB_BYTES / 8]>::uninit();
@@ -146,8 +140,7 @@ pub(super) fn scrub_stack() {
     compiler_fence(SeqCst);
 }
 
-/// Runs [`scrub_stack`] when dropped: on every exit of the frame that holds
-/// it, unwinding included (the CUDA patch's `worker_exit_t`).
+/// Runs [`scrub_stack`] when dropped, on every exit including unwinding.
 pub(super) struct ScrubOnExit;
 
 impl Drop for ScrubOnExit {

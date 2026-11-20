@@ -11,8 +11,7 @@
 // See the License for the specific language governing permissions and
 // limitations under the License.
 
-//! Host threads and locks that never panic out: panics caught as values,
-//! parallel parts, poison-tolerant locks.
+//! Host threads and locks that never panic out.
 
 use std::{
     panic::AssertUnwindSafe,
@@ -30,11 +29,9 @@ pub(super) fn catch<R>(f: impl FnOnce() -> R) -> Option<R> {
 }
 
 /// `f(a, b)` over parts `[a, b)` of `[0, len)` (at most `parts` parts of at
-/// least `min` items), in order: the first part on the calling thread, the
-/// others on scoped threads; a part whose thread cannot be started runs on
-/// the calling thread. `None`: a part panicked (every started thread has been
-/// joined, and the results of the other parts dropped). Nothing panics out
-/// of this function.
+/// least `min` items): the first on the calling thread, the others on scoped
+/// threads, or on the calling thread when a thread cannot be started.
+/// `None`: a part panicked. Never panics.
 pub(super) fn par_parts<R: Send>(
     len: usize,
     parts: usize,
@@ -78,8 +75,8 @@ pub(super) fn par_parts<R: Send>(
     })
 }
 
-/// A read lock, poisoned or not (the data under these locks is valid after
-/// any panic: whole values are replaced under them).
+/// A read lock, poisoned or not: data under these locks is only ever replaced
+/// whole, so it is valid after any panic.
 pub(super) fn read<T>(l: &RwLock<T>) -> RwLockReadGuard<'_, T> {
     l.read().unwrap_or_else(|e| e.into_inner())
 }
