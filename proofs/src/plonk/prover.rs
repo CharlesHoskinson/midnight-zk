@@ -414,8 +414,6 @@ where
         quotient_committed.poly(&h0).expect("a quotient limb h_0"),
         x,
     );
-    // With the feature `prover-par`, in tasks of bounded size (see
-    // `crate::par::open`).
     #[cfg(feature = "prover-par")]
     let h0_eval = crate::par::open::eval_many(&[(
         &quotient_committed.poly(&h0).expect("a quotient limb h_0").values[..],
@@ -593,10 +591,7 @@ where
         meta.constants.clone(),
         pk.region_starts.as_deref(),
     )?;
-    // With the feature `prover-par`, a key without a layout from keygen
-    // stores the layout its first proof measures, and later proofs reuse it
-    // when their circuit matches it, region by region; otherwise the witness
-    // is emptied and synthesized again as above (see `crate::par::layout`).
+    // See `crate::par::layout`.
     #[cfg(feature = "prover-par")]
     crate::par::layout::synthesize(
         &mut witness,
@@ -806,7 +801,6 @@ where
     // blinding coefficients appended below, within the same capacity.
     // The stock `resize` of the whole `h` and the per-limb `to_vec`
     // copies, which reallocate and leave unzeroed copies, do not happen.
-    // The limbs are allocated and filled in parallel.
     let h: &[F] = &h_poly;
     let mut h_limbs: Vec<_> = (0..nb_limbs)
         .into_par_iter()

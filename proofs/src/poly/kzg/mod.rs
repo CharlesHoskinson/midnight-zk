@@ -280,8 +280,6 @@ impl<E: KZGEngine> PolynomialCommitmentScheme<E::Fr> for KZGCommitmentScheme<E> 
             polys: &[&Polynomial<F, Coeff>],
             scalars: impl IntoIterator<Item = F>,
         ) -> Polynomial<F, Coeff> {
-            // With the feature `prover-par`, long polynomials are summed in
-            // tasks of bounded size (see `crate::par::open`).
             #[cfg(feature = "prover-par")]
             if polys.iter().map(|p| p.len()).max().unwrap_or(0) >= crate::par::INNER_PRODUCT_MIN_LEN
             {
@@ -377,8 +375,6 @@ impl<E: KZGEngine> PolynomialCommitmentScheme<E::Fr> for KZGCommitmentScheme<E> 
         #[cfg(not(feature = "prover-par"))]
         let q_evals: Vec<E::Fr> =
             q_polys.par_iter().map(|q_poly| eval_polynomial(&q_poly.values, x3)).collect();
-        // With the feature `prover-par`, in tasks of bounded size (see
-        // `crate::par::open`).
         #[cfg(feature = "prover-par")]
         let q_evals: Vec<E::Fr> = crate::par::open::eval_many(
             &q_polys.iter().map(|q_poly| (&q_poly.values[..], x3)).collect::<Vec<_>>(),
@@ -411,10 +407,8 @@ impl<E: KZGEngine> PolynomialCommitmentScheme<E::Fr> for KZGCommitmentScheme<E> 
                 PolynomialLabel::Custom("kzg_proof".into()),
             )
         };
-        // With the feature `prover-par`, the quotient by `X - x3` is divided
-        // from `final_poly` itself, in parallel blocks: it does not depend on
-        // the constant coefficient, so neither `v` nor the copy
-        // `final_poly - v` is needed (see `crate::par::open`).
+        // The quotient does not depend on the constant coefficient, so `v`
+        // and the copy `final_poly - v` are not needed.
         #[cfg(feature = "prover-par")]
         let pi = {
             let pi_poly = Polynomial::<_, Coeff> {

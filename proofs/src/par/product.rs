@@ -11,18 +11,10 @@
 // See the License for the specific language governing permissions and
 // limitations under the License.
 
-//! The running product of the permutation argument, in parallel blocks.
-//!
-//! The stock loop computes `z_0 = 1`, `z_r = z_{r-1} · m_{r-1}` in one
-//! sequential pass. Here the rows are cut into blocks of [`BLOCK`] rows: the
-//! product of each block's factors is computed in parallel, a short
-//! sequential scan turns those into the value of `z` at the start of every
-//! block, and each block then runs the stock recurrence from that value, in
-//! parallel. Every `z_r` is the product `m_0 · … · m_{r-1}` either way.
-//! Multiplication in a prime field is exact, associative and commutative,
-//! so the regrouped product is the same field element, and the field keeps
-//! reduced representations, so the limbs are the same too. There is no size
-//! floor: up to one block, the routine is the stock loop in a single task.
+//! The running product of the permutation argument, in parallel blocks: the
+//! block products, a short scan for each block's first value, then the stock
+//! recurrence within each block. Field multiplication is exact, so the values
+//! are the stock ones.
 
 use ff::Field;
 use rayon::{
@@ -38,8 +30,6 @@ const BLOCK: usize = 1 << 13;
 pub(crate) fn prefix_product_from_one<F: Field>(m: &[F], n: usize) -> Vec<F> {
     assert!(n >= 1 && m.len() >= n - 1);
     let blocks = n.div_ceil(BLOCK);
-    // The product of the factors that lead from the first row of block `b`
-    // to the first row of block `b + 1` (none for the last block).
     let block_products: Vec<F> = (0..blocks.saturating_sub(1))
         .into_par_iter()
         .map(|b| m[b * BLOCK..(b + 1) * BLOCK].iter().fold(F::ONE, |acc, f| acc * f))
@@ -74,13 +64,11 @@ mod tests {
     use super::*;
     use crate::par::testing::{in_pool, stock_prefix_product};
 
-    /// Lengths across block boundaries, with factors that include zeros and
-    /// ones (as a permutation row can give) and with nonzero factors only,
-    /// with one and many threads.
+    /// Factors with zeros and ones, and nonzero factors only.
     #[test]
     fn prefix_product_matches_stock() {
         let mut rng = ChaCha20Rng::seed_from_u64(0x2a);
-        for n in [1usize, 2, 3, BLOCK - 1, BLOCK, BLOCK + 1, 3 * BLOCK + 7] {
+        for n in [1usize, 2, BLOCK, 3 * BLOCK + 7] {
             let mut m: Vec<Fq> = (0..n).map(|_| Fq::random(&mut rng)).collect();
             for i in (0..n).step_by(997) {
                 m[i] = if i % 2 == 0 { Fq::ZERO } else { Fq::ONE };

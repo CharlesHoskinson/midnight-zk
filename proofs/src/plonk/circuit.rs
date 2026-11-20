@@ -659,11 +659,10 @@ pub trait FloorPlanner {
         Self::synthesize(cs, circuit, config, constants)
     }
 
-    /// With the feature `prover-par` (see `crate::par::layout`): the
-    /// synthesis of [`synthesize_with_cached_regions`] without cached
-    /// regions, also returning the layout it measures when the planner can
-    /// check that layout in [`synthesize_checking_layout`]. The default
-    /// measures nothing and returns `None`.
+    /// [`synthesize_with_cached_regions`] without cached regions, also
+    /// returning the measured layout if the planner can check it in
+    /// [`synthesize_checking_layout`] (see `crate::par::layout`). The default
+    /// returns `None`.
     ///
     /// [`synthesize_with_cached_regions`]: Self::synthesize_with_cached_regions
     /// [`synthesize_checking_layout`]: Self::synthesize_checking_layout
@@ -679,19 +678,12 @@ pub trait FloorPlanner {
         Ok(None)
     }
 
-    /// With the feature `prover-par` (see `crate::par::layout`): synthesizes
-    /// `circuit` into `cs` with the region starts of `layout` (from
-    /// [`synthesize_measuring_layout`]), without the shape pass, checking
-    /// that every region the circuit opens has the measured shape of
-    /// `layout` at its index and that it opens as many regions.
+    /// Synthesizes `circuit` into `cs` at the region starts of `layout`
+    /// without the shape pass, checking each region against `layout`.
     ///
-    /// Returns `true` when the synthesis succeeded and matched `layout`:
-    /// `cs` then holds the assignment of the stock synthesis. Returns
-    /// `false` on any mismatch or error, without panicking: `cs` then holds
-    /// a partial assignment that the caller must discard. The default
-    /// returns `false` without touching `cs`.
-    ///
-    /// [`synthesize_measuring_layout`]: Self::synthesize_measuring_layout
+    /// Returns `false` on any mismatch or error, leaving a partial assignment
+    /// in `cs` that the caller must discard. The default returns `false`
+    /// without touching `cs`.
     #[cfg(feature = "prover-par")]
     #[doc(hidden)]
     fn synthesize_checking_layout<F: Field, CS: Assignment<F> + SyncDeps, C: Circuit<F>>(

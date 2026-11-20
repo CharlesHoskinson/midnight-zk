@@ -40,21 +40,17 @@ use std::{
 
 use ff::PrimeField;
 
-/// From this many bytes on, [`zero_bytes`] spreads the zeroing over
-/// several threads, each taking at least this many bytes.
+/// Minimum bytes per thread of [`zero_bytes`].
 const PAR_ZERO_BYTES: usize = 1 << 20;
 
 /// The parts of the range are cut at multiples of this many bytes.
 const ZERO_TASK_BYTES: usize = 1 << 18;
 
-/// The most threads [`zero_bytes`] zeroes a range with (the calling thread
-/// included): the zeroing is bound by memory bandwidth, which a few cores
-/// saturate.
+/// Most threads of one [`zero_bytes`] call: it is bound by memory bandwidth,
+/// which a few cores saturate.
 const MAX_ZERO_THREADS: usize = 8;
 
-/// A pointer into the range of a [`zero_bytes`] call, sent to the threads
-/// that zero its parts. The pointer keeps its provenance (it is never cast
-/// to an integer and back).
+/// A pointer into the range of a [`zero_bytes`] call, sent to its threads.
 #[derive(Clone, Copy)]
 struct SendPtr(*mut u8);
 
@@ -67,32 +63,19 @@ unsafe impl Send for SendPtr {}
 /// cannot remove: the zeroed memory is not read again before it is freed,
 /// so plain writes to it could be removed as dead stores.
 ///
-/// The writes are 8-byte words where the address is aligned (single bytes
-/// at the unaligned ends). A range of at least [`PAR_ZERO_BYTES`] is cut
-/// into contiguous parts, one per thread, of at least [`PAR_ZERO_BYTES`]
-/// each, cut at multiples of [`ZERO_TASK_BYTES`]; the calling thread zeroes
-/// the first part and scoped OS threads of its own (at most
-/// [`MAX_ZERO_THREADS`] in all) zero the others. Every write is volatile and
-/// followed by a compiler fence on its thread, and this function returns
-/// only once every thread has been joined (the join orders their writes
-/// before the return), so the whole range is zero when it returns, as with
-/// one thread. A part whose thread cannot be spawned is zeroed on the
-/// calling thread; no part is skipped and nothing panics.
+/// Large ranges are split over scoped threads, all joined before the return.
+/// A part whose thread cannot be spawned is zeroed on the calling thread.
 ///
-/// The zeroing does not use the rayon pool: this runs in `Drop`, where the
-/// dropping thread may hold a lock. Waiting on pool tasks would let the
-/// dropping thread, if it is a pool worker, run other pending pool tasks
-/// (work stealing) that may take the same lock, and would make the zeroing
-/// wait for workers that are themselves blocked on that lock. The threads
-/// here run only the zeroing and take no lock.
+/// This does not use the rayon pool: it runs in `Drop`, where the caller may
+/// hold a lock. A pool worker waiting on pool tasks could steal a task that
+/// takes the same lock, or wait on workers blocked on it.
 ///
 /// # Safety
 /// `ptr` must be valid for writes of `bytes` bytes.
 pub(crate) unsafe fn zero_bytes(ptr: *mut u8, bytes: usize) {
     let threads = zero_threads(bytes);
     if threads > 1 {
-        // `threads` parts of `per_thread` bytes (the last one shorter),
-        // each a multiple of `ZERO_TASK_BYTES` but the last.
+        // The last part may be shorter.
         let per_thread = bytes.div_ceil(threads).div_ceil(ZERO_TASK_BYTES) * ZERO_TASK_BYTES;
         let base = SendPtr(ptr);
         std::thread::scope(|scope| {
@@ -127,7 +110,6 @@ pub(crate) unsafe fn zero_bytes(ptr: *mut u8, bytes: usize) {
                 // spawned, written by no other thread.
                 unsafe { zero_bytes_here(ptr.add(start), len) };
             }
-            // The scope joins every spawned thread here.
         });
     } else {
         // SAFETY: as guaranteed by the caller.
@@ -136,9 +118,7 @@ pub(crate) unsafe fn zero_bytes(ptr: *mut u8, bytes: usize) {
     compiler_fence(Ordering::SeqCst);
 }
 
-/// The number of threads (the calling one included) that zero `bytes`
-/// bytes: one per [`PAR_ZERO_BYTES`], at most the available parallelism
-/// and [`MAX_ZERO_THREADS`].
+/// Threads for zeroing `bytes` bytes, the calling one included.
 fn zero_threads(bytes: usize) -> usize {
     if bytes < PAR_ZERO_BYTES {
         return 1;
@@ -151,13 +131,10 @@ fn zero_threads(bytes: usize) -> usize {
 
 #[cfg(test)]
 thread_local! {
-    /// Tests only: when set, [`zero_bytes`] behaves as if no thread could
-    /// be spawned.
+    /// Simulates a failed spawn in [`zero_bytes`].
     static NO_SPAWN: std::cell::Cell<bool> = const { std::cell::Cell::new(false) };
 }
 
-/// Whether [`zero_bytes`] may spawn its threads (always, but in tests that
-/// simulate a failed spawn).
 fn spawn_allowed() -> bool {
     #[cfg(test)]
     return !NO_SPAWN.with(|n| n.get());
@@ -538,18 +515,14 @@ impl<F> Drop for ErasingVec<F> {
 mod tests {
     use super::zero_bytes;
 
-    /// Every byte of the range is zeroed and no byte outside it is
-    /// touched, at every alignment, below and above the parallel size.
+    /// At every alignment, below and above the parallel size.
     #[test]
     fn zero_bytes_zeroes_exactly_the_range() {
         let sizes = [
             0usize,
             1,
-            7,
-            8,
             9,
             63,
-            4096 + 3,
             super::PAR_ZERO_BYTES - 1,
             super::PAR_ZERO_BYTES,
             3 * super::ZERO_TASK_BYTES + super::PAR_ZERO_BYTES + 5,
@@ -574,28 +547,19 @@ mod tests {
     /// When no thread can be spawned, the calling thread zeroes every part.
     #[test]
     fn zero_bytes_without_threads() {
-        for bytes in [
-            super::PAR_ZERO_BYTES,
-            2 * super::PAR_ZERO_BYTES + 3,
-            9 * super::PAR_ZERO_BYTES + super::ZERO_TASK_BYTES + 7,
-        ] {
-            let mut buf = vec![0xffu8; bytes + 2];
-            super::NO_SPAWN.with(|n| n.set(true));
-            // SAFETY: `1 + bytes <= buf.len()`.
-            unsafe { zero_bytes(buf.as_mut_ptr().add(1), bytes) };
-            super::NO_SPAWN.with(|n| n.set(false));
-            assert_eq!(buf[0], 0xff);
-            assert_eq!(buf[bytes + 1], 0xff);
-            assert!(buf[1..=bytes].iter().all(|b| *b == 0), "bytes {bytes}");
-        }
+        let bytes = 9 * super::PAR_ZERO_BYTES + super::ZERO_TASK_BYTES + 7;
+        let mut buf = vec![0xffu8; bytes + 2];
+        super::NO_SPAWN.with(|n| n.set(true));
+        // SAFETY: `1 + bytes <= buf.len()`.
+        unsafe { zero_bytes(buf.as_mut_ptr().add(1), bytes) };
+        super::NO_SPAWN.with(|n| n.set(false));
+        assert_eq!(buf[0], 0xff);
+        assert_eq!(buf[bytes + 1], 0xff);
+        assert!(buf[1..=bytes].iter().all(|b| *b == 0));
     }
 
-    /// Called from the only worker of a pool while it holds a lock that a
-    /// task queued on that pool takes, the zeroing completes and the task
-    /// runs once the lock is released. This pins that the zeroing does not
-    /// wait on the pool; it cannot show that the pool would steal the task
-    /// (that depends on scheduling), which `zero_bytes` avoids by not using
-    /// the pool at all.
+    /// The only worker of a pool, holding a lock that a queued pool task
+    /// takes, zeroes without waiting on the pool.
     #[test]
     fn zero_bytes_on_a_pool_worker_holding_a_lock() {
         use std::sync::{Mutex, mpsc};

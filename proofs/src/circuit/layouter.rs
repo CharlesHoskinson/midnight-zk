@@ -312,43 +312,35 @@ impl<F: Field> RegionLayouter<F> for RegionShape {
     }
 }
 
-/// With the feature `prover-par`: one region of a layout measured during a
-/// synthesis, in synthesis order (see `crate::par::layout`). Besides the
-/// start of the region it holds what determines that start in the shape
-/// pass of [`SimpleFloorPlanner`](super::SimpleFloorPlanner): the columns and
-/// the row count of the region, and the number of global constants it
-/// assigns (they advance the first free row of the constants column).
+/// One region of a measured layout (see `crate::par::layout`): its start and
+/// what determines the next starts in the shape pass of
+/// [`SimpleFloorPlanner`](super::SimpleFloorPlanner).
 #[cfg(feature = "prover-par")]
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub(crate) struct MeasuredRegion {
     pub(crate) start: super::RegionStart,
-    /// The index of the region's columns in
-    /// [`MeasuredLayout::column_sets`].
+    /// Index into [`MeasuredLayout::column_sets`].
     pub(crate) columns: usize,
     pub(crate) row_count: usize,
+    /// Global constants the region assigns.
     pub(crate) constants: usize,
 }
 
-/// With the feature `prover-par`: the regions of a synthesis, in synthesis
-/// order (see [`MeasuredRegion`]). The column sets of the regions are kept
-/// once each: the regions of a circuit mostly repeat a few sets.
-///
-/// Public (and hidden from the docs) only because the provided methods
-/// `synthesize_measuring_layout` and `synthesize_checking_layout` of the
-/// public trait [`FloorPlanner`](crate::plonk::FloorPlanner) name it. Its
-/// fields are private to this crate, so outside it the type is opaque.
+/// The regions of a synthesis, in order, with each distinct column set kept
+/// once. Public only because methods of the public trait
+/// [`FloorPlanner`](crate::plonk::FloorPlanner) name it; opaque outside this
+/// crate.
 #[cfg(feature = "prover-par")]
 #[doc(hidden)]
 #[derive(Clone, Debug, Default, PartialEq, Eq)]
 pub struct MeasuredLayout {
-    /// The distinct column sets of the regions, each sorted.
+    /// Distinct column sets, each sorted.
     pub(crate) column_sets: Vec<Vec<RegionColumn>>,
     pub(crate) regions: Vec<MeasuredRegion>,
 }
 
 #[cfg(all(feature = "prover-par", test))]
 impl MeasuredLayout {
-    /// The region starts, in synthesis order.
     pub(crate) fn starts(&self) -> Vec<super::RegionStart> {
         self.regions.iter().map(|r| r.start).collect()
     }

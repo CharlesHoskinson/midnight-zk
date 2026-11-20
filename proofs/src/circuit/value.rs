@@ -55,8 +55,8 @@ impl<V> Value<V> {
 
     /// Obtains the inner value for assigning into the circuit.
     ///
-    /// Returns `Error::Synthesis` if this is [`Value::unknown()`]. The error
-    /// and its message are built only then, not for every assigned cell.
+    /// Returns `Error::Synthesis` if this is [`Value::unknown()`], built only
+    /// then.
     #[cfg(feature = "prover-par")]
     pub(crate) fn assign(self) -> Result<V, Error> {
         self.inner.ok_or_else(|| Error::Synthesis("witness not provided".into()))

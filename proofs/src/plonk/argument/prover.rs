@@ -231,10 +231,8 @@ impl<F: PrimeField> Committed<F, Coeff> {
                 )
             })
             .collect();
-        // With the feature `prover-par`, all evaluations of the group are
-        // computed at once, in tasks of bounded size (see `crate::par::open`).
-        // As with the stock `zip`, only the labels that have a polynomial are
-        // evaluated; `eval_many` returns one value per job, in order.
+        // As with the stock `zip`, only labels with a polynomial are
+        // evaluated.
         #[cfg(feature = "prover-par")]
         let evals_map: BTreeMap<PolynomialLabel, Vec<Evaluation<F>>> = {
             type Pair<'p, F> = (&'p PolynomialLabel, &'p Polynomial<F, Coeff>, Vec<F>);
@@ -307,10 +305,8 @@ mod tests {
         utils::arithmetic::eval_polynomial,
     };
 
-    /// A group with more labels than polynomials, or more polynomials than
-    /// labels, is evaluated over the pairs of the two lists (the stock
-    /// `zip`) in every build: no panic, and the same evaluations and
-    /// transcript as the stock code.
+    /// Labels and polynomials of different counts are evaluated pairwise,
+    /// as the stock `zip` does.
     #[test]
     fn evaluate_stops_at_the_shorter_list() {
         let mut rng = ChaCha20Rng::seed_from_u64(0x5a);

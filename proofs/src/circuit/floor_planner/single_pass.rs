@@ -79,9 +79,8 @@ impl FloorPlanner for SimpleFloorPlanner {
         let mut probe = ProbeState::default();
         let layouter = SingleChipLayouter::new_probing(cs, constants, None, &mut probe)?;
         circuit.synthesize(config, layouter)?;
-        // A circuit whose regions touch other cells in the assignment than
-        // in the shape pass would make a later check against this layout
-        // compare unlike measures: such a layout is not returned.
+        // A later check could not detect regions whose cells differ between
+        // the shape pass and the assignment.
         Ok((!probe.mismatch).then_some(probe.layout))
     }
 
@@ -120,38 +119,30 @@ pub struct SingleChipLayouter<'a, F: Field, CS: Assignment<F> + 'a> {
     /// so the caller can read the layout back after `circuit.synthesize`
     /// has consumed the layouter. Used by `synthesize_capturing_regions`.
     region_sink: Option<&'a mut Vec<RegionStart>>,
-    /// With the feature `prover-par`: when `Some`, the regions are measured
-    /// (see `assign_region_probed`).
+    /// When `Some`, the regions are measured.
     #[cfg(feature = "prover-par")]
     probe: Option<Probe<'a>>,
     _marker: PhantomData<F>,
 }
 
-/// With the feature `prover-par`: how a [`SingleChipLayouter`] measures its
-/// regions. Without `expected`, it runs the stock shape pass and records the
-/// layout it computes ([`FloorPlanner::synthesize_measuring_layout`]); with
-/// `expected`, it places the regions at the starts of that layout without
-/// the shape pass and checks each region against it
-/// ([`FloorPlanner::synthesize_checking_layout`]).
+/// How a [`SingleChipLayouter`] measures regions: without `expected` it runs
+/// the stock shape pass and records the layout; with `expected` it places
+/// the regions at its starts and checks them.
 #[cfg(feature = "prover-par")]
 struct Probe<'a> {
     expected: Option<&'a MeasuredLayout>,
     state: &'a mut ProbeState,
 }
 
-/// What a probing synthesis found (see [`Probe`]).
 #[cfg(feature = "prover-par")]
 #[derive(Default)]
 struct ProbeState {
-    /// The measured layout (without an expected layout).
     layout: MeasuredLayout,
-    /// The index of each column set in `layout.column_sets`.
+    /// Index of each column set in `layout.column_sets`.
     column_sets: HashMap<Vec<RegionColumn>, usize>,
-    /// The number of regions opened.
     regions: usize,
-    /// Checking: a region differed from the expected layout or failed, so
-    /// the assignment is not the stock one. Measuring: a region touched
-    /// other cells in its assignment than in the shape pass.
+    /// Checking: a region differed from `expected` or failed. Measuring: a
+    /// region's assignment touched other cells than its shape pass.
     mismatch: bool,
 }
 
@@ -320,10 +311,7 @@ impl<'a, F: Field, CS: Assignment<F> + 'a + SyncDeps> SingleChipLayouter<'a, F, 
 
 #[cfg(feature = "prover-par")]
 impl<'a, F: Field, CS: Assignment<F> + 'a + SyncDeps> SingleChipLayouter<'a, F, CS> {
-    /// A layouter that measures its regions (see [`Probe`]): without
-    /// `expected`, it runs the stock shape pass and records the layout in
-    /// `state`; with `expected`, it places the regions at its starts and
-    /// checks them.
+    /// See [`Probe`].
     fn new_probing(
         cs: &'a mut CS,
         constants: Vec<Column<Fixed>>,
@@ -343,32 +331,18 @@ impl<'a, F: Field, CS: Assignment<F> + 'a + SyncDeps> SingleChipLayouter<'a, F, 
         })
     }
 
-    /// The error a checking synthesis returns to the circuit for a region
-    /// that differs from the expected layout. The prover never surfaces it:
-    /// it discards the assignment and synthesizes again with the shape
-    /// pass.
+    /// Never surfaced: the prover discards the assignment and reruns the
+    /// shape pass.
     fn layout_mismatch() -> Error {
         Error::Synthesis("the region differs from the cached layout".into())
     }
 
-    /// `assign_region` of a probing layouter (see [`Probe`]).
+    /// `assign_region` of a probing layouter.
     ///
-    /// Measuring: the stock `assign_region` (shape pass, then assignment),
-    /// recording each region's start, shape and number of constants; the
-    /// assignment is also measured, and a region whose assignment touches
-    /// other cells than its shape pass marks the layout as not reusable.
-    ///
-    /// Checking: the region is placed at the start of the expected layout
-    /// at its index and assigned once, measured as the shape pass measures
-    /// ([`RegionMeasure`] records what `RegionShape` records from the same
-    /// calls). The region must have
-    /// the expected columns, row count and number of constants, and the
-    /// start the stock shape pass computes from the regions before it (the
-    /// first free rows of `self.columns`, kept as that pass keeps them) must
-    /// be the expected start. Otherwise, or on any error, the synthesis is
-    /// marked as differing and every later region fails at once: the caller
-    /// discards the assignment. A region past the expected ones is a
-    /// mismatch, not a panic.
+    /// Checking: the region is assigned once at its expected start. Its
+    /// columns, row count and constants must match the expected entry, and
+    /// the expected start must be the one the stock shape pass computes from
+    /// `self.columns`. After a mismatch every later region fails at once.
     fn assign_region_probed<A, AR, N, NR>(
         &mut self,
         probe: &mut Probe<'a>,
@@ -420,7 +394,6 @@ impl<'a, F: Field, CS: Assignment<F> + 'a + SyncDeps> SingleChipLayouter<'a, F, 
                 (result, constants_to_assign)
             }
             None => {
-                // The stock shape pass.
                 let mut shape = RegionShape::new(region_index.into());
                 {
                     let region: &mut dyn RegionLayouter<F> = &mut shape;
@@ -491,9 +464,7 @@ impl<'a, F: Field, CS: Assignment<F> + 'a + SyncDeps> SingleChipLayouter<'a, F, 
         Ok(result)
     }
 
-    /// The assignment of the region `region_index` at its start in
-    /// `self.regions`, as in the stock `assign_region_impl`, measured as the
-    /// shape pass measures.
+    /// The assignment of the stock `assign_region_impl`, measured.
     fn assign_measured<A, AR, N, NR>(
         &mut self,
         region_index: usize,
@@ -523,14 +494,10 @@ impl<'a, F: Field, CS: Assignment<F> + 'a + SyncDeps> SingleChipLayouter<'a, F, 
     }
 }
 
-/// With the feature `prover-par`: the result of the closure of a region, the
-/// shape of its assignment, and the constants it assigns.
+/// The closure's result, the measure, and the constants to assign.
 #[cfg(feature = "prover-par")]
 type MeasuredAssignment<F, AR> = (AR, RegionMeasure, Vec<(Rational<F>, Cell)>);
 
-/// With the feature `prover-par`: whether `region` of `layout` has the
-/// columns, the row count and the number of constants of the assignment
-/// `measured`, which assigns `constants` constants.
 #[cfg(feature = "prover-par")]
 fn region_matches(
     layout: &MeasuredLayout,
@@ -546,31 +513,26 @@ fn region_matches(
         && measured.has_columns(columns)
 }
 
-/// With the feature `prover-par`: the columns and the row count of a
-/// region's assignment, as `RegionShape` records them from the same calls,
-/// with constant work per call: a column is looked up in a bitset by its
-/// kind and index instead of being hashed into a set (a region of a large
-/// circuit makes millions of calls).
+/// The columns and row count of a region, as `RegionShape` records them,
+/// with a bitset lookup per call instead of hashing (large regions make
+/// millions of calls).
 #[cfg(feature = "prover-par")]
 #[derive(Debug, Default)]
 struct RegionMeasure {
-    /// One bit per column index below [`RegionMeasure::BITSET_COLUMNS`], per
-    /// kind ([`RegionMeasure::key`]): whether `columns` holds that column.
+    /// Per kind ([`RegionMeasure::key`]), one bit per column index below
+    /// [`RegionMeasure::BITSET_COLUMNS`].
     seen: [Vec<u64>; 5],
-    /// The distinct columns touched, in the order of their first call.
     columns: Vec<RegionColumn>,
-    /// One past the largest row offset touched.
     row_count: usize,
 }
 
 #[cfg(feature = "prover-par")]
 impl RegionMeasure {
-    /// Column indices from this one on are looked up in `columns` instead
-    /// of a bitset, so a sparse large index never allocates a large bitset.
+    /// Indices from this one on are searched in `columns`, so a sparse large
+    /// index allocates no large bitset.
     const BITSET_COLUMNS: usize = 1 << 16;
 
-    /// The kind (the column type, or a simple or complex selector) and the
-    /// index of `column`: two columns are equal exactly when both are.
+    /// Two columns are equal exactly when their keys are.
     fn key(column: &RegionColumn) -> (usize, usize) {
         match column {
             RegionColumn::Column(c) => {
@@ -585,7 +547,6 @@ impl RegionMeasure {
         }
     }
 
-    /// Records a call of the region on `column` at row `offset`.
     #[inline]
     fn touch(&mut self, column: RegionColumn, offset: usize) {
         self.row_count = cmp::max(self.row_count, offset + 1);
@@ -607,7 +568,6 @@ impl RegionMeasure {
         }
     }
 
-    /// Whether the region touched `column`.
     fn contains(&self, column: &RegionColumn) -> bool {
         let (kind, index) = Self::key(column);
         if index >= Self::BITSET_COLUMNS {
@@ -629,10 +589,7 @@ impl RegionMeasure {
     }
 }
 
-/// With the feature `prover-par`: a region that forwards every call to
-/// `inner` and also records it in `measure`, which takes the columns and the
-/// row count as the shape pass does. `inner` is the concrete region, so the
-/// forwarded calls are direct calls.
+/// Forwards every call to `inner` and records it in `measure`.
 #[cfg(feature = "prover-par")]
 struct Measuring<'r, R> {
     inner: &'r mut R,
@@ -649,9 +606,7 @@ impl<R: fmt::Debug> fmt::Debug for Measuring<'_, R> {
     }
 }
 
-/// The calls `RegionShape` records: a selector, an advice column (also when
-/// assigned from a constant or an instance) or a fixed column, at an offset.
-/// Naming a column, reading an instance and the constraints add nothing.
+/// Records the same calls as `RegionShape`.
 #[cfg(feature = "prover-par")]
 impl<F: Field, R: RegionLayouter<F>> RegionLayouter<F> for Measuring<'_, R> {
     fn enable_selector<'v>(
@@ -1211,10 +1166,8 @@ mod tests {
         .unwrap();
     }
 
-    /// The measured layout has the starts of the stock shape pass, and a
-    /// check against it passes for the same circuit and fails, without a
-    /// panic, against a layout with fewer or more regions or with other
-    /// shapes or starts.
+    /// The measured layout has the stock starts; a check passes for it and
+    /// fails, without a panic, against any altered layout.
     #[cfg(feature = "prover-par")]
     #[test]
     fn checking_layout_mismatch_is_not_a_panic() {
@@ -1275,9 +1228,8 @@ mod tests {
         assert!(!check(&constants_count));
     }
 
-    /// A region whose closure touches other cells on its second call (the
-    /// assignment) than on its first (the shape pass) yields no layout to
-    /// reuse.
+    /// A region whose cells differ between the shape pass and the
+    /// assignment yields no layout.
     #[cfg(feature = "prover-par")]
     #[test]
     fn measuring_skips_regions_unlike_their_shape_pass() {
@@ -1323,11 +1275,8 @@ mod tests {
         assert!(measured.is_none());
     }
 
-    /// The measure of a region's calls has the columns and the row count
-    /// that `RegionShape` records from the same calls: column indices in and
-    /// past the first word of a bitset, both kinds of selector, the advice
-    /// column of an assignment from an instance or a constant, an index past
-    /// the bitsets, and calls that record nothing.
+    /// `RegionMeasure` records what `RegionShape` records from the same
+    /// calls.
     #[cfg(feature = "prover-par")]
     #[test]
     fn region_measure_matches_region_shape() {

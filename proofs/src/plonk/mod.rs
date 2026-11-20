@@ -356,9 +356,8 @@ pub struct ProvingKey<F: PrimeField, PCS: PolynomialCommitmentScheme<F>> {
     /// `FloorPlanner` does not support capture, or the key was deserialized);
     /// in that case the prover falls back to running the shape pass itself.
     pub(crate) region_starts: Option<Vec<crate::circuit::RegionStart>>,
-    /// With the feature `prover-par`: when `region_starts` is `None`, the
-    /// layout measured by the first proof made with this key, which later
-    /// proofs reuse when their circuit matches it (see `crate::par::layout`).
+    /// When `region_starts` is `None`: the layout measured by the first
+    /// proof (see `crate::par::layout`).
     #[cfg(feature = "prover-par")]
     pub(crate) region_starts_cache: std::sync::OnceLock<crate::circuit::layouter::MeasuredLayout>,
 }

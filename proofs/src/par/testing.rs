@@ -11,13 +11,8 @@
 // See the License for the specific language governing permissions and
 // limitations under the License.
 
-//! The references of the tests of this module: verbatim copies of the stock
-//! routines whose call sites dispatch to a parallel routine (so that calling
-//! them at their call site would not reach the stock code), and a pool of a
-//! given thread count.
-//!
-//! The stock `divide_by_roots` stays callable as
-//! `crate::utils::arithmetic::divide_by_roots_seq` and needs no copy.
+//! Copies of the stock routines whose call sites dispatch to this module, as
+//! references for its tests.
 
 use ff::{BatchInvert, Field};
 

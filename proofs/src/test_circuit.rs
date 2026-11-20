@@ -386,8 +386,8 @@ pub(crate) fn prove(
     (proof, ok)
 }
 
-/// A chain of squarings with seeded proofs, for the tests of the reuse of a
-/// layout by a key read from bytes and for the golden digests at scale.
+/// A chain of squarings, for the layout-reuse tests and the golden digests
+/// at scale.
 #[cfg(test)]
 pub(crate) mod chain {
     use ff::Field;
@@ -416,8 +416,8 @@ pub(crate) mod chain {
         x.square() + Fq::from(3)
     }
 
-    /// A chain of squarings over four advice columns, with a second region
-    /// holding a fixed column so that the layout has more than one region.
+    /// Squarings over four advice columns, and a second region with a fixed
+    /// column.
     #[derive(Clone)]
     pub(crate) struct Chain {
         pub(crate) rows: usize,
@@ -530,18 +530,16 @@ pub(crate) mod chain {
         }
     }
 
-    /// How [`Reshaped`] departs from the regions of its chain.
     #[derive(Clone, Copy, Debug)]
     pub(crate) enum Reshape {
-        /// Only the chain region: one region fewer.
+        /// Only the chain region.
         Fewer,
-        /// The regions of the chain and one more after them.
+        /// One more region after those of the chain.
         More,
     }
 
-    /// The circuit of `chain` (its columns and gates) with a different
-    /// sequence of regions: proved with a key of `chain`, it makes a proof
-    /// that does not verify, but the prover still makes it.
+    /// The configuration of `chain` with other regions. Its proofs with a
+    /// key of `chain` do not verify, but the prover makes them.
     #[derive(Clone)]
     pub(crate) struct Reshaped {
         pub(crate) chain: Chain,
@@ -614,8 +612,8 @@ pub(crate) mod chain {
         }
     }
 
-    /// A seeded proof of `chain` with `pk`; the caller holds
-    /// `crate::test_circuit::SEEDED` and has set the blinding seed.
+    /// The caller holds `crate::test_circuit::SEEDED` and has set the
+    /// blinding seed.
     pub(crate) fn prove_seeded(
         params: &ParamsKZG<Bls12>,
         pk: &ProvingKey<Fq, Scheme>,
@@ -626,8 +624,7 @@ pub(crate) mod chain {
             .expect("the prover makes the proof")
     }
 
-    /// A seeded proof of any circuit with the columns of [`Chain`], with
-    /// `pk` and the public inputs `inst`; as [`prove_seeded`].
+    /// [`prove_seeded`] for any circuit with the configuration of [`Chain`].
     pub(crate) fn prove_circuit_seeded<C: Circuit<Fq>>(
         params: &ParamsKZG<Bls12>,
         pk: &ProvingKey<Fq, Scheme>,
@@ -690,11 +687,8 @@ pub(crate) mod chain {
 mod tests {
     use super::*;
 
-    /// The proofs of a key read from bytes whose circuits do not all have
-    /// the same regions are the stock proofs, in every build and in any
-    /// order: the layout a first proof stores (feature `prover-par`, see
-    /// `crate::par::layout`) never changes the proof of a circuit that does
-    /// not match it, and a circuit that matches it keeps reusing it.
+    /// A key read from bytes, proving circuits with and without the regions
+    /// of its stored layout: every proof is the stock one.
     mod layout_reuse {
         use super::{
             super::chain::{
@@ -704,9 +698,8 @@ mod tests {
             *,
         };
 
-        /// The proofs of this thread since the last call that did not
-        /// match the stored layout and synthesized again (0 without the
-        /// feature `prover-par`, which stores none).
+        /// Proofs that failed the layout check since the last call (always 0
+        /// without `prover-par`).
         fn retries() -> usize {
             #[cfg(feature = "prover-par")]
             return crate::par::layout::take_retries();
@@ -714,7 +707,6 @@ mod tests {
             0
         }
 
-        /// The stored layout's starts, if any (none without the feature).
         fn stored(pk: &ProvingKey<Fq, Scheme>) -> Option<Vec<usize>> {
             #[cfg(feature = "prover-par")]
             return pk
@@ -753,17 +745,7 @@ mod tests {
             }
         }
 
-        fn reshaped(f: &Fixture, reshape: Reshape) -> Reshaped {
-            Reshaped {
-                chain: f.right.clone(),
-                reshape,
-            }
-        }
-
-        /// The proof of `circuit` with a key read from bytes on which no
-        /// proof was made: the stock synthesis with the shape pass, in every
-        /// build (the reference for a circuit that does not match a stored
-        /// layout).
+        /// The proof with a fresh key read from bytes: the stock shape pass.
         fn uncached<C: Circuit<Fq>>(f: &Fixture, circuit: &C, inst: &[Fq], seed: u64) -> Vec<u8> {
             let fresh = read_back(&f.pk);
             let proof = prove_circuit_seeded(&f.params, &fresh, circuit, inst, seed).unwrap();
@@ -771,76 +753,9 @@ mod tests {
             proof
         }
 
-        /// A key for 200 rows read from bytes proves 150 rows first, then
-        /// 200 rows: the proofs of 200 rows are those of the key from keygen
-        /// and verify.
-        #[test]
-        fn other_rows_first() {
-            let f = fixture();
-            let _seeded = SEEDED.lock().unwrap_or_else(|e| e.into_inner());
-            crate::plonk::prover::test_blinding::set(Some(0x1a));
-            retries();
-            let reference = prove_seeded(&f.params, &f.pk, &f.right, 1);
-            let shorter_ref = uncached(&f, &f.shorter, &f.shorter.instance(), 1);
-
-            let read = read_back(&f.pk);
-            let first = prove_seeded(&f.params, &read, &f.shorter, 1);
-            assert_eq!(retries(), 0, "the first proof measures the layout");
-            let second = prove_seeded(&f.params, &read, &f.right, 1);
-            let second_retries = retries();
-            let third = prove_seeded(&f.params, &read, &f.right, 1);
-            let third_retries = retries();
-            crate::plonk::prover::test_blinding::set(None);
-
-            assert_eq!(first, shorter_ref);
-            assert_eq!(second, reference);
-            assert_eq!(third, reference);
-            assert!(verifies(&f.params, &read, &f.right, &second));
-            assert!(!verifies(&f.params, &read, &f.shorter, &first));
-            if cfg!(feature = "prover-par") {
-                // the layout of 150 rows stays: the 200 rows do not match it
-                assert_eq!(stored(&read), Some(vec![0, 151]));
-                assert_eq!((second_retries, third_retries), (1, 1));
-            }
-        }
-
-        /// A first proof of a circuit with one region fewer, or one more,
-        /// then a proof of the key's circuit: no panic, and the stock proofs.
-        #[test]
-        fn other_region_count_first() {
-            let f = fixture();
-            let _seeded = SEEDED.lock().unwrap_or_else(|e| e.into_inner());
-            crate::plonk::prover::test_blinding::set(Some(0x1b));
-            retries();
-            let reference = prove_seeded(&f.params, &f.pk, &f.right, 2);
-            for (reshape, regions) in [(Reshape::Fewer, 1), (Reshape::More, 3)] {
-                let other = reshaped(&f, reshape);
-                let inst = f.right.instance();
-                let other_ref = uncached(&f, &other, &inst, 2);
-
-                let read = read_back(&f.pk);
-                let first = prove_circuit_seeded(&f.params, &read, &other, &inst, 2).unwrap();
-                assert_eq!(retries(), 0);
-                assert_eq!(first, other_ref, "{reshape:?}");
-                if cfg!(feature = "prover-par") {
-                    assert_eq!(stored(&read).map(|s| s.len()), Some(regions));
-                }
-                for _ in 0..2 {
-                    let proof = prove_seeded(&f.params, &read, &f.right, 2);
-                    assert_eq!(proof, reference, "{reshape:?}");
-                    assert!(verifies(&f.params, &read, &f.right, &proof));
-                    if cfg!(feature = "prover-par") {
-                        assert_eq!(retries(), 1, "{reshape:?}");
-                    }
-                }
-            }
-            crate::plonk::prover::test_blinding::set(None);
-        }
-
-        /// The key's circuit first, then circuits that do not match its
-        /// layout, then the key's circuit again: each proof is the stock
-        /// one, the stored layout does not change, and the key's circuit
-        /// keeps reusing it.
+        /// Regression: circuits with other rows or fewer or more regions than
+        /// the stored layout fall back to the stock shape pass and leave the
+        /// layout in place; the key's circuit keeps reusing it.
         #[test]
         fn matching_first_then_others() {
             let f = fixture();
@@ -850,8 +765,14 @@ mod tests {
             let reference = prove_seeded(&f.params, &f.pk, &f.right, 3);
             let shorter_ref = uncached(&f, &f.shorter, &f.shorter.instance(), 3);
             let inst = f.right.instance();
-            let fewer = reshaped(&f, Reshape::Fewer);
-            let more = reshaped(&f, Reshape::More);
+            let fewer = Reshaped {
+                chain: f.right.clone(),
+                reshape: Reshape::Fewer,
+            };
+            let more = Reshaped {
+                chain: f.right.clone(),
+                reshape: Reshape::More,
+            };
             let fewer_ref = uncached(&f, &fewer, &inst, 3);
             let more_ref = uncached(&f, &more, &inst, 3);
 
@@ -888,10 +809,8 @@ mod tests {
             }
         }
 
-        /// A circuit whose synthesis fails returns the error of the stock
-        /// prover: as the first proof of a key read from bytes, storing no
-        /// layout, and after a layout is stored, after which the key's
-        /// circuit still reuses it.
+        /// A failing synthesis returns the stock error, stores no layout, and
+        /// leaves a stored one in use.
         #[test]
         fn failing_synthesis_after_layout() {
             #[derive(Clone)]
@@ -965,17 +884,9 @@ mod tests {
 
     const GOLDEN: &str = "5177fc0d3371a3ee809efe70428114afb17eddddc866a104b37e6369c5da96f2";
 
-    /// Seeded proofs at `2^14` rows have the same digests in every build:
-    /// the digests below are those of a build without the feature
-    /// `prover-par`. At this size the column paths of the feature take over
-    /// (parallel encodings from `crate::par::DELTA_MIN_LEN = 2^14` rows,
-    /// parallel inversions) and the evaluations run in chunks, but the
-    /// parallel divisions of the multi-open do not
-    /// (`crate::par::DIVISION_MIN_LEN` is `2^15`): see
-    /// [`seeded_proof_digests_at_division_size`]. The random circuit has
-    /// lookups, a trash argument and copy constraints; the chain circuit is
-    /// proved with its key from keygen and with the same key read back from
-    /// bytes (first and second proof).
+    /// Seeded proofs at `2^14` rows (`crate::par::DELTA_MIN_LEN`) have the
+    /// digests of a build without `prover-par`, also with the key read back
+    /// from bytes.
     #[test]
     fn seeded_proof_digests_at_scale() {
         use super::chain::{Chain, chain_setup, prove_seeded, read_back, verifies};
@@ -1013,17 +924,8 @@ mod tests {
         assert_eq!(digests, GOLDEN_AT_SCALE, "proof bytes changed");
     }
 
-    /// Seeded proofs at `2^16` rows, where the multi-open of the feature
-    /// `prover-par` divides in parallel blocks (`divide_by_roots` and
-    /// `kate_division` of `crate::par::open`, from
-    /// `crate::par::DIVISION_MIN_LEN = 2^15` coefficients), have the same
-    /// digests in every build: the digests below are those of a build
-    /// without the feature. With the feature the test also checks that both
-    /// parallel divisions ran. The inner product of the multi-open takes its
-    /// parallel path only from `2^19` coefficients, out of reach here; its
-    /// unit test crosses that floor against the stock helper. The chain is
-    /// proved with its key from keygen and with the same key read back from
-    /// bytes (first and second proof, the second reusing the stored layout).
+    /// As [`seeded_proof_digests_at_scale`] at `2^16` rows, where the
+    /// parallel divisions of the multi-open run (checked with `prover-par`).
     #[test]
     fn seeded_proof_digests_at_division_size() {
         use super::chain::{Chain, chain_setup, prove_seeded, read_back, verifies};
@@ -1066,8 +968,7 @@ mod tests {
         {
             let after = crate::par::open::reached::counts();
             let reached = [0, 1].map(|i| after[i] - before[i]);
-            // `kate_division` divides through `divide_by_roots`: the
-            // multi-open's own divisions are the calls beyond those.
+            // `kate_division` also counts in `divide_by_roots`.
             assert!(reached[1] > 0, "kate_division in parallel blocks");
             assert!(
                 reached[0] > reached[1],

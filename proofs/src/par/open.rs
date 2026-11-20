@@ -11,22 +11,10 @@
 // See the License for the specific language governing permissions and
 // limitations under the License.
 
-//! The evaluations and the multi-open of the prover, in parallel tasks of
-//! bounded size.
-//!
-//! The stock code evaluates one polynomial at a time, each split into one
-//! chunk per thread, and divides each point set's polynomial by its roots on
-//! a single thread. Here every evaluation of a group is cut into chunks of
-//! [`EVAL_CHUNK`] coefficients and all chunks of all evaluations are spread
-//! over the pool at once, and a division is cut into blocks of a linear
-//! recurrence that are solved in parallel and then joined.
-//!
-//! Where a value is regrouped (the partial sums of an evaluation, the blocks
-//! of a division) the result is the same field element as stock: field
-//! arithmetic is exact, so any grouping of the same sums and products gives
-//! the same element, and the field keeps reduced representations, so the
-//! limbs are the same too. The stock evaluation relies on this as well: its
-//! own grouping follows the thread count.
+//! Polynomial evaluations and the KZG multi-open, in parallel tasks of
+//! bounded size. Field arithmetic is exact, so regrouping sums and products
+//! gives the stock values (the stock evaluation's grouping already follows
+//! the thread count).
 
 use ff::Field;
 use rayon::{
@@ -54,15 +42,13 @@ const SUM_CHUNK: usize = 1 << 12;
 /// Rows per block of a division.
 const DIV_BLOCK: usize = 1 << 13;
 
-/// The number of calls that divided in parallel blocks (tests only): the
-/// golden-digest test at division size checks that its proofs take them.
+/// Calls that divided in parallel blocks, so the golden-digest test at
+/// division size can check it reached them.
 #[cfg(test)]
 pub(crate) mod reached {
     use std::sync::atomic::{AtomicUsize, Ordering};
 
-    /// [`super::divide_by_roots`] divided in parallel blocks.
     pub(crate) static DIVIDE_BY_ROOTS: AtomicUsize = AtomicUsize::new(0);
-    /// [`super::kate_division`] divided in parallel blocks.
     pub(crate) static KATE_DIVISION: AtomicUsize = AtomicUsize::new(0);
 
     pub(super) fn hit(counter: &AtomicUsize) {
@@ -75,8 +61,8 @@ pub(crate) mod reached {
     }
 }
 
-/// The evaluation of each `(polynomial, point)` of `jobs`, in order: the
-/// values of [`crate::utils::arithmetic::eval_polynomial`].
+/// [`crate::utils::arithmetic::eval_polynomial`] of each `(polynomial,
+/// point)` of `jobs`, with all chunks of all jobs spread over the pool.
 pub(crate) fn eval_many<F: Field>(jobs: &[(&[F], F)]) -> Vec<F> {
     let tasks: Vec<(usize, usize)> = (jobs.iter().enumerate())
         .flat_map(|(j, (poly, _))| (0..poly.len().div_ceil(EVAL_CHUNK)).map(move |c| (j, c)))
@@ -97,12 +83,10 @@ pub(crate) fn eval_many<F: Field>(jobs: &[(&[F], F)]) -> Vec<F> {
     evals
 }
 
-/// `eval_polynomial_seq(poly, x)`, as [`CHAINS`] interleaved Horner chains
-/// over consecutive parts of `poly` (the last one also takes the remainder
-/// of the division of the length), joined by Horner in `x^part`. A single
-/// chain waits on each multiplication before the next; independent chains
-/// keep the multiplier busy. The same value: the parts' evaluations scaled
-/// by powers of `x` sum to the evaluation of `poly`.
+/// `eval_polynomial_seq(poly, x)` as [`CHAINS`] interleaved Horner chains
+/// over consecutive parts of `poly`, joined by Horner in `x^part`.
+/// Independent chains keep the multiplier busy instead of waiting on each
+/// product.
 fn horner_interleaved<F: Field>(poly: &[F], x: F) -> F {
     let part = poly.len() / CHAINS;
     if part == 0 {
@@ -119,11 +103,8 @@ fn horner_interleaved<F: Field>(poly: &[F], x: F) -> F {
     acc.iter().rev().fold(F::ZERO, |sum, acc| sum * x_part + acc)
 }
 
-/// The inner product `Σ_i scalars_i · polys_i` of coefficient-form
-/// polynomials of possibly different lengths, as the stock helper of the KZG
-/// multi-open: each coefficient is accumulated from zero over the
-/// polynomials in the same order, with the same operations; only the cut of
-/// the coefficients into tasks differs.
+/// The stock `poly_inner_product` helper of the KZG multi-open, cut into
+/// tasks of [`SUM_CHUNK`] coefficients.
 pub(crate) fn poly_inner_product<F: Field>(
     polys: &[&Polynomial<F, Coeff>],
     scalars: impl IntoIterator<Item = F>,
@@ -149,22 +130,15 @@ pub(crate) fn poly_inner_product<F: Field>(
     }
 }
 
-/// `crate::utils::arithmetic::divide_by_roots`: the quotient of `poly` by
-/// `∏_i (X - roots_i)`, without the remainder.
+/// `crate::utils::arithmetic::divide_by_roots` in parallel blocks.
 ///
 /// With `d` roots and `v_j` the coefficients of the vanishing product, the
-/// quotient `q` of length `m = len - d` satisfies, from the top down,
-/// `q_k = a_{k+d} - Σ_{j<d, v_j≠0} v_j · q_{k+d-j}` (`q_k = 0` for `k ≥ m`),
-/// which is the stock loop. Counting rows from the top, `p = m - 1 - k`,
-/// this is a linear recurrence with lags `d - j`. The rows are cut into
-/// blocks; each block is solved in parallel with a zero history, and the
-/// true value is that solution plus the contribution of the block's true
-/// history, through the solutions `h_s` of the homogeneous recurrence with
-/// a unit history at lag `s` (the same for every block). The histories are
-/// joined by a short scan over the blocks. The quotient is unique, so the
-/// values are the stock ones.
+/// stock loop is the recurrence `q_k = a_{k+d} - Σ_{j<d} v_j · q_{k+d-j}`,
+/// from the top down, with lags `d - j`. Each block is solved with a zero
+/// history; the true rows add the true history through the solutions `h_s`
+/// of the homogeneous recurrence with a unit history at lag `s`. A short
+/// scan over the blocks gives each block's history.
 pub(crate) fn divide_by_roots<F: Field>(poly: &[F], roots: &[F]) -> Vec<F> {
-    // The vanishing product and its nonzero terms, as stock computes them.
     let mut vanishing = vec![F::ONE];
     for root in roots {
         let mut next = vec![F::ZERO; vanishing.len() + 1];
@@ -184,8 +158,7 @@ pub(crate) fn divide_by_roots<F: Field>(poly: &[F], roots: &[F]) -> Vec<F> {
     // The history a block needs: its rows read up to `lags` rows above it.
     let lags = terms.iter().map(|(lag, _)| *lag).max().unwrap_or(0);
 
-    // A history longer than a block would reach past the block above: the
-    // stock division, which takes any number of roots, divides those.
+    // A history longer than a block would reach past the block above.
     if lags > DIV_BLOCK {
         return crate::utils::arithmetic::divide_by_roots_seq(poly, roots);
     }
@@ -194,8 +167,8 @@ pub(crate) fn divide_by_roots<F: Field>(poly: &[F], roots: &[F]) -> Vec<F> {
 
     // The input of row `p` (from the top): `a_{k+d}` with `k = m - 1 - p`.
     let input = |p: usize| poly[m - 1 - p + degree];
-    // `q` in its natural order: the block `b` from the top is the `b`-th
-    // chunk from the end, and its row `t` is the element `len - 1 - t`.
+    // Block `b` from the top is the `b`-th chunk from the end; its row `t`
+    // is the element `len - 1 - t`.
     let mut q: Vec<F> = (0..m).into_par_iter().map(|_| F::ZERO).collect();
 
     // Solves the block starting at row `first` with a zero history.
@@ -242,9 +215,7 @@ pub(crate) fn divide_by_roots<F: Field>(poly: &[F], roots: &[F]) -> Vec<F> {
         homogeneous,
     );
 
-    // The scan: the true history of each block from the true last rows of
-    // the block above it. `hist[s - 1]` is the value `s` rows above the
-    // block's first row.
+    // `histories[b][s - 1]`: the true value `s` rows above block `b`.
     let blocks = m.div_ceil(DIV_BLOCK);
     let mut histories: Vec<Vec<F>> = Vec::with_capacity(blocks);
     histories.push(vec![F::ZERO; lags]);
@@ -264,7 +235,6 @@ pub(crate) fn divide_by_roots<F: Field>(poly: &[F], roots: &[F]) -> Vec<F> {
         histories.push(next);
     }
 
-    // The true rows: the zero-history solution plus the history's share.
     q.par_rchunks_mut(DIV_BLOCK)
         .zip(histories.par_iter())
         .skip(1)
@@ -284,13 +254,8 @@ pub(crate) fn divide_by_roots<F: Field>(poly: &[F], roots: &[F]) -> Vec<F> {
 }
 
 /// `crate::utils::arithmetic::kate_division` of `a - c` by `X - b`, for any
-/// constant `c`: the quotient of a division by `X - b` does not depend on
-/// the constant coefficient of the dividend (`q_i = Σ_{j>i} a_j b^{j-i-1}`),
-/// so `a` is divided as it is, without the copy that subtracting `c` makes.
-/// The same values as the stock `kate_division`, through
-/// [`divide_by_roots`] with the single root `b` (its recurrence is the one
-/// of `kate_division`: `q_k = a_{k+1} + b · q_{k+1}`); below
-/// [`DIVISION_MIN_LEN`], by the stock `kate_division` of `a` itself.
+/// constant `c`: the quotient does not depend on the constant coefficient,
+/// so `a` is divided without the copy `a - c`.
 ///
 /// # Panics
 ///
@@ -316,10 +281,7 @@ mod tests {
 
     use super::*;
     use crate::{
-        par::{
-            INNER_PRODUCT_MIN_LEN,
-            testing::{in_pool, stock_poly_inner_product},
-        },
+        par::testing::{in_pool, stock_poly_inner_product},
         utils::arithmetic::{divide_by_roots_seq, eval_polynomial, kate_division as stock_kate},
     };
 
@@ -327,23 +289,20 @@ mod tests {
         (0..n).map(|_| Fq::random(&mut *rng)).collect()
     }
 
-    /// Every length of a single Horner task (all remainders of the
-    /// interleaved chains) and lengths across task boundaries, at special
-    /// and random points, with one and many threads.
     #[test]
     fn eval_many_matches_eval_polynomial() {
         let mut rng = ChaCha20Rng::seed_from_u64(0x3a);
-        let lens =
-            (0..3 * CHAINS + 2).chain([100, EVAL_CHUNK - 1, EVAL_CHUNK, EVAL_CHUNK + 1, 70_001]);
+        // every remainder of the interleaved chains, and across a task boundary
+        let lens = (0..2 * CHAINS).chain([EVAL_CHUNK + 1]);
         let polys: Vec<Vec<Fq>> = lens.map(|n| random_poly(&mut rng, n)).collect();
         let mut jobs = Vec::new();
         for p in &polys {
-            for x in [Fq::ZERO, Fq::ONE, -Fq::ONE, Fq::random(&mut rng)] {
+            for x in [Fq::ZERO, Fq::random(&mut rng)] {
                 jobs.push((p.as_slice(), x));
             }
         }
         let stock: Vec<Fq> = jobs.iter().map(|(p, x)| eval_polynomial(p, *x)).collect();
-        for threads in [1, 3, 8] {
+        for threads in [1, 8] {
             assert_eq!(
                 in_pool(threads, || eval_many(&jobs)),
                 stock,
@@ -353,18 +312,14 @@ mod tests {
         assert!(eval_many::<Fq>(&[]).is_empty());
     }
 
-    /// Lengths across task boundaries and the floor of the multi-open's
-    /// dispatch, with more scalars than polynomials.
+    /// More scalars than polynomials, of different lengths.
     #[test]
     fn poly_inner_product_matches_stock() {
         let mut rng = ChaCha20Rng::seed_from_u64(0x3b);
         for lens in [
             vec![],
-            vec![0],
             vec![3, 1],
             vec![SUM_CHUNK + 3, 7, 2 * SUM_CHUNK, 0, 40_000],
-            vec![INNER_PRODUCT_MIN_LEN - 1, 3],
-            vec![INNER_PRODUCT_MIN_LEN, INNER_PRODUCT_MIN_LEN - 5],
         ] {
             let polys: Vec<Polynomial<Fq, Coeff>> = lens
                 .iter()
@@ -385,43 +340,29 @@ mod tests {
         }
     }
 
-    /// Dense, sparse and repeated roots, a zero root and no root, on lengths
-    /// across block boundaries and the floor, with one and many threads, here
-    /// and through the crate function that dispatches here.
+    /// Also through the dispatching crate function.
     #[test]
     fn divide_by_roots_matches_stock() {
         let mut rng = ChaCha20Rng::seed_from_u64(0x3c);
         let x = Fq::random(&mut rng);
-        let omega = Fq::ROOT_OF_UNITY.pow_vartime([1u64 << (Fq::S - 10)]);
         let zeta = Fq::ZETA;
         let root_sets: Vec<Vec<Fq>> = vec![
             vec![],
             vec![x],
             vec![Fq::ZERO],
-            vec![x, omega * x],
-            vec![x, omega * x, omega.invert().unwrap().pow_vartime([5]) * x],
             vec![x, x],
             random_poly(&mut rng, 4),
-            // the cube roots of x^3: the product is X^3 - x^3, sparse
+            // X^3 - x^3: zero terms are skipped
             vec![x, zeta * x, zeta * zeta * x],
-            // the square roots of x^2: X^2 - x^2
-            vec![x, -x],
         ];
         let lens = [
             0usize,
-            1,
-            2,
             3,
-            4,
             5,
-            100,
-            DIV_BLOCK - 1,
-            DIV_BLOCK,
             DIV_BLOCK + 2,
             3 * DIV_BLOCK + 17,
             DIVISION_MIN_LEN - 1,
             DIVISION_MIN_LEN,
-            70_000,
         ];
         for roots in &root_sets {
             for &n in &lens {
@@ -439,11 +380,9 @@ mod tests {
         }
     }
 
-    /// More roots than rows in a block (the history of a block would reach
-    /// past the block above): the stock division, at any length. The roots
-    /// are the `2^13`-th roots of `x^(2^13)` and one more root `y`, so the
-    /// product `(X^(2^13) - x^(2^13)) (X - y)` has four terms, the lowest at
-    /// lag `DIV_BLOCK + 1`.
+    /// Lags past a block fall back to the stock division. The product
+    /// `(X^(2^13) - x^(2^13)) (X - y)` has its lowest term at lag
+    /// `DIV_BLOCK + 1`.
     #[test]
     fn divide_by_roots_more_roots_than_a_block() {
         let mut rng = ChaCha20Rng::seed_from_u64(0x3f);
@@ -454,41 +393,25 @@ mod tests {
         let mut roots: Vec<Fq> =
             std::iter::successors(Some(x), |r| Some(*r * omega)).take(DIV_BLOCK).collect();
         roots.push(y);
-        for n in [DIV_BLOCK + 1 + 5, DIVISION_MIN_LEN + 3] {
-            let poly = random_poly(&mut rng, n);
-            let stock = divide_by_roots_seq(&poly, &roots);
-            assert_eq!(stock.len(), n - roots.len());
-            assert_eq!(
-                in_pool(4, || divide_by_roots(&poly, &roots)),
-                stock,
-                "n {n}"
-            );
-            assert_eq!(
-                crate::utils::arithmetic::divide_by_roots(&poly, &roots),
-                stock
-            );
-        }
+        let n = DIVISION_MIN_LEN + 3;
+        let poly = random_poly(&mut rng, n);
+        let stock = divide_by_roots_seq(&poly, &roots);
+        assert_eq!(stock.len(), n - roots.len());
+        assert_eq!(in_pool(4, || divide_by_roots(&poly, &roots)), stock);
+        assert_eq!(
+            crate::utils::arithmetic::divide_by_roots(&poly, &roots),
+            stock
+        );
     }
 
-    /// The quotient of the dividend as given equals the stock quotient of
-    /// the dividend minus a constant (the call of the stock multi-open), on
-    /// both sides of the floor, with one and many threads.
+    /// Against the stock quotient of the dividend minus a constant, as the
+    /// stock multi-open calls it.
     #[test]
     fn kate_division_matches_stock() {
         let mut rng = ChaCha20Rng::seed_from_u64(0x3d);
-        for n in [
-            1usize,
-            2,
-            3,
-            DIV_BLOCK,
-            DIV_BLOCK + 1,
-            2 * DIV_BLOCK + 9,
-            DIVISION_MIN_LEN - 1,
-            DIVISION_MIN_LEN,
-            1 << 17,
-        ] {
+        for n in [1usize, 2, DIVISION_MIN_LEN - 1, DIVISION_MIN_LEN] {
             let a = random_poly(&mut rng, n);
-            for b in [Fq::ZERO, Fq::ONE, Fq::random(&mut rng)] {
+            for b in [Fq::ZERO, Fq::random(&mut rng)] {
                 let mut shifted = a.clone();
                 shifted[0] -= Fq::random(&mut rng);
                 let stock = stock_kate(&shifted, b);

@@ -337,8 +337,6 @@ impl<F: Field> Polynomial<F, LagrangeCoeff> {
     /// (e.g. for evaluation or opening). One forward sweep, one transient
     /// `Vec<F>` allocation.
     pub fn to_delta(&self) -> Polynomial<F, LagrangeDeltaCoeff> {
-        // With the feature `prover-par`, long columns are encoded in
-        // parallel chunks (see `crate::par::columns`).
         #[cfg(feature = "prover-par")]
         if self.values.len() >= crate::par::DELTA_MIN_LEN {
             return Polynomial {
@@ -369,8 +367,6 @@ impl<F: Field> Polynomial<F, LagrangeCoeff> {
     /// applying the delta transform twice at the price of one transient
     /// `Vec<F>` allocation.
     pub fn to_double_delta(&self) -> Polynomial<F, LagrangeDoubleDeltaCoeff> {
-        // With the feature `prover-par`, long columns are encoded in
-        // parallel chunks (see `crate::par::columns`).
         #[cfg(feature = "prover-par")]
         if self.values.len() >= crate::par::DELTA_MIN_LEN {
             return Polynomial {
@@ -589,8 +585,6 @@ impl<F: PrimeField + SerdeObject, B> Polynomial<F, B> {
 pub(crate) fn batch_invert_rational<F: Field>(
     assigned: Vec<Polynomial<Rational<F>, LagrangeCoeff>>,
 ) -> Vec<Polynomial<F, LagrangeCoeff>> {
-    // With the feature `prover-par`, columns over the BLS12-381 scalar field
-    // are inverted in parallel chunks (see `crate::par::columns`).
     #[cfg(feature = "prover-par")]
     if crate::par::invert::is_bls_scalar::<F>() {
         return crate::par::columns::batch_invert_rational(assigned);
