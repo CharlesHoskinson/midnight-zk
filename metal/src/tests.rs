@@ -14,17 +14,14 @@
 //! Tests of the field arithmetic against blst, of the device context and of
 //! the hook boundary.
 
-use blst::{
-    blst_fp, blst_fp_add, blst_fp_cneg, blst_fp_from_uint64, blst_fp_mul, blst_fp_sqr, blst_fp_sub,
-    blst_fr, blst_fr_add, blst_fr_cneg, blst_fr_from_uint64, blst_fr_mul, blst_fr_sqr, blst_fr_sub,
-};
+use ff::Field;
+use midnight_curves::{Fp, Fq};
 use rand_chacha::ChaCha20Rng;
 use rand_core::{RngCore, SeedableRng};
 
 use crate::{
-    Scalar,
     ctx::{self, Arg},
-    field::{FP_MODULUS, FR_MODULUS, FpLimbs, fp_is_reduced, is_reduced},
+    field::{FP_MODULUS, FR_MODULUS, fp_is_reduced, is_reduced},
 };
 
 // Operation codes of shaders/field_test.metal.
@@ -38,17 +35,6 @@ const OP_IS_REDUCED: u32 = 6;
 const OP_ONE: u32 = 7;
 const OP_EQ: u32 = 8;
 
-const OPS: [(u32, &str); 8] = [
-    (OP_ADD, "add"),
-    (OP_SUB, "sub"),
-    (OP_MUL, "mul"),
-    (OP_SQR, "sqr"),
-    (OP_NEG, "neg"),
-    (OP_DBL, "dbl"),
-    (OP_ONE, "one"),
-    (OP_EQ, "eq"),
-];
-
 fn require_device() {
     assert!(
         crate::device(),
@@ -59,25 +45,20 @@ fn require_device() {
 
 /// Runs `kernel` (`field_test_fr` / `field_test_fp`) on `a`, `b`.
 fn run_op<T: ctx::Pod + Default>(kernel: &str, op: u32, a: &[T], b: &[T]) -> Vec<T> {
-    assert_eq!(a.len(), b.len());
     let s = ctx::lock().unwrap();
     let c = s.ctx();
-    let ba = c.upload(a).unwrap();
-    let bb = c.upload(b).unwrap();
+    let (ba, bb) = (c.upload(a).unwrap(), c.upload(b).unwrap());
     let out = c.alloc(size_of_val(a)).unwrap();
     let n = a.len() as u32;
     c.run(|cmd| {
-        cmd.dispatch(
-            kernel,
-            a.len(),
-            &[
-                Arg::Buffer(&ba),
-                Arg::Buffer(&bb),
-                Arg::Buffer(&out),
-                Arg::value(&op),
-                Arg::value(&n),
-            ],
-        )
+        let args = [
+            Arg::Buffer(&ba),
+            Arg::Buffer(&bb),
+            Arg::Buffer(&out),
+            Arg::value(&op),
+            Arg::value(&n),
+        ];
+        cmd.dispatch(kernel, a.len(), &args)
     })
     .unwrap();
     let mut r = vec![T::default(); a.len()];
@@ -85,82 +66,35 @@ fn run_op<T: ctx::Pod + Default>(kernel: &str, op: u32, a: &[T], b: &[T]) -> Vec
     r
 }
 
-fn fr2(
-    f: unsafe extern "C" fn(*mut blst_fr, *const blst_fr, *const blst_fr),
-    a: &Scalar,
-    b: &Scalar,
-) -> Scalar {
-    let mut r = blst_fr::default();
-    // SAFETY: valid blst_fr values.
-    unsafe { f(&mut r, &blst_fr { l: *a }, &blst_fr { l: *b }) };
-    r.l
-}
-
-fn fp2(
-    f: unsafe extern "C" fn(*mut blst_fp, *const blst_fp, *const blst_fp),
-    a: &FpLimbs,
-    b: &FpLimbs,
-) -> FpLimbs {
-    let mut r = blst_fp::default();
-    // SAFETY: valid blst_fp values.
-    unsafe { f(&mut r, &blst_fp { l: *a }, &blst_fp { l: *b }) };
-    r.l
-}
-
-fn fr_ref(op: u32, a: &Scalar, b: &Scalar) -> Scalar {
-    let mut r = blst_fr::default();
-    match op {
-        OP_ADD => fr2(blst_fr_add, a, b),
-        OP_SUB => fr2(blst_fr_sub, a, b),
-        OP_MUL => fr2(blst_fr_mul, a, b),
-        OP_SQR => {
-            // SAFETY: valid blst_fr values.
-            unsafe { blst_fr_sqr(&mut r, &blst_fr { l: *a }) };
-            r.l
-        }
-        OP_NEG => {
-            // SAFETY: as above.
-            unsafe { blst_fr_cneg(&mut r, &blst_fr { l: *a }, true) };
-            r.l
-        }
-        OP_DBL => fr2(blst_fr_add, a, a),
-        OP_ONE => {
-            // SAFETY: four readable limbs.
-            unsafe { blst_fr_from_uint64(&mut r, [1u64, 0, 0, 0].as_ptr()) };
-            r.l
-        }
-        OP_IS_REDUCED => [is_reduced(a) as u64, 0, 0, 0],
-        OP_EQ => [(a == b) as u64, 0, 0, 0],
-        _ => unreachable!(),
+/// `op` by blst, through the midnight-curves field `F` whose element is a
+/// transparent blst value of `N` limbs.
+fn blst_op<F: Field, const N: usize>(op: u32, a: &[u64; N], b: &[u64; N]) -> [u64; N] {
+    assert_eq!(size_of::<F>(), size_of::<[u64; N]>());
+    if op == OP_EQ {
+        let mut flag = [0u64; N];
+        flag[0] = (a == b) as u64;
+        return flag;
     }
-}
-
-fn fp_ref(op: u32, a: &FpLimbs, b: &FpLimbs) -> FpLimbs {
-    let mut r = blst_fp::default();
-    match op {
-        OP_ADD => fp2(blst_fp_add, a, b),
-        OP_SUB => fp2(blst_fp_sub, a, b),
-        OP_MUL => fp2(blst_fp_mul, a, b),
-        OP_SQR => {
-            // SAFETY: valid blst_fp values.
-            unsafe { blst_fp_sqr(&mut r, &blst_fp { l: *a }) };
-            r.l
-        }
-        OP_NEG => {
-            // SAFETY: as above.
-            unsafe { blst_fp_cneg(&mut r, &blst_fp { l: *a }, true) };
-            r.l
-        }
-        OP_DBL => fp2(blst_fp_add, a, a),
-        OP_ONE => {
-            // SAFETY: six readable limbs.
-            unsafe { blst_fp_from_uint64(&mut r, [1u64, 0, 0, 0, 0, 0].as_ptr()) };
-            r.l
-        }
-        OP_IS_REDUCED => [fp_is_reduced(a) as u64, 0, 0, 0, 0, 0],
-        OP_EQ => [(a == b) as u64, 0, 0, 0, 0, 0],
+    // SAFETY: `F` is a transparent `[u64; N]` of Montgomery limbs (sizes
+    // checked above), and every operand is reduced.
+    let (fa, fb) = unsafe {
+        (
+            std::mem::transmute_copy::<_, F>(a),
+            std::mem::transmute_copy::<_, F>(b),
+        )
+    };
+    let r = match op {
+        OP_ADD => fa + fb,
+        OP_SUB => fa - fb,
+        OP_MUL => fa * fb,
+        OP_SQR => fa.square(),
+        OP_NEG => -fa,
+        OP_DBL => fa.double(),
+        OP_ONE => F::ONE,
         _ => unreachable!(),
-    }
+    };
+    // SAFETY: as above.
+    unsafe { std::mem::transmute_copy(&r) }
 }
 
 fn sub_small<const N: usize>(m: &[u64; N], k: u64) -> [u64; N] {
@@ -170,172 +104,138 @@ fn sub_small<const N: usize>(m: &[u64; N], k: u64) -> [u64; N] {
         let (v, o) = l.overflowing_sub(borrow);
         *l = v;
         borrow = o as u64;
-        if borrow == 0 {
-            break;
-        }
     }
     r
 }
 
-fn half<const N: usize>(m: &[u64; N]) -> [u64; N] {
-    let mut r = [0u64; N];
+/// Every pair of edge values (0, 1, 2, the Montgomery one, p-1, p-2,
+/// p-2^32, (p-1)/2, (p+1)/2, a single high bit, all-ones limbs below p, a
+/// 32-bit word), then random pairs, some sharing an operand, some near p.
+fn pairs<const N: usize>(m: &[u64; N], mont_one: [u64; N], seed: u64) -> Vec<([u64; N], [u64; N])> {
+    let low = |v: u64| {
+        let mut r = [0u64; N];
+        r[0] = v;
+        r
+    };
+    let mut half = sub_small(m, 1);
     for i in 0..N {
-        r[i] = (m[i] >> 1) | if i + 1 < N { m[i + 1] << 63 } else { 0 };
+        half[i] = (half[i] >> 1) | half.get(i + 1).map_or(0, |h| h << 63);
     }
-    r
-}
-
-/// Edge values of a field: 0, 1, 2, the Montgomery one, p-1, p-2, (p-1)/2,
-/// (p+1)/2, values with a single high bit, all-ones limbs below p.
-fn edges<const N: usize>(m: &[u64; N], mont_one: [u64; N]) -> Vec<[u64; N]> {
-    let mut v = vec![[0u64; N]];
-    let mut one = [0u64; N];
-    one[0] = 1;
-    v.push(one);
-    let mut two = [0u64; N];
-    two[0] = 2;
-    v.push(two);
-    v.push(mont_one);
-    v.push(sub_small(m, 1));
-    v.push(sub_small(m, 2));
-    v.push(sub_small(m, 0x1_0000_0000));
-    v.push(half(&sub_small(m, 1)));
-    let mut h = half(&sub_small(m, 1));
-    h[0] += 1;
-    v.push(h);
+    let mut half_up = half;
+    half_up[0] += 1;
     let mut top = [0u64; N];
     top[N - 1] = 1 << (63 - m[N - 1].leading_zeros());
-    v.push(top);
-    let mut lowfull = [0u64; N];
-    for l in lowfull.iter_mut().take(N - 1) {
-        *l = u64::MAX;
+    let mut lowfull = [u64::MAX; N];
+    lowfull[N - 1] = 0;
+    let e = [
+        low(0),
+        low(1),
+        low(2),
+        mont_one,
+        sub_small(m, 1),
+        sub_small(m, 2),
+        sub_small(m, 1 << 32),
+        half,
+        half_up,
+        top,
+        lowfull,
+        low(0xffff_ffff),
+    ];
+    let mut rng = ChaCha20Rng::seed_from_u64(seed);
+    let mut random = || loop {
+        let mut a: [u64; N] = std::array::from_fn(|_| rng.next_u64());
+        a[N - 1] &= u64::MAX >> m[N - 1].leading_zeros();
+        if a.iter().rev().lt(m.iter().rev()) {
+            return a;
+        }
+    };
+    let mut v: Vec<_> = e.iter().flat_map(|x| e.iter().map(|y| (*x, *y))).collect();
+    for i in 0..1 << 16 {
+        let x = random();
+        let y = match i % 8 {
+            0 => x,
+            1 => sub_small(m, 1 + (random()[0] & 0xffff)),
+            2 => e[i % e.len()],
+            _ => random(),
+        };
+        v.push((x, y));
     }
-    v.push(lowfull);
-    let mut word = [0u64; N];
-    word[0] = 0xffff_ffff;
-    v.push(word);
     v
 }
 
-fn random_below<const N: usize>(rng: &mut ChaCha20Rng, m: &[u64; N]) -> [u64; N] {
-    let mask = u64::MAX >> m[N - 1].leading_zeros();
-    loop {
-        let mut a = [0u64; N];
-        for l in a.iter_mut() {
-            *l = rng.next_u64();
-        }
-        a[N - 1] &= mask;
-        if a.iter().rev().cmp(m.iter().rev()) == std::cmp::Ordering::Less {
-            return a;
-        }
-    }
-}
-
-/// Every pair of edge values, then `random` random pairs (some sharing an
-/// operand, some near the modulus).
-fn pairs<const N: usize>(
-    m: &[u64; N],
-    mont_one: [u64; N],
-    random: usize,
-    seed: u64,
-) -> (Vec<[u64; N]>, Vec<[u64; N]>) {
-    let e = edges(m, mont_one);
-    let mut rng = ChaCha20Rng::seed_from_u64(seed);
-    let (mut a, mut b) = (Vec::new(), Vec::new());
-    for x in &e {
-        for y in &e {
-            a.push(*x);
-            b.push(*y);
-        }
-    }
-    for i in 0..random {
-        let x = random_below(&mut rng, m);
-        let y = match i % 8 {
-            0 => x,
-            1 => sub_small(m, 1 + (rng.next_u64() & 0xffff)),
-            2 => e[i % e.len()],
-            _ => random_below(&mut rng, m),
-        };
-        a.push(x);
-        b.push(y);
-    }
-    (a, b)
-}
-
-const RANDOM: usize = 1 << 16;
-
-#[test]
-fn fr_matches_blst() {
-    require_device();
-    let one = fr_ref(OP_ONE, &[0; 4], &[0; 4]);
-    for (op, name) in OPS {
-        let (a, b) = pairs(&FR_MODULUS, one, RANDOM, 0x5eed ^ op as u64);
-        let got = run_op::<Scalar>("field_test_fr", op, &a, &b);
-        for i in 0..a.len() {
-            let want = fr_ref(op, &a[i], &b[i]);
-            assert_eq!(got[i], want, "Fr {name}: a = {:x?}, b = {:x?}", a[i], b[i]);
-        }
-    }
-}
-
-#[test]
-fn fp_matches_blst() {
-    require_device();
-    let one = fp_ref(OP_ONE, &[0; 6], &[0; 6]);
-    for (op, name) in OPS {
-        let (a, b) = pairs(&FP_MODULUS, one, RANDOM, 0xf00d ^ op as u64);
-        let got = run_op::<FpLimbs>("field_test_fp", op, &a, &b);
-        for i in 0..a.len() {
-            let want = fp_ref(op, &a[i], &b[i]);
-            assert_eq!(got[i], want, "Fp {name}: a = {:x?}, b = {:x?}", a[i], b[i]);
-        }
-    }
-}
-
-/// Values at, just above and far above the modulus, and the largest limbs.
+/// Values at, just above and far above the modulus, the largest limbs, and
+/// random values with a top limb below four times the modulus'.
 fn unreduced<const N: usize>(m: &[u64; N]) -> Vec<[u64; N]> {
-    let mut v = vec![*m, sub_small(m, 1), [u64::MAX; N], [0; N]];
-    let mut p1 = *m;
-    p1[0] += 1;
-    v.push(p1);
-    let mut hi = *m;
-    hi[N - 1] += 1;
-    v.push(hi);
-    let mut lo = *m;
-    lo[N - 1] -= 1;
-    v.push(lo);
+    let plus = |i: usize, d: i64| {
+        let mut r = *m;
+        r[i] = r[i].wrapping_add_signed(d);
+        r
+    };
     let mut top = [0u64; N];
     top[N - 1] = 1 << 63;
-    v.push(top);
+    let mut v = vec![
+        *m,
+        sub_small(m, 1),
+        [u64::MAX; N],
+        [0; N],
+        plus(0, 1),
+        plus(N - 1, 1),
+        plus(N - 1, -1),
+        top,
+    ];
     let mut rng = ChaCha20Rng::seed_from_u64(7);
     for _ in 0..1000 {
-        let mut a = [0u64; N];
-        for l in a.iter_mut() {
-            *l = rng.next_u64();
-        }
-        // the top limb below four times the modulus' so both outcomes occur
+        let mut a: [u64; N] = std::array::from_fn(|_| rng.next_u64());
         a[N - 1] %= m[N - 1].saturating_mul(4);
         v.push(a);
     }
     v
 }
 
-#[test]
-fn reduced_check() {
+/// Every operation of `kernel` against blst on edge and random pairs, and
+/// `is_reduced` against the host on reduced and unreduced values.
+fn field_matches_blst<F: Field, const N: usize>(
+    kernel: &str,
+    m: &[u64; N],
+    seed: u64,
+    reduced: fn(&[u64; N]) -> bool,
+) where
+    [u64; N]: Default,
+{
     require_device();
-    let a = unreduced(&FR_MODULUS);
-    let got = run_op::<Scalar>("field_test_fr", OP_IS_REDUCED, &a, &a);
+    let one = blst_op::<F, N>(OP_ONE, &[0; N], &[0; N]);
+    for op in [
+        OP_ADD, OP_SUB, OP_MUL, OP_SQR, OP_NEG, OP_DBL, OP_ONE, OP_EQ,
+    ] {
+        let (a, b): (Vec<_>, Vec<_>) = pairs(m, one, seed ^ op as u64).into_iter().unzip();
+        let got = run_op(kernel, op, &a, &b);
+        for i in 0..a.len() {
+            let want = blst_op::<F, N>(op, &a[i], &b[i]);
+            assert_eq!(
+                got[i], want,
+                "{kernel} op {op}: a = {:x?}, b = {:x?}",
+                a[i], b[i]
+            );
+        }
+    }
+    let a = unreduced(m);
+    let got = run_op(kernel, OP_IS_REDUCED, &a, &a);
     let mut both = [0usize; 2];
     for (x, g) in a.iter().zip(&got) {
-        assert_eq!(g[0], is_reduced(x) as u64, "Fr is_reduced {x:x?}");
+        assert_eq!(g[0], reduced(x) as u64, "{kernel} is_reduced {x:x?}");
         both[g[0] as usize] += 1;
     }
     assert!(both[0] > 0 && both[1] > 0);
-    let a = unreduced(&FP_MODULUS);
-    let got = run_op::<FpLimbs>("field_test_fp", OP_IS_REDUCED, &a, &a);
-    for (x, g) in a.iter().zip(&got) {
-        assert_eq!(g[0], fp_is_reduced(x) as u64, "Fp is_reduced {x:x?}");
-    }
+}
+
+#[test]
+fn fr_matches_blst() {
+    field_matches_blst::<Fq, 4>("field_test_fr", &FR_MODULUS, 0x5eed, is_reduced);
+}
+
+#[test]
+fn fp_matches_blst() {
+    field_matches_blst::<Fp, 6>("field_test_fp", &FP_MODULUS, 0xf00d, fp_is_reduced);
 }
 
 #[test]
@@ -369,13 +269,14 @@ fn errors_are_values() {
 /// compare byte counts run one at a time.
 fn serial() -> std::sync::MutexGuard<'static, ()> {
     static LOCK: std::sync::Mutex<()> = std::sync::Mutex::new(());
-    LOCK.lock().unwrap_or_else(|e| e.into_inner())
+    let g = LOCK.lock().unwrap_or_else(|e| e.into_inner());
+    require_device();
+    g
 }
 
 #[test]
 fn request_buffers_and_byte_accounting() {
     let _g = serial();
-    require_device();
     assert!(crate::end_request());
     let mut s = ctx::lock().unwrap();
     let before = ctx::in_use_bytes();
@@ -416,7 +317,6 @@ fn request_buffers_and_byte_accounting() {
 #[test]
 fn pooled_buffers_come_back_zeroed() {
     let _g = serial();
-    require_device();
     assert!(crate::end_request());
     let c = ctx::context().unwrap();
     let len = (3 << 20) + 4096;
@@ -513,7 +413,6 @@ fn per_class_thresholds() {
     use group::Curve;
     use midnight_proofs::gpu::adapter::{affine, from_jacobian, scalar, scalars, scalars_mut};
     let _g = serial();
-    require_device();
     crate::reset_min_k();
     if std::env::var_os("MIDNIGHT_METAL_MIN_K").is_some() {
         eprintln!("MIDNIGHT_METAL_MIN_K is set: the defaults are not in force; skipped");
@@ -601,7 +500,6 @@ fn per_class_thresholds() {
 #[test]
 fn erase_report_reads_back_every_region() {
     let _g = serial();
-    require_device();
     assert!(crate::end_request());
     let fill = |n: usize| {
         let mut s = ctx::lock().unwrap();
@@ -611,13 +509,7 @@ fn erase_report_reads_back_every_region() {
     };
     fill(4096 + 3);
     let w = crate::end_request_report(true).expect("every region reads back zero");
-    assert_eq!(
-        (
-            w.regions - w.pool_regions,
-            w.checked_regions - w.pool_regions
-        ),
-        (2, 2)
-    );
+    assert_eq!(w.regions - w.pool_regions, 2);
     assert_eq!(w.checked_regions, w.regions);
     assert_eq!(w.bytes - w.pool_bytes, 3 * (4096 + 3) as u64);
     assert!(w.checked && w.nonzero_regions == 0 && w.check_failures == 0);
@@ -657,7 +549,6 @@ fn erase_report_reads_back_every_region() {
 #[test]
 fn erase_report_reads_back_the_idle_pool() {
     let _g = serial();
-    require_device();
     assert!(crate::end_request());
     let c = ctx::context().unwrap();
     let mut b = c.alloc_pooled(1 << 20).unwrap();
@@ -712,7 +603,6 @@ fn short_uploads_copy_exactly_their_bytes() {
 #[test]
 fn settle_releases_waits_for_every_caller() {
     let _g = serial();
-    require_device();
     assert!(crate::end_request());
     let c = ctx::context().unwrap();
     for _ in 0..2 {
@@ -752,7 +642,6 @@ fn settle_releases_waits_for_every_caller() {
 #[test]
 fn a_panicking_zeroing_is_completed_and_reported() {
     let _g = serial();
-    require_device();
     assert!(crate::end_request());
     let c = ctx::context().unwrap();
     let mut b = c.alloc_pooled(1 << 20).unwrap();
@@ -816,7 +705,6 @@ fn hooks_outside_a_request_wipe_before_they_return() {
         test_switches::RandomCircuit,
     };
     let _g = serial();
-    require_device();
     assert!(crate::end_request());
     assert!(!ctx::request_open());
     assert!(crate::set_min_k(1));
@@ -880,7 +768,6 @@ fn hooks_outside_a_request_wipe_before_they_return() {
 fn a_backend_panic_is_a_counted_decline() {
     use midnight_proofs::gpu::adapter::{affine, scalar, scalars, scalars_mut};
     let _g = serial();
-    require_device();
     assert!(crate::end_request());
     assert!(crate::set_min_k(1));
     let log_n = 12;
@@ -890,47 +777,44 @@ fn a_backend_panic_is_a_counted_decline() {
     let wi = ff::Field::invert(&w).unwrap();
     let div = ff::Field::invert(&midnight_curves::Fq::from(n as u64)).unwrap();
 
+    let points = stock::points(1 << 10, 32);
+    let transform = |inverse: bool| {
+        let mut a = input.clone();
+        let ok = if inverse {
+            crate::ifft(scalars_mut(&mut a), scalar(wi), log_n, scalar(div))
+        } else {
+            crate::fft(scalars_mut(&mut a), scalar(w), log_n)
+        };
+        assert_eq!(a, input, "the caller's buffer is unchanged");
+        ok
+    };
+    // the switch panics before the job is read, so a placeholder job is safe
+    let quotient = || {
+        let mut out = vec![[7u64; 4]; 4];
+        let job = &0u64 as *const u64 as *const std::ffi::c_void;
+        // SAFETY: the test switch panics before the job is read.
+        let ok = unsafe { crate::quotient(job, &mut out) };
+        assert_eq!(out, vec![[7u64; 4]; 4]);
+        ok
+    };
+    let calls: [(&str, &dyn Fn() -> bool); 4] = [
+        ("fft", &|| transform(false)),
+        ("ifft", &|| transform(true)),
+        ("msm", &|| {
+            crate::msm_g1(scalars(&input[..1 << 10]), affine(&points)).is_some()
+        }),
+        ("quotient", &quotient),
+    ];
     let panics = crate::hook_panics();
-    for class in ["fft", "ifft"] {
+    for (class, call) in calls {
         let before = decline_count(class, "panic");
         crate::set_hook_panic(class, true);
-        let mut a = input.clone();
-        let ok = if class == "fft" {
-            crate::fft(scalars_mut(&mut a), scalar(w), log_n)
-        } else {
-            crate::ifft(scalars_mut(&mut a), scalar(wi), log_n, scalar(div))
-        };
+        let ok = call();
         crate::set_hook_panic(class, false);
-        assert!(!ok);
-        assert_eq!(a, input, "{class}: the caller's buffer is unchanged");
-        assert_eq!(decline_count(class, "panic") - before, 1);
+        assert!(!ok, "{class}");
+        assert_eq!(decline_count(class, "panic") - before, 1, "{class}");
         assert_wiped(class);
     }
-    let points = stock::points(1 << 10, 32);
-    let before = decline_count("msm", "panic");
-    crate::set_hook_panic("msm", true);
-    let r = crate::msm_g1(scalars(&input[..1 << 10]), affine(&points));
-    crate::set_hook_panic("msm", false);
-    assert!(r.is_none());
-    assert_eq!(decline_count("msm", "panic") - before, 1);
-    assert_wiped("msm_g1");
-    // the switch panics before the job is read, so a placeholder job is safe
-    let before = decline_count("quotient", "panic");
-    let placeholder = 0u64;
-    let mut out = vec![[7u64; 4]; 4];
-    crate::set_hook_panic("quotient", true);
-    // SAFETY: the test switch panics before the job is read.
-    let ok = unsafe {
-        crate::quotient(
-            &placeholder as *const u64 as *const std::ffi::c_void,
-            &mut out,
-        )
-    };
-    crate::set_hook_panic("quotient", false);
-    assert!(!ok);
-    assert_eq!(out, vec![[7u64; 4]; 4]);
-    assert_eq!(decline_count("quotient", "panic") - before, 1);
-    assert_wiped("quotient");
     assert_eq!(crate::hook_panics() - panics, 4);
     let mut a = input;
     assert!(crate::fft(scalars_mut(&mut a), scalar(w), log_n));

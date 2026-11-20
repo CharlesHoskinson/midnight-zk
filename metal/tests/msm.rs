@@ -17,23 +17,25 @@
 
 #![cfg(target_os = "macos")]
 
-use std::sync::{Mutex, MutexGuard, OnceLock};
+mod common;
+
+use std::sync::{MutexGuard, OnceLock};
 
 use blst::{
-    blst_fp, blst_fp_mul, blst_fp_sqr, blst_p1, blst_p1_add_or_double, blst_p1_affine,
-    blst_p1_cneg, blst_p1_from_affine, blst_p1_is_equal,
+    BLST_ERROR, blst_fp, blst_fp_mul, blst_p1_affine, blst_p1_affine_in_g1, blst_p1_uncompress,
 };
+use common::random_scalars;
 use ff::Field;
 use group::{Curve, Group, prime::PrimeCurveAffine};
 use midnight_curves::{Bls12, Fq, G1Affine, G1Projective, msm::msm_pippenger};
 use midnight_metal::{
-    G1AffineLimbs, MsmStages, Scalar,
+    self as metal, G1AffineLimbs, MsmStages, Scalar,
     ctx::{self, Arg},
 };
 use midnight_proofs::{
-    gpu::{GpuHooks, adapter, install, test_switches::without_hooks},
+    gpu::{adapter, test_switches::without_hooks},
     poly::{
-        Coeff, EvaluationDomain, PolynomialLabel,
+        Coeff, EvaluationDomain, Polynomial, PolynomialLabel,
         commitment::PolynomialCommitmentScheme,
         kzg::{KZGCommitmentScheme, params::ParamsKZG},
     },
@@ -42,15 +44,14 @@ use rand_chacha::ChaCha8Rng;
 use rand_core::SeedableRng;
 use rayon::prelude::*;
 
-/// Serializes the tests (thresholds and counters are process-wide) and sets
-/// the threshold (`None`: the defaults) and the CPU share.
+const UNREGISTERED: (&str, &str, u64) = ("msm", "unregistered-bases", 1);
+
+/// `min_k`: an explicit threshold, or `None` for the defaults.
 fn setup(min_k: Option<u32>, cpu_share: bool) -> MutexGuard<'static, ()> {
-    static LOCK: Mutex<()> = Mutex::new(());
-    let g = LOCK.lock().unwrap_or_else(|e| e.into_inner());
-    assert!(midnight_metal::device(), "no usable Metal device");
+    let g = common::serial();
     match min_k {
-        Some(k) => assert!(midnight_metal::set_min_k(k)),
-        None => midnight_metal::reset_min_k(),
+        Some(k) => assert!(metal::set_min_k(k)),
+        None => metal::reset_min_k(),
     }
     set_cpu_share(cpu_share);
     g
@@ -58,16 +59,16 @@ fn setup(min_k: Option<u32>, cpu_share: bool) -> MutexGuard<'static, ()> {
 
 /// Whether `MIDNIGHT_METAL_MIN_K` overrides the defaults.
 fn defaults_overridden() -> bool {
-    let explicit = midnight_metal::thresholds().explicit;
+    let explicit = metal::thresholds().explicit;
     if explicit {
         eprintln!("MIDNIGHT_METAL_MIN_K is set: the defaults are not in force; skipped");
     }
     explicit
 }
 
-/// Called under the lock of [`setup`].
 fn set_cpu_share(on: bool) {
-    // SAFETY: no other thread of this binary reads the environment meanwhile.
+    // SAFETY: called under the lock of `setup`; no other thread of this
+    // binary reads the environment meanwhile.
     unsafe {
         if on {
             std::env::remove_var("MIDNIGHT_METAL_MSM_CPU_SHARE");
@@ -79,9 +80,8 @@ fn set_cpu_share(on: bool) {
 
 /// `n` distinct points: chunks of `P + i Q` from random `P`, `Q`.
 fn random_points(n: usize, seed: u64) -> Vec<G1Affine> {
-    const CHUNK: usize = 1 << 12;
     let mut out = vec![G1Affine::identity(); n];
-    out.par_chunks_mut(CHUNK).enumerate().for_each(|(c, chunk)| {
+    out.par_chunks_mut(1 << 12).enumerate().for_each(|(c, chunk)| {
         let mut rng = ChaCha8Rng::seed_from_u64(seed ^ ((c as u64) << 20));
         let step = G1Projective::random(&mut rng);
         let mut p = G1Projective::random(&mut rng);
@@ -101,47 +101,25 @@ fn points_cache() -> &'static [G1Affine] {
     P.get_or_init(|| random_points(1 << 20, 1))
 }
 
-fn random_scalars(n: usize, seed: u64) -> Vec<Fq> {
-    (0..n)
-        .into_par_iter()
-        .chunks(1 << 12)
-        .flat_map_iter(|c| {
-            let mut rng = ChaCha8Rng::seed_from_u64(seed ^ ((c[0] as u64) << 16));
-            c.into_iter().map(move |_| Fq::random(&mut rng))
-        })
-        .collect()
-}
-
-fn device_msm(s: &[Fq], b: &[G1Affine]) -> G1Projective {
-    let r = midnight_metal::msm_g1(adapter::scalars(s), adapter::affine(b));
-    adapter::from_jacobian(r.unwrap_or_else(|| {
-        panic!(
-            "the device declined an MSM of {}: {:?}",
-            s.len(),
-            midnight_metal::declines()
-        )
-    }))
+fn msm(s: &[Fq], b: &[G1Affine]) -> Option<G1Projective> {
+    metal::msm_g1(adapter::scalars(s), adapter::affine(b)).map(adapter::from_jacobian)
 }
 
 /// The device MSM is served and equals `msm_pippenger`.
 fn check(name: &str, s: &[Fq], b: &[G1Affine]) {
-    let before = midnight_metal::stats().msm.served;
-    let got = device_msm(s, b);
-    assert!(
-        got == msm_pippenger(s, b),
-        "{name}: MSM of {} differs from msm_pippenger",
-        s.len()
-    );
-    assert_eq!(midnight_metal::stats().msm.served, before + 1, "{name}");
+    let before = metal::stats().msm.served;
+    let got = msm(s, b).unwrap_or_else(|| panic!("{name}: declined {:?}", metal::declines()));
+    assert!(got == msm_pippenger(s, b), "{name}: MSM of {}", s.len());
+    assert_eq!(metal::stats().msm.served, before + 1, "{name}");
 }
 
 /// The path and plan of one MSM, its value checked.
 fn stages(s: &[Fq], b: &[G1Affine]) -> MsmStages {
-    let (r, st) = midnight_metal::msm_g1_stages(adapter::scalars(s), adapter::affine(b))
-        .unwrap_or_else(|| panic!("msm_g1_stages declined an MSM of {}", s.len()));
+    let (r, st) = metal::msm_g1_stages(adapter::scalars(s), adapter::affine(b))
+        .unwrap_or_else(|| panic!("an MSM of {} declined", s.len()));
     assert!(
         adapter::from_jacobian(r) == msm_pippenger(s, b),
-        "MSM of {} differs from msm_pippenger",
+        "MSM of {}",
         s.len()
     );
     st
@@ -149,40 +127,24 @@ fn stages(s: &[Fq], b: &[G1Affine]) -> MsmStages {
 
 /// The device value, or the stock CPU MSM when it declines.
 fn hook_or_stock(s: &[Fq], b: &[G1Affine]) -> G1Projective {
-    midnight_metal::msm_g1(adapter::scalars(s), adapter::affine(b))
-        .map_or_else(|| msm_pippenger(s, b), adapter::from_jacobian)
+    msm(s, b).unwrap_or_else(|| msm_pippenger(s, b))
 }
 
 fn sized(b: &[G1Affine]) -> bool {
-    midnight_metal::msm_sized(b.len(), adapter::affine(b))
+    metal::msm_sized(b.len(), adapter::affine(b))
 }
-
-const UNREGISTERED: &str = "unregistered-bases";
 
 /// `msm_g1` declines `unregistered-bases` only, with no device MSM, no table
 /// upload and no G1 check of the bases.
 fn declines_unregistered(what: &str, s: &[Fq], b: &[G1Affine]) {
-    midnight_metal::reset_stats();
-    let counts = midnight_metal::msm_counts();
-    let checks = midnight_metal::one_shot_g1_checks();
-    let r = midnight_metal::msm_g1(adapter::scalars(s), adapter::affine(b));
-    assert!(r.is_none(), "{what}: served");
-    assert_eq!(midnight_metal::stats().msm.served, 0, "{what}");
-    assert_eq!(
-        midnight_metal::declines(),
-        vec![("msm", UNREGISTERED, 1)],
-        "{what}"
-    );
-    assert_eq!(
-        midnight_metal::msm_counts(),
-        counts,
-        "{what}: no device MSM, no upload"
-    );
-    assert_eq!(
-        midnight_metal::one_shot_g1_checks(),
-        checks,
-        "{what}: no G1 check"
-    );
+    metal::reset_stats();
+    let counts = metal::msm_counts();
+    let checks = metal::one_shot_g1_checks();
+    assert!(msm(s, b).is_none(), "{what}: served");
+    assert_eq!(metal::stats().msm.served, 0, "{what}");
+    assert_eq!(metal::declines(), vec![UNREGISTERED], "{what}");
+    assert_eq!(metal::msm_counts(), counts, "{what}");
+    assert_eq!(metal::one_shot_g1_checks(), checks, "{what}");
 }
 
 /// The CUDA crate's mask vector (gpu/src/msm.rs `mask_vector`).
@@ -223,25 +185,12 @@ fn fmul(a: &blst_fp, b: &blst_fp) -> blst_fp {
 }
 
 fn fsqr(a: &blst_fp) -> blst_fp {
-    let mut r = blst_fp::default();
-    // SAFETY: valid field element.
-    unsafe { blst_fp_sqr(&mut r, a) };
-    r
-}
-
-fn p1_of_affine(a: &G1AffineLimbs) -> blst_p1 {
-    let aff = blst_p1_affine {
-        x: fp(&a[..6]),
-        y: fp(&a[6..]),
-    };
-    let mut p = blst_p1::default();
-    // SAFETY: valid affine point (all zero is infinity).
-    unsafe { blst_p1_from_affine(&mut p, &aff) };
-    p
+    fmul(a, a)
 }
 
 /// `(x z^2, y z^3, z^3, z^2)`; infinity is all zero.
-fn xyzz_of(a: &G1AffineLimbs, z: &blst_fp) -> Xyzz {
+fn xyzz_of(a: &G1Affine, z: &blst_fp) -> Xyzz {
+    let a = adapter::affine(std::slice::from_ref(a))[0];
     let mut r = [0u64; 24];
     if a.iter().all(|&w| w == 0) {
         return r;
@@ -255,67 +204,37 @@ fn xyzz_of(a: &G1AffineLimbs, z: &blst_fp) -> Xyzz {
     r
 }
 
-/// An XYZZ record as a blst point, checking `ZZ^3 = ZZZ^2`.
-fn p1_of_xyzz(r: &Xyzz) -> blst_p1 {
+/// An XYZZ record as a point, checking `ZZ^3 = ZZZ^2`.
+fn point_of(r: &Xyzz) -> G1Projective {
     let (x, y, zzz, zz) = (fp(&r[..6]), fp(&r[6..12]), fp(&r[12..18]), fp(&r[18..]));
-    let zz_zero = zz.l.iter().all(|&w| w == 0);
-    let zzz_zero = zzz.l.iter().all(|&w| w == 0);
-    assert_eq!(zz_zero, zzz_zero, "ZZ and ZZZ disagree on infinity");
+    let zero = |f: &blst_fp| f.l.iter().all(|&w| w == 0);
+    assert_eq!(zero(&zz), zero(&zzz), "ZZ and ZZZ disagree on infinity");
     assert_eq!(fmul(&fsqr(&zz), &zz).l, fsqr(&zzz).l, "ZZ^3 != ZZZ^2");
-    blst_p1 {
-        x: fmul(&x, &zz),
-        y: fmul(&y, &zzz),
-        z: zz,
-    }
-}
-
-fn padd(a: &blst_p1, b: &blst_p1) -> blst_p1 {
-    let mut r = blst_p1::default();
-    // SAFETY: valid points.
-    unsafe { blst_p1_add_or_double(&mut r, a, b) };
-    r
-}
-
-fn pneg(a: &blst_p1) -> blst_p1 {
-    let mut r = *a;
-    // SAFETY: valid point.
-    unsafe { blst_p1_cneg(&mut r, true) };
-    r
-}
-
-fn peq(a: &blst_p1, b: &blst_p1) -> bool {
-    // SAFETY: valid points.
-    unsafe { blst_p1_is_equal(a, b) }
+    let mut j = [0u64; 18];
+    j[..6].copy_from_slice(&fmul(&x, &zz).l);
+    j[6..12].copy_from_slice(&fmul(&y, &zzz).l);
+    j[12..].copy_from_slice(&zz.l);
+    adapter::from_jacobian(j)
 }
 
 fn g1_kernel(op: u32, a: &[Xyzz], b: &[Xyzz], b_aff: &[G1AffineLimbs], flags: &[u32]) -> Vec<Xyzz> {
     let n = a.len() as u32;
     let s = ctx::lock().unwrap();
     let c = s.ctx();
-    let (ba, bb, bf, bl) = (
+    let bufs = [
         c.upload(a).unwrap(),
         c.upload(b).unwrap(),
         c.upload(b_aff).unwrap(),
         c.upload(flags).unwrap(),
-    );
-    let out = c.alloc(size_of_val(a)).unwrap();
+        c.alloc(size_of_val(a)).unwrap(),
+    ];
     c.run(|cmd| {
-        cmd.dispatch(
-            "msm_test_g1",
-            n as usize,
-            &[
-                Arg::Buffer(&ba),
-                Arg::Buffer(&bb),
-                Arg::Buffer(&bf),
-                Arg::Buffer(&bl),
-                Arg::Buffer(&out),
-                Arg::value(&op),
-                Arg::value(&n),
-            ],
-        )
+        let mut args: Vec<Arg> = bufs.iter().map(Arg::Buffer).collect();
+        args.extend([Arg::value(&op), Arg::value(&n)]);
+        cmd.dispatch("msm_test_g1", n as usize, &args)
     })
     .unwrap();
-    out.as_slice::<Xyzz>().to_vec()
+    bufs[4].as_slice::<Xyzz>().to_vec()
 }
 
 #[test]
@@ -323,66 +242,40 @@ fn g1_kernels_match_blst() {
     let _g = setup(Some(14), true);
     let mut rng = ChaCha8Rng::seed_from_u64(7);
     let pts: Vec<G1Affine> = (0..64).map(|_| G1Projective::random(&mut rng).to_affine()).collect();
-    let limbs = adapter::affine(&pts);
-    let z = |i: usize| fp(&limbs[(i + 17) % limbs.len()][..6]);
-    let lim = |p: &G1Affine| adapter::affine(std::slice::from_ref(p))[0];
     let inf = G1Affine::identity();
-
-    let mut pts_pairs: Vec<(G1Affine, G1Affine)> = Vec::new();
-    for i in 0..32 {
-        pts_pairs.push((pts[i], pts[i + 32]));
-    }
+    let mut pairs: Vec<(G1Affine, G1Affine)> = (0..32).map(|i| (pts[i], pts[i + 32])).collect();
     for p in &pts[..4] {
-        pts_pairs.push((*p, inf));
-        pts_pairs.push((inf, *p));
-        pts_pairs.push((*p, *p));
-        pts_pairs.push((*p, -*p));
+        pairs.extend([(*p, inf), (inf, *p), (*p, *p), (*p, -*p)]);
     }
-    pts_pairs.push((inf, inf));
-    let pairs: Vec<(G1AffineLimbs, G1AffineLimbs)> =
-        pts_pairs.iter().map(|(a, b)| (lim(a), lim(b))).collect();
-    let m = pairs.len();
-
+    pairs.push((inf, inf));
+    let z = |i: usize| fp(&adapter::affine(&pts)[(i + 17) % pts.len()][..6]);
     let a: Vec<Xyzz> = pairs.iter().enumerate().map(|(i, p)| xyzz_of(&p.0, &z(i))).collect();
     // b in XYZZ with a different scale, so P + P is not a bitwise copy
     let b: Vec<Xyzz> = pairs.iter().enumerate().map(|(i, p)| xyzz_of(&p.1, &z(i + 5))).collect();
-    let b_aff: Vec<G1AffineLimbs> = pairs.iter().map(|p| p.1).collect();
-    let pa: Vec<blst_p1> = pairs.iter().map(|p| p1_of_affine(&p.0)).collect();
-    let pb: Vec<blst_p1> = pairs.iter().map(|p| p1_of_affine(&p.1)).collect();
-
-    for i in 0..m {
-        assert!(peq(&p1_of_xyzz(&a[i]), &pa[i]), "input a {i}");
-        assert!(peq(&p1_of_xyzz(&b[i]), &pb[i]), "input b {i}");
-    }
-
-    for flag in [0u32, 1] {
-        let flags = vec![flag; m];
-        let got = g1_kernel(OP_MADD, &a, &b, &b_aff, &flags);
-        for i in 0..m {
-            let exp = if flag == 1 {
-                padd(&pa[i], &pneg(&pb[i]))
+    let b_aff: Vec<G1Affine> = pairs.iter().map(|p| p.1).collect();
+    for (op, neg) in [
+        (OP_MADD, false),
+        (OP_MADD, true),
+        (OP_FROM_AFFINE, false),
+        (OP_FROM_AFFINE, true),
+        (OP_ADD, false),
+    ] {
+        let flags = vec![neg as u32; pairs.len()];
+        let got = g1_kernel(op, &a, &b, adapter::affine(&b_aff), &flags);
+        for (i, (p, q)) in pairs.iter().enumerate() {
+            let q = if neg { -q.to_curve() } else { q.to_curve() };
+            let want = if op == OP_FROM_AFFINE {
+                q
             } else {
-                padd(&pa[i], &pb[i])
+                p.to_curve() + q
             };
-            assert!(peq(&p1_of_xyzz(&got[i]), &exp), "madd {i} flag {flag}");
-        }
-        let got = g1_kernel(OP_FROM_AFFINE, &a, &b, &b_aff, &flags);
-        for i in 0..m {
-            let exp = if flag == 1 { pneg(&pb[i]) } else { pb[i] };
             assert!(
-                peq(&p1_of_xyzz(&got[i]), &exp),
-                "from_affine {i} flag {flag}"
+                point_of(&got[i]) == want,
+                "op {op}, negated {neg}, pair {i}"
             );
-        }
-    }
-    let flags = vec![0u32; m];
-    let got = g1_kernel(OP_ADD, &a, &b, &b_aff, &flags);
-    for i in 0..m {
-        assert!(peq(&p1_of_xyzz(&got[i]), &padd(&pa[i], &pb[i])), "add {i}");
-    }
-    for (i, (pa, pb)) in pts_pairs.iter().enumerate() {
-        if *pa != inf && *pb == -*pa {
-            assert_eq!(got[i], [0u64; 24], "P + (-P) at {i}");
+            if op == OP_ADD && *p != inf && q == -p.to_curve() {
+                assert_eq!(got[i], [0u64; 24], "P + (-P) at {i}");
+            }
         }
     }
 }
@@ -390,52 +283,35 @@ fn g1_kernels_match_blst() {
 #[test]
 fn mask_is_the_cuda_vector() {
     let _g = setup(Some(14), true);
-    let n = 5000u32;
-    let want = cuda_mask_vector(n as usize + 100);
+    let (i0, n) = (100u32, 5000u32);
+    let want = cuda_mask_vector((i0 + n) as usize);
     let s = ctx::lock().unwrap();
     let c = s.ctx();
     let out = c.alloc(n as usize * 32).unwrap();
-    let i0 = 100u32;
     c.run(|cmd| {
-        cmd.dispatch(
-            "msm_test_mask",
-            n as usize,
-            &[Arg::Buffer(&out), Arg::value(&i0), Arg::value(&n)],
-        )
+        let args = [Arg::Buffer(&out), Arg::value(&i0), Arg::value(&n)];
+        cmd.dispatch("msm_test_mask", n as usize, &args)
     })
     .unwrap();
-    assert_eq!(out.as_slice::<Scalar>(), &want[100..]);
-    assert!(want.iter().all(midnight_metal::field::is_reduced));
-}
-
-/// `(log2 n, wbits)`: one size per window width class of the one-shot path.
-fn sizes(split: bool) -> &'static [(u32, u32)] {
-    if split || cfg!(debug_assertions) {
-        &[(14, 11), (16, 13)]
-    } else {
-        &[(14, 11), (16, 13), (20, 15)]
-    }
+    assert_eq!(out.as_slice::<Scalar>(), &want[i0 as usize..]);
+    assert!(want.iter().all(metal::field::is_reduced));
 }
 
 /// Special inputs are spread over all indices so both shares of a split
 /// hold them, and `odd[i] = odd[i / 2]` repeats points across the shares.
 fn differential(split: bool) {
     let _g = setup(Some(0), split);
-    midnight_metal::reset_stats();
-    let all = points_cache();
-    for &(k, wbits) in sizes(split) {
+    metal::reset_stats();
+    // `(log2 n, wbits)`: one size per window width class of the one-shot path
+    let sizes: &[(u32, u32)] = if split || cfg!(debug_assertions) {
+        &[(14, 11), (16, 13)]
+    } else {
+        &[(14, 11), (16, 13), (20, 15)]
+    };
+    for &(k, wbits) in sizes {
         let n = 1usize << k;
-        let bases = &all[..n];
+        let bases = &points_cache()[..n];
         let path = |st: MsmStages| (st.device_points < n as u64, st.wbits);
-
-        let random = random_scalars(n, k as u64);
-        assert_eq!(path(stages(&random, bases)), (split, wbits), "2^{k}");
-        check("random", &random, bases);
-        let c = Fq::random(ChaCha8Rng::seed_from_u64(99 + k as u64));
-        check("all equal", &vec![c; n], bases);
-        check("all zero", &vec![Fq::ZERO; n], bases);
-        check("all one", &vec![Fq::ONE; n], bases);
-        check("all r-1", &vec![-Fq::ONE; n], bases);
         let few = [
             Fq::from(3),
             -Fq::from(5),
@@ -443,7 +319,19 @@ fn differential(split: bool) {
             Fq::ONE,
         ];
         let repeated: Vec<Fq> = (0..n).map(|i| few[(i * 7 + i / 13) % few.len()]).collect();
-        check("repeated", &repeated, bases);
+        let c = Fq::random(ChaCha8Rng::seed_from_u64(99 + k as u64));
+        let random = random_scalars(n, k as u64);
+        assert_eq!(path(stages(&random, bases)), (split, wbits), "2^{k}");
+        for (name, s) in [
+            ("random", random),
+            ("all equal", vec![c; n]),
+            ("all zero", vec![Fq::ZERO; n]),
+            ("all one", vec![Fq::ONE; n]),
+            ("all r-1", vec![-Fq::ONE; n]),
+            ("repeated", repeated.clone()),
+        ] {
+            check(name, &s, bases);
+        }
 
         let mut odd = bases.to_vec();
         for i in (0..n).step_by(7) {
@@ -457,15 +345,15 @@ fn differential(split: bool) {
         }
         let odd_random = random_scalars(n, 1000 + k as u64);
         assert_eq!(path(stages(&odd_random, &odd)), (split, wbits), "2^{k}");
-        check("odd bases, random", &odd_random, &odd);
-        check("odd bases, repeated", &repeated, &odd);
-        check("odd bases, all one", &vec![Fq::ONE; n], &odd);
+        for (name, s) in [
+            ("odd bases, random", odd_random),
+            ("odd bases, repeated", repeated),
+            ("odd bases, all one", vec![Fq::ONE; n]),
+        ] {
+            check(name, &s, &odd);
+        }
     }
-    assert!(
-        midnight_metal::declines().is_empty(),
-        "{:?}",
-        midnight_metal::declines()
-    );
+    assert!(metal::declines().is_empty(), "{:?}", metal::declines());
 }
 
 #[test]
@@ -482,29 +370,23 @@ fn msm_from_rayon_pool() {
     let n = 1usize << 14;
     let bases = &points_cache()[..n];
     let inputs: Vec<Vec<Fq>> = (0..6).map(|i| random_scalars(n, 300 + i)).collect();
-    let want: Vec<G1Projective> = inputs.iter().map(|s| msm_pippenger(s, bases)).collect();
+    let want: Vec<Option<G1Projective>> =
+        inputs.iter().map(|s| Some(msm_pippenger(s, bases))).collect();
     assert!(stages(&inputs[0], bases).device_points < n as u64);
-    let got: Vec<G1Projective> = inputs.par_iter().map(|s| device_msm(s, bases)).collect();
-    assert!(got == want);
+    let run = || inputs.par_iter().map(|s| msm(s, bases)).collect::<Vec<_>>();
+    assert!(run() == want);
     let pool = rayon::ThreadPoolBuilder::new().num_threads(3).build().unwrap();
-    let got: Vec<G1Projective> =
-        pool.install(|| inputs.par_iter().map(|s| device_msm(s, bases)).collect());
-    assert!(got == want);
+    assert!(pool.install(run) == want);
 }
 
 /// Around the chunk stride of 32, below the plan table, and a split one.
 #[test]
 fn msm_odd_lengths() {
     let _g = setup(Some(0), true);
-    let all = points_cache();
     for n in [1usize, 2, 31, 33, 193, 1000, (1 << 14) + 5] {
-        let s = random_scalars(n, n as u64);
-        check("odd length", &s, &all[..n]);
-        assert_eq!(
-            stages(&s, &all[..n]).device_points < n as u64,
-            n >= 1 << 14,
-            "{n}"
-        );
+        let (s, b) = (random_scalars(n, n as u64), &points_cache()[..n]);
+        check("odd length", &s, b);
+        assert_eq!(stages(&s, b).device_points < n as u64, n >= 1 << 14, "{n}");
     }
 }
 
@@ -513,9 +395,8 @@ fn msm_odd_lengths() {
 #[test]
 fn abs_boundary_scalars_match_cpu() {
     let _g = setup(Some(0), true);
-    let two = Fq::from(2);
-    let half = two.invert().unwrap();
-    let p2 = |e: u64| two.pow_vartime([e]);
+    let half = Fq::from(2).invert().unwrap();
+    let p2 = |e: u64| Fq::from(2).pow_vartime([e]);
     let top = Fq::from(0x39f6_d3a9u64);
     let boundary = [
         -half,                               // (r - 1) / 2
@@ -525,34 +406,27 @@ fn abs_boundary_scalars_match_cpu() {
         (top + Fq::ONE) * p2(224) - Fq::ONE, // top limb of s and r - s equal
         top * p2(224),                       // top limbs next to each other
     ];
-    assert_eq!(-half - half, -Fq::ONE);
     let n = 1usize << 14;
     let bases = &points_cache()[..n];
     let mask = mask_fq(n);
     for split in [false, true] {
         set_cpu_share(split);
         for masked in [false, true] {
-            let mut s = random_scalars(n, 81);
+            let b = |i: usize, j: usize| {
+                boundary[j % boundary.len()] - mask[i] * Fq::from(masked as u64)
+            };
+            let mut mixed = random_scalars(n, 81);
             for i in (0..n).step_by(3) {
-                let b = boundary[(i / 3) % boundary.len()];
-                s[i] = if masked { b - mask[i] } else { b };
+                mixed[i] = b(i, i / 3);
             }
-            check(
-                &format!("abs boundary, masked {masked}, split {split}"),
-                &s,
-                bases,
-            );
-            let s: Vec<Fq> = (0..n)
-                .map(|i| {
-                    let b = boundary[i % boundary.len()];
-                    if masked { b - mask[i] } else { b }
-                })
-                .collect();
-            check(
-                &format!("abs boundary only, masked {masked}, split {split}"),
-                &s,
-                bases,
-            );
+            let only: Vec<Fq> = (0..n).map(|i| b(i, i)).collect();
+            for (name, s) in [("mixed", mixed), ("only", only)] {
+                check(
+                    &format!("{name}, masked {masked}, split {split}"),
+                    &s,
+                    bases,
+                );
+            }
         }
     }
 }
@@ -567,7 +441,7 @@ fn wide_windows_and_chunks_match_cpu() {
     let n = 1usize << 22;
     let bases = random_points(n, 2222);
     let scal = random_scalars(n, 2223);
-    let h = midnight_metal::register_srs(adapter::affine(&bases));
+    let h = metal::register_srs(adapter::affine(&bases));
     for (k, wbits, batches) in [(20u32, 15u32, 1u32), (22, 16, 2)] {
         let m = 1usize << k;
         let (s, b) = (&scal[..m], &bases[..m]);
@@ -597,16 +471,16 @@ fn hot_bucket_is_exact_or_declined() {
         let s: Vec<Fq> = mask_fq(n).iter().map(|m| c - m).collect();
         let want = msm_pippenger(&s, bases);
         for registered in [false, true] {
-            let h = registered.then(|| midnight_metal::register_srs(adapter::affine(bases)));
-            midnight_metal::reset_stats();
-            let got = midnight_metal::msm_g1(adapter::scalars(&s), adapter::affine(bases));
+            let h = registered.then(|| metal::register_srs(adapter::affine(bases)));
+            metal::reset_stats();
+            let got = msm(&s, bases);
             let what = format!("2^{k}, registered {registered}");
             if served {
-                assert!(got.map(adapter::from_jacobian) == Some(want), "{what}");
+                assert!(got == Some(want), "{what}");
             } else {
                 assert!(got.is_none(), "{what}");
                 assert_eq!(
-                    midnight_metal::declines(),
+                    metal::declines(),
                     vec![("msm", "device-error", 1)],
                     "{what}"
                 );
@@ -630,24 +504,17 @@ fn sparse_scalars(n: usize, nz: usize, seed: u64) -> Vec<Fq> {
 
 /// The device MSM, or `None` on a `below-min-k` decline with no device work.
 fn try_device_msm(s: &[Fq], b: &[G1Affine]) -> Option<G1Projective> {
-    midnight_metal::reset_stats();
-    let counts = midnight_metal::msm_counts();
-    match midnight_metal::msm_g1(adapter::scalars(s), adapter::affine(b)) {
-        Some(r) => {
-            assert_eq!(midnight_metal::stats().msm.served, 1);
-            Some(adapter::from_jacobian(r))
-        }
-        None => {
-            assert_eq!(
-                midnight_metal::declines(),
-                vec![("msm", "below-min-k", 1)],
-                "only a below-min-k decline"
-            );
-            assert_eq!(midnight_metal::msm_counts(), counts);
-            assert_eq!(midnight_metal::stats().msm.served, 0);
-            None
-        }
+    metal::reset_stats();
+    let counts = metal::msm_counts();
+    let r = msm(s, b);
+    if r.is_some() {
+        assert_eq!(metal::stats().msm.served, 1);
+    } else {
+        assert_eq!(metal::declines(), vec![("msm", "below-min-k", 1)]);
+        assert_eq!(metal::msm_counts(), counts);
+        assert_eq!(metal::stats().msm.served, 0);
     }
+    r
 }
 
 /// With the defaults a table needs `2^12 + n/5` non-zero scalars; an
@@ -655,79 +522,91 @@ fn try_device_msm(s: &[Fq], b: &[G1Affine]) -> Option<G1Projective> {
 #[test]
 fn sparse_msm_declines_below_min_k() {
     let _g = setup(None, true);
-    let t = midnight_metal::thresholds();
+    let t = metal::thresholds();
     assert!(!t.explicit, "MIDNIGHT_METAL_MIN_K is set: {t:?}");
     assert_eq!(t.msm_one_shot, None);
     let n = 1usize << 16;
     let bases = &points_cache()[..n];
     let need = (1usize << 12) + n / 5;
-    let served = |nz: usize, seed: u64| {
-        let s = sparse_scalars(n, nz, seed);
-        let got = try_device_msm(&s, bases).expect("served");
-        assert!(got == msm_pippenger(&s, bases), "{nz}");
+    let declined = |s: &[Fq], b: &[G1Affine]| try_device_msm(s, b).is_none();
+    let served = |s: &[Fq], b: &[G1Affine]| {
+        assert!(
+            try_device_msm(s, b) == Some(msm_pippenger(s, b)),
+            "{}",
+            s.len()
+        );
     };
 
     for nz in [0, 2, 11, n / 3, n] {
         declines_unregistered(&format!("{nz}"), &sparse_scalars(n, nz, nz as u64), bases);
     }
 
-    let h = midnight_metal::register_srs(adapter::affine(bases));
+    let h = metal::register_srs(adapter::affine(bases));
     for nz in [2, 1 << t.msm_table, need - 1] {
-        assert!(
-            try_device_msm(&sparse_scalars(n, nz, 5), bases).is_none(),
-            "table {nz}"
-        );
+        assert!(declined(&sparse_scalars(n, nz, 5), bases), "table {nz}");
     }
-    served(need, 6);
+    served(&sparse_scalars(n, need, 6), bases);
 
     // a column with zero rows before its blinding rows; the multi-open's
     // length m - 1
     let m = 1usize << t.msm_table;
     for len in [m, m - 1] {
         let mut s = random_scalars(len, 13);
-        for z in &mut s[len - 20..len - 4] {
-            *z = Fq::ZERO;
-        }
-        let got = try_device_msm(&s, &bases[..len]).expect("a dense MSM at the threshold");
-        assert!(got == msm_pippenger(&s, &bases[..len]), "{len}");
+        s[len - 20..len - 4].fill(Fq::ZERO);
+        served(&s, &bases[..len]);
     }
-    assert!(try_device_msm(&sparse_scalars(m, m / 2, 14), &bases[..m]).is_none());
+    assert!(declined(&sparse_scalars(m, m / 2, 14), &bases[..m]));
 
-    assert!(midnight_metal::set_min_k(14));
-    served(1 << 14, 7);
-    assert!(try_device_msm(&sparse_scalars(n, (1 << 14) - 1, 8), bases).is_none());
+    assert!(metal::set_min_k(14));
+    served(&sparse_scalars(n, 1 << 14, 7), bases);
+    assert!(declined(&sparse_scalars(n, (1 << 14) - 1, 8), bases));
     drop(h);
-    served(1 << 14, 9);
-    assert!(try_device_msm(&sparse_scalars(n, (1 << 14) - 1, 10), bases).is_none());
+    served(&sparse_scalars(n, 1 << 14, 9), bases);
+    assert!(declined(&sparse_scalars(n, (1 << 14) - 1, 10), bases));
 }
 
+fn sized_call(s: &[Fq], b: &[G1Affine]) -> (bool, Option<G1Projective>) {
+    metal::reset_stats();
+    let (sized, r) = metal::msm_g1_sized(adapter::scalars(s), adapter::affine(b));
+    (sized, r.map(adapter::from_jacobian))
+}
+
+/// `msm_sized`, `msm_g1` and `msm_g1_sized` agree on unregistered,
+/// registered, dropped and malformed calls.
 #[test]
 fn unregistered_bases_decline_by_default() {
     let _g = setup(None, true);
     if defaults_overridden() {
         return;
     }
-    assert_eq!(midnight_metal::thresholds().msm_one_shot, None);
-    let n = 1usize << 16;
+    assert_eq!(metal::thresholds().msm_one_shot, None);
+    let n = 1usize << 15;
     let bases = &points_cache()[..n];
     let s = random_scalars(n, 516);
+    let want = msm_pippenger(&s, bases);
 
     assert!(!sized(bases));
     declines_unregistered("unregistered", &s, bases);
-    assert!(hook_or_stock(&s, bases) == msm_pippenger(&s, bases));
+    assert!(hook_or_stock(&s, bases) == want);
+    assert_eq!(sized_call(&s, bases), (false, None));
+    assert_eq!(metal::declines(), vec![UNREGISTERED]);
 
-    let h = midnight_metal::register_srs(adapter::affine(bases));
+    let h = metal::register_srs(adapter::affine(bases));
     assert!(sized(bases));
-    let checks = midnight_metal::one_shot_g1_checks();
-    let (c0, o0, _) = midnight_metal::msm_counts();
+    let checks = metal::one_shot_g1_checks();
+    let (c0, o0, _) = metal::msm_counts();
     check("registered", &s, bases);
-    let (c1, o1, _) = midnight_metal::msm_counts();
+    let (c1, o1, _) = metal::msm_counts();
     assert_eq!((c1 - c0, o1 - o0), (1, 0), "from the table");
-    assert_eq!(midnight_metal::one_shot_g1_checks(), checks);
+    assert_eq!(metal::one_shot_g1_checks(), checks);
+    assert_eq!(sized_call(&s, bases), (true, Some(want)));
+    assert_eq!(metal::stats().msm.served, 1);
     drop(h);
 
     assert!(!sized(bases));
     declines_unregistered("dropped", &s, bases);
+    assert_eq!(sized_call(&s[..n - 1], bases), (false, None));
+    assert_eq!(metal::declines(), vec![("msm", "shape", 1)]);
 }
 
 #[test]
@@ -742,27 +621,25 @@ fn infinity_bases_and_malformed_calls() {
         .into_iter()
         .map(|x| if x == Fq::ZERO { Fq::ONE } else { x })
         .collect();
-    let (_, o0, _) = midnight_metal::msm_counts();
+    let (_, o0, _) = metal::msm_counts();
     check("infinity bases, one-shot", &s, &bases);
-    assert_eq!(midnight_metal::msm_counts().1, o0 + 1);
-    let h = midnight_metal::register_srs(adapter::affine(&bases));
-    let (c0, _, _) = midnight_metal::msm_counts();
+    assert_eq!(metal::msm_counts().1, o0 + 1);
+    let h = metal::register_srs(adapter::affine(&bases));
+    let (c0, _, _) = metal::msm_counts();
     check("infinity bases, table", &s, &bases);
-    assert_eq!(midnight_metal::msm_counts().0, c0 + 1);
+    assert_eq!(metal::msm_counts().0, c0 + 1);
 
-    for (sl, bl) in [(n - 1, n), (n, n - 1)] {
-        midnight_metal::reset_stats();
-        assert!(
-            midnight_metal::msm_g1(adapter::scalars(&s[..sl]), adapter::affine(&bases[..bl]))
-                .is_none()
-        );
-        assert_eq!(midnight_metal::declines(), vec![("msm", "shape", 1)]);
-    }
     let mut unreduced = adapter::scalars(&s).to_vec();
-    unreduced[7] = midnight_metal::field::FR_MODULUS;
-    midnight_metal::reset_stats();
-    assert!(midnight_metal::msm_g1(&unreduced, adapter::affine(&bases)).is_none());
-    assert_eq!(midnight_metal::declines(), vec![("msm", "unreduced", 1)]);
+    unreduced[7] = metal::field::FR_MODULUS;
+    for (reason, sc, bl) in [
+        ("shape", &adapter::scalars(&s)[..n - 1], n),
+        ("shape", adapter::scalars(&s), n - 1),
+        ("unreduced", &unreduced[..], n),
+    ] {
+        metal::reset_stats();
+        assert!(metal::msm_g1(sc, adapter::affine(&bases[..bl])).is_none());
+        assert_eq!(metal::declines(), vec![("msm", reason, 1)]);
+    }
     drop(h);
 }
 
@@ -773,16 +650,16 @@ fn registered_table_prefixes() {
     let _g = setup(Some(14), true);
     let n = (1usize << 17) + 5;
     let bases = &points_cache()[..n];
-    let handle = midnight_metal::register_srs(adapter::affine(bases));
+    let handle = metal::register_srs(adapter::affine(bases));
     assert_eq!(handle.len(), n);
     assert_eq!(handle.device_bytes(), 0, "a registration is host memory");
     assert!(handle.verify(adapter::affine(bases)));
-    let (c0, o0, u0) = midnight_metal::msm_counts();
+    let (c0, o0, u0) = metal::msm_counts();
 
     let m = 1usize << 14;
     let st = stages(&random_scalars(m, 5), &bases[..m]);
     assert!(st.table && st.passes == 2, "{st:?}");
-    assert_eq!(midnight_metal::msm_counts(), (c0 + 1, o0, u0 + 1));
+    assert_eq!(metal::msm_counts(), (c0 + 1, o0, u0 + 1));
     assert_eq!(handle.device_bytes(), (n * 96) as u64);
     let st = stages(&random_scalars(m, 6), &bases[..m]);
     assert!(st.table && st.passes == 1, "{st:?}");
@@ -793,8 +670,7 @@ fn registered_table_prefixes() {
         assert!(st.table && st.device_points < len as u64, "{len}: {st:?}");
         check("table prefix, split", &s, &bases[..len]);
     }
-    assert_eq!(midnight_metal::msm_counts(), (c0 + 6, o0, u0 + 1));
-    drop(handle);
+    assert_eq!(metal::msm_counts(), (c0 + 6, o0, u0 + 1));
 }
 
 /// A table changed at one point a sampled check would not read is dropped:
@@ -807,140 +683,89 @@ fn stale_table_declines_by_default_and_one_shot_when_explicit() {
         return;
     }
     let n = 1usize << 15;
-    let fresh = random_points(3, 4711);
+    let fresh = random_points(4, 4711);
     let s = random_scalars(n, 4712);
-    let i = 3 * n / 7 + 5;
+    let (i, j) = (3 * n / 7 + 5, 2 * (1 << 14) / 7 + 3);
+    let registered = || {
+        let bases = points_cache()[..n].to_vec();
+        let h = metal::register_srs(adapter::affine(&bases));
+        (bases, h)
+    };
 
-    let mut bases = points_cache()[..n].to_vec();
-    let h = midnight_metal::register_srs(adapter::affine(&bases));
+    let (mut bases, h) = registered();
     check("table", &s, &bases);
     bases[i] = fresh[0];
-    let stale = midnight_metal::srs_stale();
+    let stale = metal::srs_stale();
     assert!(!sized(&bases));
-    assert_eq!(midnight_metal::srs_stale(), stale + 1);
+    assert_eq!(metal::srs_stale(), stale + 1);
     declines_unregistered("stale, msm_sized first", &s, &bases);
     assert!(hook_or_stock(&s, &bases) == msm_pippenger(&s, &bases));
-    assert_eq!(midnight_metal::srs_stale(), stale + 1);
+    assert_eq!(metal::srs_stale(), stale + 1);
     drop(h);
 
-    let mut bases = points_cache()[..n].to_vec();
-    let h = midnight_metal::register_srs(adapter::affine(&bases));
+    let (mut bases, h) = registered();
     bases[i] = fresh[1];
-    let stale = midnight_metal::srs_stale();
+    let stale = metal::srs_stale();
     declines_unregistered("stale", &s, &bases);
-    assert_eq!(midnight_metal::srs_stale(), stale + 1);
+    assert_eq!(metal::srs_stale(), stale + 1);
     assert!(!sized(&bases));
     drop(h);
 
-    assert!(midnight_metal::set_min_k(14));
-    let mut bases = points_cache()[..n].to_vec();
-    let h = midnight_metal::register_srs(adapter::affine(&bases));
+    let (mut bases, h) = registered();
+    bases[i] = fresh[3];
+    let stale = metal::srs_stale();
+    assert_eq!(sized_call(&s, &bases), (false, None));
+    assert_eq!(metal::srs_stale(), stale + 1);
+    assert_eq!(metal::declines(), vec![UNREGISTERED]);
+    assert!(!sized(&bases));
+    drop(h);
+
+    assert!(metal::set_min_k(14));
+    let (mut bases, h) = registered();
     bases[i] = fresh[0];
     assert!(!h.verify(adapter::affine(&bases)));
-    let stale = midnight_metal::srs_stale();
+    let stale = metal::srs_stale();
     assert!(sized(&bases));
-    assert_eq!(midnight_metal::srs_stale(), stale + 1);
-    let checks = midnight_metal::one_shot_g1_checks();
-    let (c0, o0, u0) = midnight_metal::msm_counts();
+    assert_eq!(metal::srs_stale(), stale + 1);
+    let checks = metal::one_shot_g1_checks();
+    let (c0, o0, u0) = metal::msm_counts();
     check("stale, explicit threshold", &s, &bases);
-    assert_eq!(midnight_metal::msm_counts(), (c0, o0 + 1, u0));
-    assert_eq!(midnight_metal::one_shot_g1_checks(), checks + 1);
+    assert_eq!(metal::msm_counts(), (c0, o0 + 1, u0));
+    assert_eq!(metal::one_shot_g1_checks(), checks + 1);
     drop(h);
 
-    let mut bases = points_cache()[..n].to_vec();
-    let h = midnight_metal::register_srs(adapter::affine(&bases));
-    let m = 1usize << 14;
-    let s = random_scalars(m, 62);
+    let (mut bases, h) = registered();
+    let s = random_scalars(1 << 14, 62);
+    let m = s.len();
     check("prefix", &s, &bases[..m]);
-    let j = 2 * m / 7 + 3;
     bases[j] = fresh[2];
-    let stale = midnight_metal::srs_stale();
-    let (c0, o0, u0) = midnight_metal::msm_counts();
+    let stale = metal::srs_stale();
+    let (c0, o0, u0) = metal::msm_counts();
     check("prefix, one point changed", &s, &bases[..m]);
-    assert_eq!(midnight_metal::srs_stale(), stale + 1);
-    assert_eq!(midnight_metal::msm_counts(), (c0, o0 + 1, u0));
+    assert_eq!(metal::srs_stale(), stale + 1);
+    assert_eq!(metal::msm_counts(), (c0, o0 + 1, u0));
     drop(h);
-}
-
-#[test]
-fn msm_g1_sized_reports_both_entries() {
-    let _g = setup(None, true);
-    if defaults_overridden() {
-        return;
-    }
-    let n = 1usize << 15;
-    let s = random_scalars(n, 4721);
-    let call = |s: &[Fq], b: &[G1Affine]| {
-        midnight_metal::reset_stats();
-        midnight_metal::msm_g1_sized(adapter::scalars(s), adapter::affine(b))
-    };
-    let mut bases = points_cache()[..n].to_vec();
-
-    let (sized_call, r) = call(&s, &bases);
-    assert!(!sized_call && !sized(&bases) && r.is_none());
-    assert_eq!(midnight_metal::declines(), vec![("msm", UNREGISTERED, 1)]);
-
-    let h = midnight_metal::register_srs(adapter::affine(&bases));
-    let (sized_call, r) = call(&s, &bases);
-    assert!(sized_call && sized(&bases));
-    assert!(r.map(adapter::from_jacobian) == Some(msm_pippenger(&s, &bases)));
-    assert_eq!(midnight_metal::stats().msm.served, 1);
-
-    bases[3 * n / 7 + 5] = random_points(1, 4722)[0];
-    let stale = midnight_metal::srs_stale();
-    let (sized_call, r) = call(&s, &bases);
-    assert!(!sized_call && r.is_none());
-    assert_eq!(midnight_metal::srs_stale(), stale + 1);
-    assert_eq!(midnight_metal::declines(), vec![("msm", UNREGISTERED, 1)]);
-    assert!(!sized(&bases));
-    drop(h);
-
-    let (sized_call, r) = call(&s[..n - 1], &bases);
-    assert!(!sized_call && r.is_none());
-    assert_eq!(midnight_metal::declines(), vec![("msm", "shape", 1)]);
 }
 
 /// A point on the curve outside the prime-order subgroup.
-fn non_subgroup_point() -> G1AffineLimbs {
-    use blst::{
-        blst_fp_add, blst_fp_from_uint64, blst_fp_sqrt, blst_p1_affine_in_g1,
-        blst_p1_affine_on_curve,
-    };
-    let fp_of = |v: u64| {
-        let mut r = blst_fp::default();
-        // SAFETY: six limbs.
-        unsafe { blst_fp_from_uint64(&mut r, [v, 0, 0, 0, 0, 0].as_ptr()) };
-        r
-    };
-    let four = fp_of(4);
-    for v in 1u64.. {
-        let x = fp_of(v);
-        let mut rhs = blst_fp::default();
-        let x3 = fmul(&fsqr(&x), &x);
-        // SAFETY: valid field elements.
-        unsafe { blst_fp_add(&mut rhs, &x3, &four) };
-        let mut y = blst_fp::default();
-        // SAFETY: as above.
-        if !unsafe { blst_fp_sqrt(&mut y, &rhs) } {
-            continue;
-        }
-        let p = blst_p1_affine { x, y };
-        // SAFETY: a valid affine point.
-        let (on, in_g1) = unsafe { (blst_p1_affine_on_curve(&p), blst_p1_affine_in_g1(&p)) };
-        assert!(on);
-        if !in_g1 {
-            let mut l = [0u64; 12];
-            l[..6].copy_from_slice(&p.x.l);
-            l[6..].copy_from_slice(&p.y.l);
-            return l;
+fn non_subgroup_point() -> G1Affine {
+    for x in 1u8.. {
+        let mut compressed = [0u8; 48];
+        compressed[0] = 0x80;
+        compressed[47] = x;
+        let mut p = blst_p1_affine::default();
+        // SAFETY: 48 readable bytes; `p` is a valid affine point after a
+        // successful decoding, which checks the curve but not the subgroup.
+        let found = unsafe {
+            blst_p1_uncompress(&mut p, compressed.as_ptr()) == BLST_ERROR::BLST_SUCCESS
+                && !blst_p1_affine_in_g1(&p)
+        };
+        if found {
+            // SAFETY: `G1Affine` is a transparent `blst_p1_affine`.
+            return unsafe { std::mem::transmute::<blst_p1_affine, G1Affine>(p) };
         }
     }
     unreachable!()
-}
-
-fn affine_of(l: G1AffineLimbs) -> G1Affine {
-    // SAFETY: `G1Affine` is a transparent `blst_p1_affine` (`[u64; 12]`).
-    unsafe { std::mem::transmute::<G1AffineLimbs, G1Affine>(l) }
 }
 
 #[test]
@@ -948,29 +773,29 @@ fn bases_outside_g1_decline() {
     let _g = setup(Some(14), true);
     let n = 1usize << 14;
     let k = n / 3;
-    let bad = non_subgroup_point();
     let mut off = adapter::affine(&points_cache()[..1])[0];
     off[6] ^= 1;
-    for (what, p) in [("not in the subgroup", bad), ("off the curve", off)] {
+    // SAFETY: `G1Affine` is a transparent `blst_p1_affine` (`[u64; 12]`).
+    let off = unsafe { std::mem::transmute::<G1AffineLimbs, G1Affine>(off) };
+    for (what, p) in [
+        ("not in the subgroup", non_subgroup_point()),
+        ("off the curve", off),
+    ] {
         let mut bases = points_cache()[..n].to_vec();
-        bases[k] = affine_of(p);
-        for (name, sc) in [("r-1", -Fq::ONE), ("> r/2", -Fq::from(12345))] {
+        bases[k] = p;
+        for sc in [-Fq::ONE, -Fq::from(12345)] {
             let mut s = random_scalars(n, 71);
             s[k] = sc;
             for registered in [false, true] {
-                let h = registered.then(|| midnight_metal::register_srs(adapter::affine(&bases)));
-                midnight_metal::reset_stats();
-                let counts = midnight_metal::msm_counts();
-                let got = midnight_metal::msm_g1(adapter::scalars(&s), adapter::affine(&bases));
-                let case = format!("{what}, {name}, registered {registered}");
-                assert!(got.is_none(), "{case}");
-                assert_eq!(
-                    midnight_metal::declines(),
-                    vec![("msm", "bases-not-in-subgroup", 1)],
-                    "{case}"
-                );
-                assert_eq!(midnight_metal::stats().msm.served, 0, "{case}");
-                assert_eq!(midnight_metal::msm_counts(), counts, "{case}");
+                let h = registered.then(|| metal::register_srs(adapter::affine(&bases)));
+                metal::reset_stats();
+                let counts = metal::msm_counts();
+                let case = format!("{what}, {sc:?}, registered {registered}");
+                assert!(msm(&s, &bases).is_none(), "{case}");
+                let want = vec![("msm", "bases-not-in-subgroup", 1)];
+                assert_eq!(metal::declines(), want, "{case}");
+                assert_eq!(metal::stats().msm.served, 0, "{case}");
+                assert_eq!(metal::msm_counts(), counts, "{case}");
                 drop(h);
             }
             // the fallback runs on this input (a debug build of
@@ -979,12 +804,15 @@ fn bases_outside_g1_decline() {
                 let _ = msm_pippenger(&s, &bases);
             }
         }
-        assert!(midnight_metal::set_min_k(0));
-        let h = midnight_metal::register_srs(adapter::affine(&bases));
-        let s = random_scalars(k, 73);
-        check("prefix before the bad point", &s, &bases[..k]);
+        assert!(metal::set_min_k(0));
+        let h = metal::register_srs(adapter::affine(&bases));
+        check(
+            "prefix before the bad point",
+            &random_scalars(k, 73),
+            &bases[..k],
+        );
         drop(h);
-        assert!(midnight_metal::set_min_k(14));
+        assert!(metal::set_min_k(14));
     }
 }
 
@@ -998,39 +826,31 @@ fn hook_commitment_matches_stock() {
     const K: u32 = 14;
     let mut rng = ChaCha8Rng::seed_from_u64(12);
     let params = ParamsKZG::<Bls12>::unsafe_setup(K, &mut rng);
-    let h = midnight_metal::register_srs(adapter::affine(params.bases::<Coeff>()));
+    let h = metal::register_srs(adapter::affine(params.bases::<Coeff>()));
     let domain = EvaluationDomain::<Fq>::new(1, K);
-    assert!(install(GpuHooks {
-        msm_g1: Some(midnight_metal::msm_g1),
-        ..Default::default()
-    }));
-    let label = || PolynomialLabel::Custom("p".into());
+    common::install_hooks(metal::quotient);
+    let commit = |poly: &Polynomial<Fq, Coeff>| {
+        KZGCommitmentScheme::<Bls12>::commit(&params, poly, PolynomialLabel::Custom("p".into()))
+    };
     for (nz, device) in [(5usize, false), (1usize << K, true)] {
         let mut poly = domain.empty_coeff();
         let step = poly.len() / nz;
         for i in 0..nz {
             poly[i * step] = Fq::random(&mut rng);
         }
-        midnight_metal::reset_stats();
-        let got = KZGCommitmentScheme::<Bls12>::commit(&params, &poly, label());
-        let served = midnight_metal::stats().msm.served;
-        let declines = midnight_metal::declines();
+        metal::reset_stats();
+        let got = commit(&poly);
+        let served = metal::stats().msm.served;
+        let declines = metal::declines();
         if device {
             assert_eq!(served, 1, "{declines:?}");
         } else {
             assert_eq!(served, 0);
             assert_eq!(declines, vec![("msm", "below-min-k", 1)]);
         }
-        let want = without_hooks(|| KZGCommitmentScheme::<Bls12>::commit(&params, &poly, label()));
-        assert_eq!(
-            midnight_metal::stats().msm.served,
-            served,
-            "a suspended hook served"
-        );
-        assert!(
-            got == want,
-            "{nz} non-zero: the commitment differs from the stock one"
-        );
+        let want = without_hooks(|| commit(&poly));
+        assert_eq!(metal::stats().msm.served, served, "a suspended hook served");
+        assert!(got == want, "{nz} non-zero");
     }
     drop(h);
 }
