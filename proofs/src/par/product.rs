@@ -62,23 +62,21 @@ mod tests {
     use rand_core::SeedableRng;
 
     use super::*;
-    use crate::par::testing::{in_pool, stock_prefix_product};
+    use crate::par::testing::{assert_on_pools, random_values, stock_prefix_product};
 
     /// Factors with zeros and ones, and nonzero factors only.
     #[test]
     fn prefix_product_matches_stock() {
         let mut rng = ChaCha20Rng::seed_from_u64(0x2a);
-        for n in [1usize, 2, BLOCK, 3 * BLOCK + 7] {
-            let mut m: Vec<Fq> = (0..n).map(|_| Fq::random(&mut rng)).collect();
+        for n in [1, 2, BLOCK, 3 * BLOCK + 7] {
+            let mut m = random_values(&mut rng, n);
             for i in (0..n).step_by(997) {
                 m[i] = if i % 2 == 0 { Fq::ZERO } else { Fq::ONE };
             }
-            for case in [m.clone(), m.iter().map(|x| *x + Fq::ONE).collect()] {
-                let stock = stock_prefix_product(&case, n);
-                for threads in [1, 4] {
-                    let par = in_pool(threads, || prefix_product_from_one(&case, n));
-                    assert_eq!(par, stock, "n {n} threads {threads}");
-                }
+            for m in [m.clone(), m.iter().map(|x| *x + Fq::ONE).collect()] {
+                assert_on_pools(&stock_prefix_product(&m, n), || {
+                    prefix_product_from_one(&m, n)
+                });
             }
         }
     }

@@ -14,7 +14,11 @@
 //! Copies of the stock routines whose call sites dispatch to this module, as
 //! references for its tests.
 
+use std::fmt::Debug;
+
 use ff::{BatchInvert, Field};
+use midnight_curves::Fq;
+use rand_chacha::ChaCha20Rng;
 
 use crate::{
     poly::{Coeff, LagrangeCoeff, Polynomial},
@@ -24,6 +28,24 @@ use crate::{
 /// Runs `f` in a new pool of `threads` threads.
 pub(crate) fn in_pool<R: Send>(threads: usize, f: impl FnOnce() -> R + Send) -> R {
     rayon::ThreadPoolBuilder::new().num_threads(threads).build().unwrap().install(f)
+}
+
+/// Asserts that `f` returns `expected` in pools of one and four threads.
+pub(crate) fn assert_on_pools<R: PartialEq + Debug + Send>(expected: &R, f: impl Fn() -> R + Sync) {
+    for threads in [1, 4] {
+        assert_eq!(&in_pool(threads, &f), expected, "{threads} threads");
+    }
+}
+
+pub(crate) fn random_values(rng: &mut ChaCha20Rng, n: usize) -> Vec<Fq> {
+    (0..n).map(|_| Fq::random(&mut *rng)).collect()
+}
+
+pub(crate) fn poly<T, B>(values: Vec<T>) -> Polynomial<T, B> {
+    Polynomial {
+        values,
+        _marker: std::marker::PhantomData,
+    }
 }
 
 /// The stock `crate::poly::batch_invert_rational`.

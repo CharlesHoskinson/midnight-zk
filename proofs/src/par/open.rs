@@ -272,8 +272,6 @@ pub(crate) fn kate_division<F: Field>(a: &[F], b: F) -> Vec<F> {
 
 #[cfg(test)]
 mod tests {
-    use std::marker::PhantomData;
-
     use ff::{Field, PrimeField, WithSmallOrderMulGroup};
     use midnight_curves::Fq;
     use rand_chacha::ChaCha20Rng;
@@ -281,34 +279,23 @@ mod tests {
 
     use super::*;
     use crate::{
-        par::testing::{in_pool, stock_poly_inner_product},
+        par::testing::{assert_on_pools, poly, random_values, stock_poly_inner_product},
         utils::arithmetic::{divide_by_roots_seq, eval_polynomial, kate_division as stock_kate},
     };
-
-    fn random_poly(rng: &mut ChaCha20Rng, n: usize) -> Vec<Fq> {
-        (0..n).map(|_| Fq::random(&mut *rng)).collect()
-    }
 
     #[test]
     fn eval_many_matches_eval_polynomial() {
         let mut rng = ChaCha20Rng::seed_from_u64(0x3a);
         // every remainder of the interleaved chains, and across a task boundary
-        let lens = (0..2 * CHAINS).chain([EVAL_CHUNK + 1]);
-        let polys: Vec<Vec<Fq>> = lens.map(|n| random_poly(&mut rng, n)).collect();
-        let mut jobs = Vec::new();
-        for p in &polys {
-            for x in [Fq::ZERO, Fq::random(&mut rng)] {
-                jobs.push((p.as_slice(), x));
-            }
-        }
+        let polys: Vec<Vec<Fq>> = (0..2 * CHAINS)
+            .chain([EVAL_CHUNK + 1])
+            .map(|n| random_values(&mut rng, n))
+            .collect();
+        let points = [Fq::ZERO, Fq::random(&mut rng)];
+        let jobs: Vec<(&[Fq], Fq)> =
+            polys.iter().flat_map(|p| points.map(|x| (p.as_slice(), x))).collect();
         let stock: Vec<Fq> = jobs.iter().map(|(p, x)| eval_polynomial(p, *x)).collect();
-        for threads in [1, 8] {
-            assert_eq!(
-                in_pool(threads, || eval_many(&jobs)),
-                stock,
-                "threads {threads}"
-            );
-        }
+        assert_on_pools(&stock, || eval_many(&jobs));
         assert!(eval_many::<Fq>(&[]).is_empty());
     }
 
@@ -321,22 +308,14 @@ mod tests {
             vec![3, 1],
             vec![SUM_CHUNK + 3, 7, 2 * SUM_CHUNK, 0, 40_000],
         ] {
-            let polys: Vec<Polynomial<Fq, Coeff>> = lens
-                .iter()
-                .map(|&n| Polynomial {
-                    values: random_poly(&mut rng, n),
-                    _marker: PhantomData,
-                })
+            let polys: Vec<Polynomial<Fq, Coeff>> =
+                lens.iter().map(|&n| poly(random_values(&mut rng, n))).collect();
+            let refs: Vec<_> = polys.iter().collect();
+            let scalars: Vec<Fq> = crate::utils::arithmetic::powers(Fq::random(&mut rng))
+                .take(lens.len() + 2)
                 .collect();
-            let refs: Vec<&Polynomial<Fq, Coeff>> = polys.iter().collect();
-            let x = Fq::random(&mut rng);
-            let scalars: Vec<Fq> =
-                crate::utils::arithmetic::powers(x).take(lens.len() + 2).collect();
             let stock = stock_poly_inner_product(&refs, scalars.clone());
-            for threads in [1, 4] {
-                let par = in_pool(threads, || poly_inner_product(&refs, scalars.clone()));
-                assert_eq!(par.values, stock);
-            }
+            assert_on_pools(&stock, || poly_inner_product(&refs, scalars.clone()).values);
         }
     }
 
@@ -345,18 +324,17 @@ mod tests {
     fn divide_by_roots_matches_stock() {
         let mut rng = ChaCha20Rng::seed_from_u64(0x3c);
         let x = Fq::random(&mut rng);
-        let zeta = Fq::ZETA;
-        let root_sets: Vec<Vec<Fq>> = vec![
+        let root_sets = [
             vec![],
             vec![x],
             vec![Fq::ZERO],
             vec![x, x],
-            random_poly(&mut rng, 4),
+            random_values(&mut rng, 4),
             // X^3 - x^3: zero terms are skipped
-            vec![x, zeta * x, zeta * zeta * x],
+            vec![x, Fq::ZETA * x, Fq::ZETA.square() * x],
         ];
         let lens = [
-            0usize,
+            0,
             3,
             5,
             DIV_BLOCK + 2,
@@ -365,43 +343,31 @@ mod tests {
             DIVISION_MIN_LEN,
         ];
         for roots in &root_sets {
-            for &n in &lens {
-                let poly = random_poly(&mut rng, n);
-                let stock = divide_by_roots_seq(&poly, roots);
-                for threads in [1, 4] {
-                    let par = in_pool(threads, || divide_by_roots(&poly, roots));
-                    assert_eq!(par, stock, "roots {} n {n} threads {threads}", roots.len());
-                }
-                assert_eq!(
-                    crate::utils::arithmetic::divide_by_roots(&poly, roots),
-                    stock
-                );
+            for n in lens {
+                let a = random_values(&mut rng, n);
+                let stock = divide_by_roots_seq(&a, roots);
+                assert_on_pools(&stock, || divide_by_roots(&a, roots));
+                assert_eq!(crate::utils::arithmetic::divide_by_roots(&a, roots), stock);
             }
         }
     }
 
-    /// Lags past a block fall back to the stock division. The product
-    /// `(X^(2^13) - x^(2^13)) (X - y)` has its lowest term at lag
+    /// Lags past a block fall back to the stock division: the product
+    /// `(X^DIV_BLOCK - x^DIV_BLOCK) (X - y)` has its lowest term at lag
     /// `DIV_BLOCK + 1`.
     #[test]
     fn divide_by_roots_more_roots_than_a_block() {
         let mut rng = ChaCha20Rng::seed_from_u64(0x3f);
-        let x = Fq::random(&mut rng);
-        let y = Fq::random(&mut rng);
-        let omega = Fq::ROOT_OF_UNITY.pow_vartime([1u64 << (Fq::S - 13)]);
-        assert_eq!(DIV_BLOCK, 1 << 13);
+        let omega = Fq::ROOT_OF_UNITY.pow_vartime([1u64 << (Fq::S - DIV_BLOCK.ilog2())]);
         let mut roots: Vec<Fq> =
-            std::iter::successors(Some(x), |r| Some(*r * omega)).take(DIV_BLOCK).collect();
-        roots.push(y);
-        let n = DIVISION_MIN_LEN + 3;
-        let poly = random_poly(&mut rng, n);
-        let stock = divide_by_roots_seq(&poly, &roots);
-        assert_eq!(stock.len(), n - roots.len());
-        assert_eq!(in_pool(4, || divide_by_roots(&poly, &roots)), stock);
-        assert_eq!(
-            crate::utils::arithmetic::divide_by_roots(&poly, &roots),
-            stock
-        );
+            std::iter::successors(Some(Fq::random(&mut rng)), |r| Some(*r * omega))
+                .take(DIV_BLOCK)
+                .collect();
+        roots.push(Fq::random(&mut rng));
+        let a = random_values(&mut rng, DIVISION_MIN_LEN + 3);
+        let stock = divide_by_roots_seq(&a, &roots);
+        assert_on_pools(&stock, || divide_by_roots(&a, &roots));
+        assert_eq!(crate::utils::arithmetic::divide_by_roots(&a, &roots), stock);
     }
 
     /// Against the stock quotient of the dividend minus a constant, as the
@@ -409,15 +375,12 @@ mod tests {
     #[test]
     fn kate_division_matches_stock() {
         let mut rng = ChaCha20Rng::seed_from_u64(0x3d);
-        for n in [1usize, 2, DIVISION_MIN_LEN - 1, DIVISION_MIN_LEN] {
-            let a = random_poly(&mut rng, n);
+        for n in [1, 2, DIVISION_MIN_LEN - 1, DIVISION_MIN_LEN] {
+            let a = random_values(&mut rng, n);
             for b in [Fq::ZERO, Fq::random(&mut rng)] {
                 let mut shifted = a.clone();
                 shifted[0] -= Fq::random(&mut rng);
-                let stock = stock_kate(&shifted, b);
-                for threads in [1, 4] {
-                    assert_eq!(in_pool(threads, || kate_division(&a, b)), stock, "n {n}");
-                }
+                assert_on_pools(&stock_kate(&shifted, b), || kate_division(&a, b));
             }
         }
     }

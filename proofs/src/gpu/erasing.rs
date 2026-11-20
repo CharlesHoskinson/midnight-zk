@@ -515,47 +515,28 @@ impl<F> Drop for ErasingVec<F> {
 mod tests {
     use super::zero_bytes;
 
-    /// At every alignment, below and above the parallel size.
+    /// At every alignment, below and above the parallel size, and when no
+    /// thread can be spawned (the calling thread zeroes every part).
     #[test]
     fn zero_bytes_zeroes_exactly_the_range() {
-        let sizes = [
-            0usize,
-            1,
-            9,
-            63,
-            super::PAR_ZERO_BYTES - 1,
-            super::PAR_ZERO_BYTES,
-            3 * super::ZERO_TASK_BYTES + super::PAR_ZERO_BYTES + 5,
-        ];
-        for &bytes in &sizes {
-            for offset in 0..9usize {
+        use super::{NO_SPAWN, PAR_ZERO_BYTES as PAR, ZERO_TASK_BYTES as TASK};
+
+        let cases = [0, 1, 9, 63, PAR - 1, PAR, 3 * TASK + PAR + 5]
+            .map(|bytes| (bytes, false))
+            .into_iter()
+            .chain([(9 * PAR + TASK + 7, true)]);
+        for (bytes, no_spawn) in cases {
+            for offset in 0..9 {
                 let mut buf: Vec<u8> = (0..bytes + 32).map(|i| (i % 251) as u8 | 1).collect();
-                let before = buf.clone();
+                let mut expected = buf.clone();
+                expected[offset..offset + bytes].fill(0);
+                NO_SPAWN.with(|n| n.set(no_spawn));
                 // SAFETY: `offset + bytes <= buf.len()`.
                 unsafe { zero_bytes(buf.as_mut_ptr().add(offset), bytes) };
-                for (i, (b, old)) in buf.iter().zip(&before).enumerate() {
-                    if (offset..offset + bytes).contains(&i) {
-                        assert_eq!(*b, 0, "bytes {bytes} offset {offset} at {i}");
-                    } else {
-                        assert_eq!(b, old, "bytes {bytes} offset {offset} at {i}");
-                    }
-                }
+                NO_SPAWN.with(|n| n.set(false));
+                assert!(buf == expected, "bytes {bytes} offset {offset}");
             }
         }
-    }
-
-    /// When no thread can be spawned, the calling thread zeroes every part.
-    #[test]
-    fn zero_bytes_without_threads() {
-        let bytes = 9 * super::PAR_ZERO_BYTES + super::ZERO_TASK_BYTES + 7;
-        let mut buf = vec![0xffu8; bytes + 2];
-        super::NO_SPAWN.with(|n| n.set(true));
-        // SAFETY: `1 + bytes <= buf.len()`.
-        unsafe { zero_bytes(buf.as_mut_ptr().add(1), bytes) };
-        super::NO_SPAWN.with(|n| n.set(false));
-        assert_eq!(buf[0], 0xff);
-        assert_eq!(buf[bytes + 1], 0xff);
-        assert!(buf[1..=bytes].iter().all(|b| *b == 0));
     }
 
     /// The only worker of a pool, holding a lock that a queued pool task

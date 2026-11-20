@@ -1171,6 +1171,8 @@ mod tests {
     #[cfg(feature = "prover-par")]
     #[test]
     fn checking_layout_mismatch_is_not_a_panic() {
+        use crate::circuit::layouter::MeasuredLayout;
+
         let circuit = TwoRegionCircuit;
         let mut cs = crate::plonk::ConstraintSystem::<Fq>::default();
         let config = TwoRegionCircuit::configure(&mut cs);
@@ -1181,9 +1183,7 @@ mod tests {
             &circuit,
             config,
             constants.clone(),
-        )
-        .unwrap()
-        .unwrap();
+        );
         let layout = SimpleFloorPlanner::synthesize_measuring_layout(
             &mut NullCs,
             &circuit,
@@ -1191,41 +1191,37 @@ mod tests {
             constants.clone(),
         )
         .unwrap()
-        .expect("the simple planner measures");
-        assert_eq!(layout.starts(), starts);
-        assert_eq!(layout.regions[0].row_count, 2);
-        assert_eq!(layout.regions[1].row_count, 1);
+        .unwrap();
+        assert_eq!(Some(layout.starts()), starts.unwrap());
+        assert_eq!(
+            layout.regions.iter().map(|r| r.row_count).collect::<Vec<_>>(),
+            [2, 1]
+        );
 
-        let check = |layout: &crate::circuit::layouter::MeasuredLayout| {
+        let check = |alter: fn(&mut MeasuredLayout)| {
+            let mut altered = layout.clone();
+            alter(&mut altered);
             SimpleFloorPlanner::synthesize_checking_layout(
                 &mut NullCs,
                 &circuit,
                 config,
                 constants.clone(),
-                layout,
+                &altered,
             )
         };
-        assert!(check(&layout));
-
-        let mut fewer = layout.clone();
-        fewer.regions.truncate(1);
-        assert!(!check(&fewer));
-        let mut more = layout.clone();
-        more.regions.push(more.regions[1].clone());
-        assert!(!check(&more));
-        let mut rows = layout.clone();
-        rows.regions[0].row_count = 3;
-        assert!(!check(&rows));
-        let mut columns = layout.clone();
-        columns.regions[1].columns = columns.regions[0].columns;
-        assert!(!check(&columns));
-        let mut start = layout.clone();
-        start.regions[1].start = 5.into();
-        assert!(!check(&start));
-        assert!(!check(&Default::default()));
-        let mut constants_count = layout;
-        constants_count.regions[0].constants = 1;
-        assert!(!check(&constants_count));
+        assert!(check(|_| {}));
+        let alterations: [fn(&mut MeasuredLayout); 7] = [
+            |l| l.regions.truncate(1),
+            |l| l.regions.push(l.regions[1].clone()),
+            |l| l.regions[0].row_count = 3,
+            |l| l.regions[1].columns = l.regions[0].columns,
+            |l| l.regions[1].start = 5.into(),
+            |l| *l = MeasuredLayout::default(),
+            |l| l.regions[0].constants = 1,
+        ];
+        for alter in alterations {
+            assert!(!check(alter));
+        }
     }
 
     /// A region whose cells differ between the shape pass and the

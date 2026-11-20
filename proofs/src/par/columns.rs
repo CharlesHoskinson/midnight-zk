@@ -131,94 +131,76 @@ pub(crate) fn copy_from_slice<T: Copy + Send + Sync>(dst: &mut [T], src: &[T]) {
 
 #[cfg(test)]
 mod tests {
-    use std::marker::PhantomData;
-
     use ff::Field;
     use midnight_curves::Fq;
     use rand_chacha::ChaCha20Rng;
     use rand_core::{RngCore, SeedableRng};
 
     use super::*;
-    use crate::{
-        par::{
-            DELTA_MIN_LEN,
-            testing::{
-                in_pool, stock_batch_invert_rational, stock_to_delta, stock_to_double_delta,
-            },
+    use crate::par::{
+        DELTA_MIN_LEN,
+        testing::{
+            assert_on_pools, in_pool, poly, random_values, stock_batch_invert_rational,
+            stock_to_delta, stock_to_double_delta,
         },
-        poly::batch_invert_rational as dispatched_batch_invert_rational,
     };
-
-    fn random_rational(rng: &mut ChaCha20Rng, mix: u32) -> Rational<Fq> {
-        match rng.next_u32() % mix {
-            0 => Rational::Zero,
-            1 => Rational::Trivial(Fq::random(&mut *rng)),
-            2 => Rational::Rational(Fq::random(&mut *rng), Fq::random(&mut *rng)),
-            3 => Rational::Rational(Fq::random(&mut *rng), Fq::ZERO),
-            4 => Rational::Rational(Fq::ZERO, Fq::random(&mut *rng)),
-            5 => Rational::Rational(Fq::random(&mut *rng), Fq::ONE),
-            _ => Rational::Trivial(Fq::ZERO),
-        }
-    }
 
     #[test]
     fn batch_invert_rational_matches_stock() {
         let mut rng = ChaCha20Rng::seed_from_u64(0x1a);
+        let values = |polys: Vec<Polynomial<Fq, LagrangeCoeff>>| -> Vec<Vec<Fq>> {
+            polys.into_iter().map(|p| p.values).collect()
+        };
         // `mix` 2: no denominators at all
         for (cols, n, mix) in [
-            (0usize, 0usize, 7u32),
+            (0, 0, 7),
             (3, 17, 7),
             (4, CHUNK + 3, 7),
             (3, 3 * CHUNK + 5, 2),
         ] {
-            let assigned: Vec<Polynomial<Rational<Fq>, LagrangeCoeff>> = (0..cols)
-                .map(|_| Polynomial {
-                    values: (0..n).map(|_| random_rational(&mut rng, mix)).collect(),
-                    _marker: PhantomData,
-                })
-                .collect();
-            let stock = stock_batch_invert_rational(assigned.clone());
-            for threads in [1, 8] {
-                let par = in_pool(threads, || batch_invert_rational(assigned.clone()));
-                assert_eq!(par.len(), stock.len());
-                for (p, s) in par.iter().zip(&stock) {
-                    assert_eq!(p.values, s.values, "cols {cols} n {n} threads {threads}");
+            let mut rational = || {
+                let kind = rng.next_u32() % mix;
+                let mut r = || Fq::random(&mut rng);
+                match kind {
+                    0 => Rational::Zero,
+                    1 => Rational::Trivial(r()),
+                    2 => Rational::Rational(r(), r()),
+                    3 => Rational::Rational(r(), Fq::ZERO),
+                    4 => Rational::Rational(Fq::ZERO, r()),
+                    5 => Rational::Rational(r(), Fq::ONE),
+                    _ => Rational::Trivial(Fq::ZERO),
                 }
-            }
-            let dispatched = dispatched_batch_invert_rational(assigned);
-            for (p, s) in dispatched.iter().zip(&stock) {
-                assert_eq!(p.values, s.values);
-            }
+            };
+            let assigned: Vec<Polynomial<_, LagrangeCoeff>> =
+                (0..cols).map(|_| poly((0..n).map(|_| rational()).collect())).collect();
+            let stock = values(stock_batch_invert_rational(assigned.clone()));
+            assert_on_pools(&stock, || values(batch_invert_rational(assigned.clone())));
+            assert_eq!(values(crate::poly::batch_invert_rational(assigned)), stock);
         }
     }
 
     #[test]
     fn parallelize_passes_every_element_once_with_its_offset() {
+        let mark = |part: &mut [(usize, u32)], start: usize| {
+            for (i, x) in part.iter_mut().enumerate() {
+                *x = (start + i, x.1 + 1);
+            }
+        };
         for threads in [1usize, 7] {
             let floor = threads * PARALLELIZE_CHUNKS_PER_THREAD * PARALLELIZE_MIN_CHUNK;
-            for n in [0usize, floor - 1, floor, 300_017] {
-                let mut v = vec![(0usize, 0u32); n];
-                let took = in_pool(threads, || {
-                    parallelize(&mut v, &|part: &mut [(usize, u32)], start: usize| {
-                        for (i, x) in part.iter_mut().enumerate() {
-                            *x = (start + i, x.1 + 1);
-                        }
-                    })
-                });
-                if took {
-                    assert!(v.iter().enumerate().all(|(i, x)| *x == (i, 1)), "n {n}");
+            for n in [0, floor - 1, floor, 300_017] {
+                let marked: Vec<_> = (0..n).map(|i| (i, 1)).collect();
+                let mut v = vec![(0, 0); n];
+                if in_pool(threads, || parallelize(&mut v, &mark)) {
+                    assert_eq!(v, marked);
                 } else {
                     assert!(v.iter().all(|x| x.1 == 0));
                 }
-                let mut w = vec![(0usize, 0u32); n];
+                let mut w = vec![(0, 0); n];
                 in_pool(threads, || {
-                    crate::utils::arithmetic::parallelize(&mut w, |part, start| {
-                        for (i, x) in part.iter_mut().enumerate() {
-                            *x = (start + i, x.1 + 1);
-                        }
-                    })
+                    crate::utils::arithmetic::parallelize(&mut w, mark)
                 });
-                assert!(w.iter().enumerate().all(|(i, x)| *x == (i, 1)), "n {n}");
+                assert_eq!(w, marked);
             }
         }
     }
@@ -226,24 +208,12 @@ mod tests {
     #[test]
     fn delta_encodings_match_stock() {
         let mut rng = ChaCha20Rng::seed_from_u64(0x1b);
-        for n in [0usize, 1, 2, 3, CHUNK + 1, DELTA_MIN_LEN - 1, DELTA_MIN_LEN] {
-            let values: Vec<Fq> = (0..n).map(|_| Fq::random(&mut rng)).collect();
-            let delta = stock_to_delta(&values);
-            let double = stock_to_double_delta(&values);
-            for threads in [1, 5] {
-                assert_eq!(in_pool(threads, || to_delta(&values)), delta, "n {n}");
-                assert_eq!(
-                    in_pool(threads, || to_double_delta(&values)),
-                    double,
-                    "n {n}"
-                );
-            }
-            let poly = Polynomial::<Fq, LagrangeCoeff> {
-                values,
-                _marker: PhantomData,
-            };
-            assert_eq!(poly.to_delta().values, delta);
-            assert_eq!(poly.to_double_delta().values, double);
+        for n in [0, 1, 2, 3, CHUNK + 1, DELTA_MIN_LEN - 1, DELTA_MIN_LEN] {
+            let values = random_values(&mut rng, n);
+            let stock = (stock_to_delta(&values), stock_to_double_delta(&values));
+            assert_on_pools(&stock, || (to_delta(&values), to_double_delta(&values)));
+            let p = poly::<_, LagrangeCoeff>(values);
+            assert_eq!((p.to_delta().values, p.to_double_delta().values), stock);
         }
     }
 }

@@ -396,21 +396,16 @@ pub(crate) mod chain {
     use rand_core::SeedableRng;
 
     use crate::{
-        circuit::{Layouter, SimpleFloorPlanner, Value},
+        circuit::{Cell, Layouter, SimpleFloorPlanner, Value},
         plonk::{
             Advice, Circuit, Column, ConstraintSystem, Constraints, Error, Expression, Fixed,
             Instance, ProvingKey, Selector, create_proof, keygen_pk, keygen_vk_with_k, prepare,
         },
-        poly::{
-            Rotation,
-            commitment::Guard,
-            kzg::{KZGCommitmentScheme, params::ParamsKZG},
-        },
+        poly::{Rotation, commitment::Guard, kzg::params::ParamsKZG},
+        test_circuit::Scheme,
         transcript::{CircuitTranscript, Transcript},
         utils::SerdeFormat,
     };
-
-    pub(crate) type Scheme = KZGCommitmentScheme<Bls12>;
 
     fn step(x: Fq) -> Fq {
         x.square() + Fq::from(3)
@@ -426,7 +421,7 @@ pub(crate) mod chain {
 
     #[derive(Clone)]
     pub(crate) struct ChainConfig {
-        pub(crate) advice: [Column<Advice>; 4],
+        advice: [Column<Advice>; 4],
         fixed: Column<Fixed>,
         public: Column<Instance>,
         active: Selector,
@@ -436,6 +431,39 @@ pub(crate) mod chain {
         pub(crate) fn instance(&self) -> [Fq; 2] {
             let start = Fq::from(self.start);
             [start, (0..4 * self.rows).fold(start, |x, _| step(x))]
+        }
+
+        /// The squarings; returns the first and the last cell.
+        fn chain_region(
+            &self,
+            config: &ChainConfig,
+            layouter: &mut impl Layouter<Fq>,
+        ) -> Result<(Cell, Cell), Error> {
+            layouter.assign_region(
+                || "chain",
+                |mut region| {
+                    let mut x = Fq::from(self.start);
+                    let mut start = None;
+                    for row in 0..self.rows {
+                        config.active.enable(&mut region, row)?;
+                        for col in config.advice {
+                            let cell =
+                                region.assign_advice(|| "x", col, row, || Value::known(x))?;
+                            if row == 0 && col == config.advice[0] {
+                                start = Some(cell.cell());
+                            }
+                            x = step(x);
+                        }
+                    }
+                    let end = region.assign_advice(
+                        || "endpoint",
+                        config.advice[0],
+                        self.rows,
+                        || Value::known(x),
+                    )?;
+                    Ok((start.unwrap(), end.cell()))
+                },
+            )
         }
     }
 
@@ -489,31 +517,7 @@ pub(crate) mod chain {
             config: ChainConfig,
             mut layouter: impl Layouter<Fq>,
         ) -> Result<(), Error> {
-            let (start, end) = layouter.assign_region(
-                || "chain",
-                |mut region| {
-                    let mut x = Fq::from(self.start);
-                    let mut start = None;
-                    for row in 0..self.rows {
-                        config.active.enable(&mut region, row)?;
-                        for col in config.advice {
-                            let cell =
-                                region.assign_advice(|| "x", col, row, || Value::known(x))?;
-                            if row == 0 && col == config.advice[0] {
-                                start = Some(cell.cell());
-                            }
-                            x = step(x);
-                        }
-                    }
-                    let end = region.assign_advice(
-                        || "endpoint",
-                        config.advice[0],
-                        self.rows,
-                        || Value::known(x),
-                    )?;
-                    Ok((start.unwrap(), end.cell()))
-                },
-            )?;
+            let (start, end) = self.chain_region(&config, &mut layouter)?;
             layouter.assign_region(
                 || "fixed",
                 |mut region| {
@@ -530,21 +534,21 @@ pub(crate) mod chain {
         }
     }
 
-    #[derive(Clone, Copy, Debug)]
+    /// The regions of a [`Reshaped`] circuit.
+    #[derive(Clone, Copy)]
     pub(crate) enum Reshape {
         /// Only the chain region.
         Fewer,
         /// One more region after those of the chain.
         More,
+        /// A region with an unknown value: the synthesis fails.
+        Failing,
     }
 
-    /// The configuration of `chain` with other regions. Its proofs with a
-    /// key of `chain` do not verify, but the prover makes them.
+    /// The configuration of a [`Chain`] with other regions; its proofs with
+    /// the chain's key do not verify.
     #[derive(Clone)]
-    pub(crate) struct Reshaped {
-        pub(crate) chain: Chain,
-        pub(crate) reshape: Reshape,
-    }
+    pub(crate) struct Reshaped(pub(crate) Chain, pub(crate) Reshape);
 
     impl Circuit<Fq> for Reshaped {
         type Config = ChainConfig;
@@ -565,70 +569,35 @@ pub(crate) mod chain {
             config: ChainConfig,
             mut layouter: impl Layouter<Fq>,
         ) -> Result<(), Error> {
-            match self.reshape {
+            let (rows, value) = match self.1 {
                 Reshape::Fewer => {
-                    let start = layouter.assign_region(
-                        || "chain only",
-                        |mut region| {
-                            let mut x = Fq::from(self.chain.start);
-                            let mut start = None;
-                            for row in 0..self.chain.rows {
-                                config.active.enable(&mut region, row)?;
-                                for col in config.advice {
-                                    let cell = region.assign_advice(
-                                        || "x",
-                                        col,
-                                        row,
-                                        || Value::known(x),
-                                    )?;
-                                    start.get_or_insert(cell.cell());
-                                    x = step(x);
-                                }
-                            }
-                            Ok(start.unwrap())
-                        },
-                    )?;
-                    layouter.constrain_instance(start, config.public, 0)
+                    let (start, _) = self.0.chain_region(&config, &mut layouter)?;
+                    return layouter.constrain_instance(start, config.public, 0);
                 }
                 Reshape::More => {
-                    self.chain.synthesize(config.clone(), layouter.namespace(|| "chain"))?;
-                    layouter.assign_region(
-                        || "extra",
-                        |mut region| {
-                            for row in 0..5 {
-                                let v = Fq::from(11 + row as u64);
-                                region.assign_advice(
-                                    || "e",
-                                    config.advice[1],
-                                    row,
-                                    || Value::known(v),
-                                )?;
-                            }
-                            Ok(())
-                        },
-                    )
+                    self.0.synthesize(config.clone(), layouter.namespace(|| "chain"))?;
+                    (5, Value::known(Fq::from(11)))
                 }
-            }
+                Reshape::Failing => (1, Value::unknown()),
+            };
+            layouter.assign_region(
+                || "extra",
+                |mut region| {
+                    for row in 0..rows {
+                        region.assign_advice(|| "e", config.advice[1], row, || value)?;
+                    }
+                    Ok(())
+                },
+            )
         }
     }
 
-    /// The caller holds `crate::test_circuit::SEEDED` and has set the
-    /// blinding seed.
-    pub(crate) fn prove_seeded(
+    /// A proof with the blinding seed already set; the caller holds
+    /// `crate::test_circuit::SEEDED`.
+    pub(crate) fn try_prove(
         params: &ParamsKZG<Bls12>,
         pk: &ProvingKey<Fq, Scheme>,
-        chain: &Chain,
-        seed: u64,
-    ) -> Vec<u8> {
-        prove_circuit_seeded(params, pk, chain, &chain.instance(), seed)
-            .expect("the prover makes the proof")
-    }
-
-    /// [`prove_seeded`] for any circuit with the configuration of [`Chain`].
-    pub(crate) fn prove_circuit_seeded<C: Circuit<Fq>>(
-        params: &ParamsKZG<Bls12>,
-        pk: &ProvingKey<Fq, Scheme>,
-        circuit: &C,
+        circuit: &impl Circuit<Fq>,
         inst: &[Fq],
         seed: u64,
     ) -> Result<Vec<u8>, Error> {
@@ -646,29 +615,47 @@ pub(crate) mod chain {
         Ok(transcript.finalize())
     }
 
+    pub(crate) fn prove(
+        params: &ParamsKZG<Bls12>,
+        pk: &ProvingKey<Fq, Scheme>,
+        chain: &Chain,
+        seed: u64,
+    ) -> Vec<u8> {
+        try_prove(params, pk, chain, &chain.instance(), seed).unwrap()
+    }
+
     pub(crate) fn verifies(
         params: &ParamsKZG<Bls12>,
         pk: &ProvingKey<Fq, Scheme>,
         chain: &Chain,
         proof: &[u8],
     ) -> bool {
-        let inst = chain.instance();
         let mut transcript = CircuitTranscript::<blake2b_simd::State>::init_from_bytes(proof);
         prepare::<Fq, Scheme, _>(
             pk.get_vk(),
             #[cfg(feature = "committed-instances")]
             &[],
-            &[&inst],
+            &[&chain.instance()],
             &mut transcript,
         )
         .is_ok_and(|g| g.verify(&params.verifier_params()).is_ok())
     }
 
-    pub(crate) fn chain_setup(k: u32, chain: &Chain) -> (ParamsKZG<Bls12>, ProvingKey<Fq, Scheme>) {
+    /// The parameters and the keygen key of `chain` at `2^k` rows, and the
+    /// same key read back from bytes.
+    pub(crate) fn setup(
+        k: u32,
+        chain: &Chain,
+    ) -> (
+        ParamsKZG<Bls12>,
+        ProvingKey<Fq, Scheme>,
+        ProvingKey<Fq, Scheme>,
+    ) {
         let params = ParamsKZG::<Bls12>::unsafe_setup(k, ChaCha20Rng::seed_from_u64(k as u64));
         let vk = keygen_vk_with_k::<Fq, Scheme, _>(&params, chain, k).unwrap();
         let pk = keygen_pk(vk, chain).unwrap();
-        (params, pk)
+        let read = read_back(&pk);
+        (params, pk, read)
     }
 
     pub(crate) fn read_back(pk: &ProvingKey<Fq, Scheme>) -> ProvingKey<Fq, Scheme> {
@@ -687,184 +674,123 @@ pub(crate) mod chain {
 mod tests {
     use super::*;
 
-    /// A key read from bytes, proving circuits with and without the regions
-    /// of its stored layout: every proof is the stock one.
-    mod layout_reuse {
-        use super::{
-            super::chain::{
-                Chain, Reshape, Reshaped, chain_setup, prove_circuit_seeded, prove_seeded,
-                read_back, verifies,
-            },
-            *,
+    fn digest(proof: &[u8]) -> String {
+        blake2b_simd::Params::new().hash_length(32).hash(proof).to_hex().to_string()
+    }
+
+    /// Proofs that failed the layout check on this thread since the last
+    /// call (none without `prover-par`).
+    fn retries() -> usize {
+        #[cfg(feature = "prover-par")]
+        return crate::par::layout::take_retries();
+        #[cfg(not(feature = "prover-par"))]
+        0
+    }
+
+    /// The stored layout's starts (none without `prover-par`).
+    fn stored(pk: &ProvingKey<Fq, Scheme>) -> Option<Vec<usize>> {
+        #[cfg(feature = "prover-par")]
+        return pk
+            .region_starts_cache
+            .get()
+            .map(|l| l.regions.iter().map(|r| *r.start).collect());
+        #[cfg(not(feature = "prover-par"))]
+        {
+            let _ = pk;
+            None
+        }
+    }
+
+    /// Regression: a key read from bytes proves as the stock prover, first
+    /// concurrently, then with circuits that do not match the stored layout
+    /// (other rows, fewer or more regions, a failing synthesis). Those fall
+    /// back to the stock shape pass and leave the layout in place; the key's
+    /// circuit keeps reusing it.
+    #[test]
+    fn read_key_proves_as_stock() {
+        use super::chain::{
+            Chain, Reshape, Reshaped, prove, read_back, setup, try_prove, verifies,
         };
 
-        /// Proofs that failed the layout check since the last call (always 0
-        /// without `prover-par`).
-        fn retries() -> usize {
-            #[cfg(feature = "prover-par")]
-            return crate::par::layout::take_retries();
-            #[cfg(not(feature = "prover-par"))]
-            0
-        }
-
-        fn stored(pk: &ProvingKey<Fq, Scheme>) -> Option<Vec<usize>> {
-            #[cfg(feature = "prover-par")]
-            return pk
-                .region_starts_cache
-                .get()
-                .map(|l| l.regions.iter().map(|r| *r.start).collect());
-            #[cfg(not(feature = "prover-par"))]
-            {
-                let _ = pk;
-                None
-            }
-        }
-
-        struct Fixture {
-            params: ParamsKZG<Bls12>,
-            pk: ProvingKey<Fq, Scheme>,
-            right: Chain,
-            shorter: Chain,
-        }
-
-        fn fixture() -> Fixture {
-            let right = Chain {
-                rows: 200,
-                start: 7,
-            };
-            let shorter = Chain {
-                rows: 150,
-                start: 7,
-            };
-            let (params, pk) = chain_setup(9, &right);
-            Fixture {
-                params,
-                pk,
-                right,
-                shorter,
-            }
-        }
-
-        /// The proof with a fresh key read from bytes: the stock shape pass.
-        fn uncached<C: Circuit<Fq>>(f: &Fixture, circuit: &C, inst: &[Fq], seed: u64) -> Vec<u8> {
-            let fresh = read_back(&f.pk);
-            let proof = prove_circuit_seeded(&f.params, &fresh, circuit, inst, seed).unwrap();
+        let right = Chain {
+            rows: 200,
+            start: 7,
+        };
+        let shorter = Chain {
+            rows: 150,
+            start: 7,
+        };
+        let inst = right.instance();
+        let (params, pk, read) = setup(9, &right);
+        let _seeded = SEEDED.lock().unwrap_or_else(|e| e.into_inner());
+        crate::plonk::prover::test_blinding::set(Some(0x1c));
+        // the stock proofs: a fresh key read from bytes runs the shape pass,
+        // and stores no layout when the synthesis fails
+        type Prover<'a> = &'a dyn Fn(&ProvingKey<Fq, Scheme>) -> Result<Vec<u8>, Error>;
+        let fresh = |circuit: Prover| {
+            let key = read_back(&pk);
+            let proof = circuit(&key);
             assert_eq!(retries(), 0);
+            if proof.is_err() {
+                assert_eq!(stored(&key), None);
+            }
             proof
+        };
+        let reference = prove(&params, &pk, &right, 3);
+        let shorter_ref = fresh(&|k| Ok(prove(&params, k, &shorter, 3))).unwrap();
+        let other = |reshape, k: &ProvingKey<Fq, Scheme>| {
+            try_prove(&params, k, &Reshaped(right.clone(), reshape), &inst, 3)
+        };
+        let fewer_ref = fresh(&|k| other(Reshape::Fewer, k)).unwrap();
+        let more_ref = fresh(&|k| other(Reshape::More, k)).unwrap();
+        let failing_err = fresh(&|k| other(Reshape::Failing, k)).unwrap_err();
+
+        // first proofs at once, then two more with the layout stored
+        for threads in [3, 2] {
+            let barrier = std::sync::Barrier::new(threads);
+            std::thread::scope(|s| {
+                let handles: Vec<_> = (0..threads)
+                    .map(|_| {
+                        s.spawn(|| {
+                            barrier.wait();
+                            let proof = prove(&params, &read, &right, 3);
+                            assert_eq!(retries(), 0);
+                            proof
+                        })
+                    })
+                    .collect();
+                for h in handles {
+                    assert_eq!(h.join().unwrap(), reference);
+                }
+            });
+        }
+        let layout = stored(&read);
+        if cfg!(feature = "prover-par") {
+            let keygen = pk.region_starts.as_ref().map(|s| s.iter().map(|r| **r).collect());
+            assert_eq!(layout, keygen);
         }
 
-        /// Regression: circuits with other rows or fewer or more regions than
-        /// the stored layout fall back to the stock shape pass and leave the
-        /// layout in place; the key's circuit keeps reusing it.
-        #[test]
-        fn matching_first_then_others() {
-            let f = fixture();
-            let _seeded = SEEDED.lock().unwrap_or_else(|e| e.into_inner());
-            crate::plonk::prover::test_blinding::set(Some(0x1c));
-            retries();
-            let reference = prove_seeded(&f.params, &f.pk, &f.right, 3);
-            let shorter_ref = uncached(&f, &f.shorter, &f.shorter.instance(), 3);
-            let inst = f.right.instance();
-            let fewer = Reshaped {
-                chain: f.right.clone(),
-                reshape: Reshape::Fewer,
-            };
-            let more = Reshaped {
-                chain: f.right.clone(),
-                reshape: Reshape::More,
-            };
-            let fewer_ref = uncached(&f, &fewer, &inst, 3);
-            let more_ref = uncached(&f, &more, &inst, 3);
+        assert_eq!(prove(&params, &read, &shorter, 3), shorter_ref);
+        let after_shorter = retries();
+        assert_eq!(other(Reshape::Fewer, &read).unwrap(), fewer_ref);
+        let after_fewer = retries();
+        assert_eq!(other(Reshape::More, &read).unwrap(), more_ref);
+        let after_more = retries();
+        let err = other(Reshape::Failing, &read).unwrap_err();
+        assert_eq!(format!("{err:?}"), format!("{failing_err:?}"));
+        retries();
+        let again = prove(&params, &read, &right, 3);
+        let after_again = retries();
+        crate::plonk::prover::test_blinding::set(None);
 
-            let read = read_back(&f.pk);
-            assert_eq!(prove_seeded(&f.params, &read, &f.right, 3), reference);
-            assert_eq!(retries(), 0);
-            let layout = stored(&read);
-            if cfg!(feature = "prover-par") {
-                assert_eq!(
-                    layout,
-                    f.pk.region_starts.as_ref().map(|s| s.iter().map(|r| **r).collect())
-                );
-            }
-            assert_eq!(prove_seeded(&f.params, &read, &f.shorter, 3), shorter_ref);
-            let after_shorter = retries();
-            let fewer_proof = prove_circuit_seeded(&f.params, &read, &fewer, &inst, 3).unwrap();
-            assert_eq!(fewer_proof, fewer_ref);
-            let after_fewer = retries();
-            let more_proof = prove_circuit_seeded(&f.params, &read, &more, &inst, 3).unwrap();
-            assert_eq!(more_proof, more_ref);
-            let after_more = retries();
-            let again = prove_seeded(&f.params, &read, &f.right, 3);
-            let after_again = retries();
-            crate::plonk::prover::test_blinding::set(None);
-
-            assert_eq!(again, reference);
-            assert!(verifies(&f.params, &read, &f.right, &again));
-            assert_eq!(stored(&read), layout, "the stored layout does not change");
-            if cfg!(feature = "prover-par") {
-                assert_eq!(
-                    (after_shorter, after_fewer, after_more, after_again),
-                    (1, 1, 1, 0)
-                );
-            }
-        }
-
-        /// A failing synthesis returns the stock error, stores no layout, and
-        /// leaves a stored one in use.
-        #[test]
-        fn failing_synthesis_after_layout() {
-            #[derive(Clone)]
-            struct Failing;
-            impl Circuit<Fq> for Failing {
-                type Config = super::super::chain::ChainConfig;
-                type FloorPlanner = SimpleFloorPlanner;
-                #[cfg(feature = "circuit-params")]
-                type Params = ();
-                fn without_witnesses(&self) -> Self {
-                    self.clone()
-                }
-                fn configure(meta: &mut ConstraintSystem<Fq>) -> Self::Config {
-                    Chain::configure(meta)
-                }
-                fn synthesize(
-                    &self,
-                    config: Self::Config,
-                    mut layouter: impl Layouter<Fq>,
-                ) -> Result<(), Error> {
-                    layouter.assign_region(
-                        || "unknown",
-                        |mut region| {
-                            region.assign_advice(
-                                || "x",
-                                config.advice[0],
-                                0,
-                                Value::<Fq>::unknown,
-                            )?;
-                            Ok(())
-                        },
-                    )
-                }
-            }
-            let f = fixture();
-            let _seeded = SEEDED.lock().unwrap_or_else(|e| e.into_inner());
-            crate::plonk::prover::test_blinding::set(Some(0x1d));
-            retries();
-            let reference = prove_seeded(&f.params, &f.pk, &f.right, 4);
-            let inst = f.right.instance();
-            let fresh = read_back(&f.pk);
-            let stock_err = prove_circuit_seeded(&f.params, &fresh, &Failing, &inst, 4)
-                .expect_err("the stock prover fails");
-            assert_eq!(stored(&fresh), None);
-
-            let read = read_back(&f.pk);
-            assert_eq!(prove_seeded(&f.params, &read, &f.right, 4), reference);
-            let err = prove_circuit_seeded(&f.params, &read, &Failing, &inst, 4)
-                .expect_err("the prover fails as stock");
-            assert_eq!(format!("{err:?}"), format!("{stock_err:?}"));
-            retries();
-            assert_eq!(prove_seeded(&f.params, &read, &f.right, 4), reference);
-            assert_eq!(retries(), 0);
-            crate::plonk::prover::test_blinding::set(None);
+        assert_eq!(again, reference);
+        assert!(verifies(&params, &read, &right, &again));
+        assert_eq!(stored(&read), layout);
+        if cfg!(feature = "prover-par") {
+            assert_eq!(
+                (after_shorter, after_fewer, after_more, after_again),
+                (1, 1, 1, 0)
+            );
         }
     }
 
@@ -884,98 +810,55 @@ mod tests {
 
     const GOLDEN: &str = "5177fc0d3371a3ee809efe70428114afb17eddddc866a104b37e6369c5da96f2";
 
-    /// Seeded proofs at `2^14` rows (`crate::par::DELTA_MIN_LEN`) have the
-    /// digests of a build without `prover-par`, also with the key read back
-    /// from bytes.
-    #[test]
-    fn seeded_proof_digests_at_scale() {
-        use super::chain::{Chain, chain_setup, prove_seeded, read_back, verifies};
-
-        let digest = |proof: &[u8]| {
-            blake2b_simd::Params::new().hash_length(32).hash(proof).to_hex().to_string()
-        };
-        let k = 14;
+    /// The digests of seeded proofs of the random circuits of `seeds` and of
+    /// a chain filling `2^k` rows, checking that the chain's proof verifies
+    /// and that the key read back from bytes proves the same twice.
+    fn digests_at(k: u32, seeds: &[u64], start: u64, blinding: u64, seed: u64) -> Vec<String> {
         let mut digests = Vec::new();
-        for seed in [7u64, 21] {
-            let (params, pk) = setup(seed, true, k);
-            let (proof, ok) = prove(&params, &pk, seed, true);
-            assert!(ok, "seed {seed}: the satisfied circuit verifies");
+        for &s in seeds {
+            let (params, pk) = setup(s, true, k);
+            let (proof, ok) = prove(&params, &pk, s, true);
+            assert!(ok);
             digests.push(digest(&proof));
         }
-
-        let chain = Chain {
+        let chain = super::chain::Chain {
             rows: (1 << k) - 24,
-            start: 7,
+            start,
         };
-        let (params, pk) = chain_setup(k, &chain);
-        let read = read_back(&pk);
-        let seeded = SEEDED.lock().unwrap_or_else(|e| e.into_inner());
-        crate::plonk::prover::test_blinding::set(Some(0xc4a1));
-        let from_keygen = prove_seeded(&params, &pk, &chain, 5);
-        let read_first = prove_seeded(&params, &read, &chain, 5);
-        let read_second = prove_seeded(&params, &read, &chain, 5);
+        let (params, pk, read) = super::chain::setup(k, &chain);
+        let _seeded = SEEDED.lock().unwrap_or_else(|e| e.into_inner());
+        crate::plonk::prover::test_blinding::set(Some(blinding));
+        let proofs = [&pk, &read, &read].map(|k| super::chain::prove(&params, k, &chain, seed));
         crate::plonk::prover::test_blinding::set(None);
-        drop(seeded);
-        assert!(verifies(&params, &pk, &chain, &from_keygen));
-        assert_eq!(read_first, from_keygen);
-        assert_eq!(read_second, from_keygen);
-        digests.push(digest(&from_keygen));
+        assert!(super::chain::verifies(&params, &pk, &chain, &proofs[0]));
+        assert_eq!(proofs[1], proofs[0]);
+        assert_eq!(proofs[2], proofs[0]);
+        digests.push(digest(&proofs[0]));
+        digests
+    }
 
-        assert_eq!(digests, GOLDEN_AT_SCALE, "proof bytes changed");
+    /// At `2^14` rows (`crate::par::DELTA_MIN_LEN`) the digests are those of
+    /// a build without `prover-par`.
+    #[test]
+    fn seeded_proof_digests_at_scale() {
+        assert_eq!(digests_at(14, &[7, 21], 7, 0xc4a1, 5), GOLDEN_AT_SCALE);
     }
 
     /// As [`seeded_proof_digests_at_scale`] at `2^16` rows, where the
     /// parallel divisions of the multi-open run (checked with `prover-par`).
     #[test]
     fn seeded_proof_digests_at_division_size() {
-        use super::chain::{Chain, chain_setup, prove_seeded, read_back, verifies};
-
-        let digest = |proof: &[u8]| {
-            blake2b_simd::Params::new().hash_length(32).hash(proof).to_hex().to_string()
-        };
-        let k = 16;
-        #[cfg(feature = "prover-par")]
-        assert!(1usize << k >= crate::par::DIVISION_MIN_LEN);
         #[cfg(feature = "prover-par")]
         let before = crate::par::open::reached::counts();
-        let mut digests = Vec::new();
-        let seed = 7u64;
-        let (params, pk) = setup(seed, true, k);
-        let (proof, ok) = prove(&params, &pk, seed, true);
-        assert!(ok, "seed {seed}: the satisfied circuit verifies");
-        digests.push(digest(&proof));
-        drop((params, pk));
-
-        let chain = Chain {
-            rows: (1 << k) - 24,
-            start: 9,
-        };
-        let (params, pk) = chain_setup(k, &chain);
-        let read = read_back(&pk);
-        let seeded = SEEDED.lock().unwrap_or_else(|e| e.into_inner());
-        crate::plonk::prover::test_blinding::set(Some(0x16d1));
-        let from_keygen = prove_seeded(&params, &pk, &chain, 6);
-        let read_first = prove_seeded(&params, &read, &chain, 6);
-        let read_second = prove_seeded(&params, &read, &chain, 6);
-        crate::plonk::prover::test_blinding::set(None);
-        drop(seeded);
-        assert!(verifies(&params, &pk, &chain, &from_keygen));
-        assert_eq!(read_first, from_keygen);
-        assert_eq!(read_second, from_keygen);
-        digests.push(digest(&from_keygen));
-
+        assert_eq!(digests_at(16, &[7], 9, 0x16d1, 6), GOLDEN_AT_DIVISION_SIZE);
         #[cfg(feature = "prover-par")]
         {
             let after = crate::par::open::reached::counts();
-            let reached = [0, 1].map(|i| after[i] - before[i]);
+            let [roots, kate] = [0, 1].map(|i| after[i] - before[i]);
             // `kate_division` also counts in `divide_by_roots`.
-            assert!(reached[1] > 0, "kate_division in parallel blocks");
-            assert!(
-                reached[0] > reached[1],
-                "divide_by_roots in parallel blocks"
-            );
+            assert!(kate > 0);
+            assert!(roots > kate);
         }
-        assert_eq!(digests, GOLDEN_AT_DIVISION_SIZE, "proof bytes changed");
     }
 
     const GOLDEN_AT_DIVISION_SIZE: [&str; 2] = [
