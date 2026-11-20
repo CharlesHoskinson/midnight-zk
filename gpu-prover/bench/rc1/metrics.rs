@@ -106,9 +106,7 @@ pub mod device {
     }
 }
 
-/// The Metal counterpart of the CUDA `device` module above, on
-/// `midnight-metal`. With `rc1-bench-cuda` also on, the CUDA module is the one
-/// built.
+/// The Metal counterpart of the CUDA `device` module above.
 #[cfg(all(feature = "rc1-bench-metal", not(feature = "rc1-bench-cuda")))]
 pub mod device {
     use midnight_curves::Bls12;
@@ -124,16 +122,14 @@ pub mod device {
     use super::Metrics;
     use crate::{Key, Result};
 
-    /// The device model and its recommended working set in bytes (unified
-    /// memory has no dedicated total).
+    /// The device model and its recommended working set in bytes.
     pub fn info() -> Result<(String, u64)> {
         let info = metal::present().ok_or("Metal device unavailable")?;
         Ok((info.name.clone(), info.recommended_max_working_set))
     }
 
-    /// Registers the four SRS vectors the KZG prover commits from (every
-    /// commitment finds its table) and the proving key's resident polynomials,
-    /// and installs the hooks.
+    /// Registers the SRS vectors and the key's resident polynomials, and
+    /// installs the hooks.
     pub fn install(
         params: &ParamsKZG<Bls12>,
         pk: &Key,
@@ -162,7 +158,7 @@ pub mod device {
         Ok((srs, key))
     }
 
-    /// Nothing to subtract: the crate's counters are reset at `begin`.
+    /// The crate's counters are reset at `begin`.
     pub struct Baseline;
 
     pub fn begin() -> Baseline {
@@ -172,8 +168,7 @@ pub mod device {
         Baseline
     }
 
-    /// The counters of one proof. Unified memory has no host-device copies, so
-    /// the transfer and staging counters are 0.
+    /// Unified memory: the transfer and staging counters are 0.
     pub fn finish(_: Baseline) -> Result<Metrics> {
         let stats = metal::stats();
         let hook_declines = hooks::hook_declines();

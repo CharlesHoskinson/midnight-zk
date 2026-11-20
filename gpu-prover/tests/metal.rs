@@ -11,16 +11,8 @@
 // See the License for the specific language governing permissions and
 // limitations under the License.
 
-//! Metal device tests. Compiled only with `--features metal` (the build script
-//! then sets the cfg `midnight_metal_linked`); the byte-identity tests also
-//! need `test-seed`. Each test returns early, with a line on stderr, when no
-//! device is detected.
-//!
-//! The byte-identity tests prove one seeded request through the Metal device
-//! and once more on the CPU (`NoDevice`, hooks suspended) and compare the
-//! proof bytes: the example relation with the size thresholds lowered, and a
-//! chain of Poseidon hashes at k = 16, which the default per-class thresholds
-//! admit to all four kernels (run with `--release`).
+//! Metal device tests (`--features metal`; the byte-identity tests also need
+//! `test-seed`). Each test returns early when no device is detected.
 
 #![cfg(all(feature = "metal", midnight_metal_linked, target_os = "macos"))]
 
@@ -33,8 +25,7 @@ use midnight_gpu_prover::{
     device::{self, Device, Phases},
 };
 
-/// The hooks and the device layer's counters are process-wide: the tests of
-/// this file run one at a time.
+/// The hooks and counters are process-wide: one test at a time.
 static SERIAL: std::sync::Mutex<()> = std::sync::Mutex::new(());
 
 fn detect() -> Option<Box<dyn Device>> {
@@ -46,7 +37,6 @@ fn detect() -> Option<Box<dyn Device>> {
     Some(d)
 }
 
-/// The request options of every test: the erasure is read back and checked.
 fn checked() -> RequestOptions {
     RequestOptions {
         zero_check: true,
@@ -54,8 +44,8 @@ fn checked() -> RequestOptions {
     }
 }
 
-/// Resets the size thresholds to the defaults; `false` (with a line on
-/// stderr) when `MIDNIGHT_METAL_MIN_K` overrides them.
+/// Resets the size thresholds; `false` when `MIDNIGHT_METAL_MIN_K` overrides
+/// them.
 fn default_thresholds() -> bool {
     midnight_metal::reset_min_k();
     if std::env::var_os("MIDNIGHT_METAL_MIN_K").is_some() {
@@ -96,8 +86,8 @@ mod seeded {
     const ROUNDS: usize = 600;
     const SEED: u64 = 7;
 
-    /// `ROUNDS` chained Poseidon hashes of three inputs; the last is public
-    /// (the relation of the CUDA device tests, `tests/gpu.rs`).
+    /// `ROUNDS` chained Poseidon hashes; the last is public (as in
+    /// `tests/gpu.rs`).
     #[derive(Clone, Copy, Debug, Default)]
     struct PoseidonChain;
 
@@ -171,21 +161,10 @@ mod seeded {
         }
     }
 
-    /// Proves `input` seeded through the Metal device (every phase admitted)
-    /// and once on the CPU, and checks: equal proof bytes, the stock verifier
-    /// accepts, the `msm`, `ifft` and `quotient` classes served, no
-    /// fallback, the erasure checked and clean. Returns the device service
-    /// for further checks.
-    ///
-    /// The `fft` class (the forward base-domain transform) is checked as never
-    /// offered: the PLONK prover of `midnight-proofs` makes no forward
-    /// base-domain FFT. Its only callers in `EvaluationDomain` are
-    /// `coeff_to_lagrange` and `extended_to_lagrange`, which the prover does
-    /// not call; its forward transforms are the extended cosets of
-    /// `coeff_to_extended`, done by the pruned `fft_coeff_to_extended` of
-    /// `midnight-curves` (no hook) on the CPU path and inside the quotient job
-    /// on the device. The `fft` entry point is checked against the stock FFT by
-    /// the tests of `midnight-metal`.
+    /// Proves seeded on the Metal device and on the CPU, and checks equal
+    /// proof bytes, verification, the served classes, no fallback and a clean
+    /// erasure. The prover makes no forward base-domain FFT (its forward
+    /// transforms are inside the quotient), so `fft` is never offered.
     fn byte_identity<R: ServedRelation + Copy>(
         name: &str,
         relation: R,
@@ -217,7 +196,6 @@ mod seeded {
             served(class)
                 + r.declines.iter().filter(|d| d.phase == class).map(|d| d.count).sum::<u64>()
         };
-        // the record has one MSM total and no served MSM count
         assert!(r.msm.count > 0, "{name}: no MSM call");
         assert!(!r.device_calls.contains_key("msm"));
         assert!(
@@ -256,7 +234,6 @@ mod seeded {
             (0, 0, 0)
         );
         assert!(gpu.retired().is_none());
-        // the stock verifier of the standard library accepts the proof
         let (inst, _) = relation.decode_input(&example_input(4)).unwrap();
         midnight_zk_stdlib::verify::<R, blake2b_simd::State, _>(
             gpu.verifier_params(),
@@ -269,8 +246,7 @@ mod seeded {
         gpu
     }
 
-    /// The example relation, with the thresholds lowered so that its calls
-    /// reach the kernels.
+    /// The example relation, with the thresholds lowered.
     #[test]
     fn seeded_small_proof_equals_cpu_proof_with_min_k_lowered() {
         let _g = SERIAL.lock().unwrap_or_else(|e| e.into_inner());
@@ -280,9 +256,7 @@ mod seeded {
         midnight_metal::reset_min_k();
     }
 
-    /// k = 16 with the measured per-class default thresholds: every class
-    /// reaches the device without lowering them. The service keeps the key
-    /// copies and the tables (`keep`), so the held bytes are the device's.
+    /// k = 16 reaches every class with the default thresholds.
     #[test]
     #[cfg_attr(
         debug_assertions,
@@ -302,10 +276,8 @@ mod seeded {
             ResidentPolicy::Keep,
             d,
         );
-        // every MSM of the proof had a table
         let held = gpu.held();
         assert!(held.tables > 0 && held.resident > 0, "{held:?}");
-        // the key copies, the tables and the idle pool of zeroed buffers
         let pooled = midnight_metal::pool_bytes();
         let freed = gpu.evict(true);
         assert_eq!(freed, held.tables + held.resident + pooled);
@@ -323,7 +295,6 @@ fn a_proof_with_the_device_phases_admitted_verifies_and_the_erasure_succeeds() {
     };
     let _g = SERIAL.lock().unwrap_or_else(|e| e.into_inner());
     let Some(d) = detect() else { return };
-    // let calls of the example circuit's size reach the kernels
     assert!(midnight_metal::set_min_k(1));
     let mut s = service(config(), d);
     let served = s.prove(&SecretBytes::new(example_input(1)), checked()).unwrap();
@@ -333,7 +304,6 @@ fn a_proof_with_the_device_phases_admitted_verifies_and_the_erasure_succeeds() {
     assert!(r.wipe.checked && r.wipe.regions > 0, "{:?}", r.wipe);
     assert_eq!(r.wipe.erasure_failures, 0);
     assert!(r.verify_s > 0.0);
-    // the stock verifier of the standard library accepts the proof
     let (inst, _) =
         midnight_gpu_prover::ServedRelation::decode_input(&PoseidonPreimage, &example_input(1))
             .unwrap();
@@ -346,10 +316,8 @@ fn a_proof_with_the_device_phases_admitted_verifies_and_the_erasure_succeeds() {
     )
     .unwrap();
     assert!(midnight_metal::end_request());
-    // the counters of the record are the crate's
+    // the record's counters are the crate's
     let st = midnight_metal::stats();
-    // the MSM total is every hook invocation (served or declined); the
-    // record has no served MSM count
     assert!(!r.device_calls.contains_key("msm"));
     assert!(r.msm.count >= st.msm.served);
     for (class, served) in [
@@ -366,9 +334,7 @@ fn a_proof_with_the_device_phases_admitted_verifies_and_the_erasure_succeeds() {
     midnight_metal::reset_min_k();
 }
 
-/// The read-back check through the device layer: a non-zero byte planted
-/// after the zeroing (the crate's test switch) fails the request's erasure
-/// and is counted.
+/// A non-zero byte planted after the zeroing fails the erasure check.
 #[test]
 fn a_planted_nonzero_byte_fails_the_erasure_check() {
     let _g = SERIAL.lock().unwrap_or_else(|e| e.into_inner());
@@ -379,9 +345,7 @@ fn a_planted_nonzero_byte_fails_the_erasure_check() {
     assert!(!d.revoke());
     let clean = d.end_request(true).unwrap();
     assert!(clean.checked && clean.nonzero_regions == 0, "{clean:?}");
-    // a per-request region, as a kernel makes one. Check mode also reads
-    // back (and counts) the idle buffers of the pool: the pool is emptied
-    // first, so the request's own region is the only one
+    // the check also reads back the idle pool, so empty it first
     let fill = || {
         let mut s = midnight_metal::ctx::lock().unwrap();
         s.scratch("test-planted", 4096).unwrap().as_mut_slice::<u8>().fill(0x77);
@@ -392,7 +356,6 @@ fn a_planted_nonzero_byte_fails_the_erasure_check() {
     let w = d.end_request(true).unwrap();
     assert_eq!((w.regions, w.bytes, w.checked), (1, 4096, true));
     assert_eq!((w.nonzero_regions, w.check_failures), (0, 0));
-    // the region went back to the pool: the next check reads it back too
     assert_eq!(midnight_metal::pool_bytes(), 4096);
     midnight_metal::release_pool();
     assert_eq!(d.begin_request(Phases::ALL), Phases::ALL);
@@ -405,10 +368,8 @@ fn a_planted_nonzero_byte_fails_the_erasure_check() {
     assert!(d.end_request(true).is_ok());
 }
 
-/// The peak of a request is the bytes in use (`request_peak_bytes`): what
-/// earlier requests left resident and every buffer the request holds, new or
-/// taken from the pool of zeroed buffers, but not the idle pool of an
-/// earlier, larger request.
+/// The peak counts every buffer the request holds, new or from the pool, but
+/// not the idle pool of an earlier, larger request.
 #[test]
 fn the_peak_of_a_small_request_excludes_the_pool_of_an_earlier_large_one() {
     const BIG: usize = 64 << 20;
@@ -420,8 +381,7 @@ fn the_peak_of_a_small_request_excludes_the_pool_of_an_earlier_large_one() {
         let mut s = midnight_metal::ctx::lock().unwrap();
         s.scratch("test-peak", n).unwrap().as_mut_slice::<u8>().fill(1);
     };
-    // a request that holds `n` bytes of scratch; `(peak, bytes in use at its
-    // start, idle pool while it held the scratch)`
+    // `(peak, bytes in use at the start, idle pool during the request)`
     let request = |n: usize| {
         let base = midnight_metal::ctx::in_use_bytes();
         assert_eq!(d.begin_request(Phases::ALL), Phases::ALL);
@@ -440,7 +400,6 @@ fn the_peak_of_a_small_request_excludes_the_pool_of_an_earlier_large_one() {
         d.evict(true);
         return;
     }
-    // a small request: a new small buffer; the idle large one is not counted
     d.reset_counters();
     let (small, base, pool_during) = request(SMALL);
     assert_eq!(
@@ -452,7 +411,6 @@ fn the_peak_of_a_small_request_excludes_the_pool_of_an_earlier_large_one() {
         small < pooled,
         "the idle pool counted in the peak: {small} >= {pooled}"
     );
-    // a request that reuses the pooled large buffer: its bytes count
     d.reset_counters();
     let pool_before = midnight_metal::pool_bytes();
     let (reused, base, pool_during) = request(BIG);
@@ -469,11 +427,8 @@ fn the_peak_of_a_small_request_excludes_the_pool_of_an_earlier_large_one() {
     d.evict(true);
 }
 
-/// A chain of `ROWS` products of witness values, one row each, at `K = 13`: a
-/// witness of zeros leaves the advice columns all zero (but for the blinding
-/// rows), a dense one fills about four fifths of their rows with non-zero
-/// values. The input is a little-endian `u64` seed; seed 0 is the zero
-/// witness.
+/// `ROWS` products of witness values at `K = 13`. The input is a
+/// little-endian `u64` seed; seed 0 gives a witness of zeros.
 mod mul_chain {
     use ff::Field;
     use midnight_circuits::{
@@ -550,12 +505,8 @@ mod mul_chain {
     }
 }
 
-/// The record's MSM figures and label do not depend on the scalar values:
-/// two proofs of one circuit with the default thresholds, a witness of zeros
-/// and a dense one. The crate declines the sparse witness's advice
-/// commitments (`below-min-k` of a sparse MSM) and serves the dense one's,
-/// which this test checks first; the record still reports the same MSM
-/// total, declines, device calls, fallbacks and label for both.
+/// The crate serves a dense witness's MSMs and declines a sparse one's, but
+/// the record's MSM total, declines, calls, fallbacks and label are the same.
 #[test]
 fn the_record_does_not_tell_a_sparse_witness_from_a_dense_one() {
     use midnight_gpu_prover::{ProverService, input::SecretBytes};
@@ -588,8 +539,7 @@ fn the_record_does_not_tell_a_sparse_witness_from_a_dense_one() {
     };
     let (dense, dense_served, dense_declined) = prove(0x5eed);
     let (sparse, sparse_served, sparse_declined) = prove(0);
-    // the crate tells them apart: an MSM of the dense witness served on the
-    // device is declined as sparse with the zero witness
+    // the crate tells them apart
     assert!(
         dense_served > sparse_served,
         "{dense_served} <= {sparse_served}"

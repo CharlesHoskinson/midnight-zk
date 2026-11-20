@@ -187,31 +187,24 @@ Scope of the zero-knowledge rule (a named assumption):
   and needs a separate analysis.
 
 The Metal backend and the record. `midnight-metal` declines a sparse MSM (one
-with few non-zero scalars) and the stock CPU MSM of `midnight-proofs` runs it,
-so how many MSMs the device serves depends on the witness. The record does not
-show that split:
+with few non-zero scalars) to the stock CPU MSM, so how many MSMs the device
+serves depends on the witness. The record does not show that split:
 
-- It reports one MSM total: every MSM hook invocation, served or declined
-  (`msm.count`), and the wall time of all of them (`msm.seconds`).
-  `device_calls` has no `msm` entry, and `declines` and `fallbacks` have no
-  MSM row.
+- It reports one MSM total, `msm.count` and `msm.seconds`, over every MSM hook
+  invocation, served or declined. There is no MSM entry in `device_calls`,
+  `declines` or `fallbacks`.
 - The `gpu` or `cpu` label is decided from facts that do not depend on the
-  witness: the admitted phases, the served `fft`, `ifft` and `quotient` calls
-  (which depend on sizes only), and the MSM calls that the device takes by
-  their length and table before it reads any scalar.
+  witness: the admitted phases, the served `fft`, `ifft` and `quotient` calls,
+  and the MSM calls the device takes by length and table before reading any
+  scalar.
 - With the default thresholds the device takes an MSM only when a registered
-  table serves its bases (the four SRS vectors of the proving parameters,
-  every point compared with the table at each call). Any other MSM declines
-  `unregistered-bases` before any scalar is read, and the CPU MSM runs it. The
-  reason is cost: the one-shot path checks every base for membership in G1 at
-  each call, and that check alone takes longer than the whole CPU MSM (on Apple
-  M4 Max, 187 ms for `2^16` points and 593 ms for `2^18`, against about 25 ms
-  and 78 ms). Only an explicit threshold (`MIDNIGHT_METAL_MIN_K`) opens the
-  one-shot path. The decline depends on public facts only.
+  table serves its bases. Any other MSM declines `unregistered-bases` before
+  reading a scalar, because the one-shot path's per-call G1 membership check
+  costs more than the CPU MSM. Only `MIDNIGHT_METAL_MIN_K` opens that path.
+  The decline depends on public facts only.
 - The split by path stays inside the process (`midnight_metal::stats` and
-  `declines`, for local benchmarks and debugging). The time of a proof still
-  depends on the sparsity, as the CPU MSM time does: timing is out of scope
-  (below).
+  `declines`). Proof time still depends on sparsity, as with the CPU MSM:
+  timing is out of scope (below).
 
 Out of scope:
 
