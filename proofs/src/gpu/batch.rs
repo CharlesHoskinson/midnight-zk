@@ -670,8 +670,16 @@ mod tests {
                 1,
                 hooks,
                 |_, _| {
-                    let mut scratch = [0u8; 3 << 20];
-                    std::hint::black_box(&mut scratch);
+                    // Not inlined: in a release build LLVM hoists an inlined
+                    // static alloca into the calling frame, so the 3 MiB
+                    // landed on the 2 MiB test thread stack instead of the
+                    // 8 MiB pool worker stack.
+                    #[inline(never)]
+                    fn use_stack() {
+                        let mut scratch = [0u8; 3 << 20];
+                        std::hint::black_box(&mut scratch);
+                    }
+                    use_stack();
                 },
                 || true,
             )

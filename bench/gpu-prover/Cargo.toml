@@ -21,6 +21,10 @@ default = []
 rc1-bench-cuda = ["dep:midnight-gpu", "midnight-gpu/cuda", "midnight-proofs/gpu"]
 # The bench through the Metal hooks (midnight-metal), on an Apple GPU.
 rc1-bench-metal = ["dep:midnight-metal", "midnight-proofs/gpu"]
+# The K15 differential bench (k15diff/) through the CUDA hooks. Without it, the stock CPU prover.
+k15-diff-cuda = ["dep:midnight-gpu", "midnight-gpu/cuda", "midnight-proofs/gpu"]
+# Seeds the quotient limb blinding (midnight-proofs `gpu-test`) for byte-identity runs. Test only.
+k15-diff-seeded = ["midnight-proofs/gpu-test"]
 
 [dependencies]
 blake2b_simd = { workspace = true }
@@ -38,7 +42,15 @@ rand = { workspace = true }
 rayon = { workspace = true }
 serde = { workspace = true }
 serde_json = { workspace = true }
+midnight-circuits = { path = "../../circuits" }
+midnight-zk-stdlib = { path = "../../zk_stdlib" }
+rand_chacha = { workspace = true }
+sha2 = { workspace = true }
 
 [[bin]]
 name = "rc1-bench"
 path = "rc1/main.rs"
+
+[[bin]]
+name = "k15-diff"
+path = "k15diff/main.rs"

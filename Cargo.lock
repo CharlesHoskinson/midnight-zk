@@ -1247,14 +1247,18 @@ dependencies = [
  "ff",
  "hex",
  "libc",
+ "midnight-circuits",
  "midnight-curves",
  "midnight-gpu",
  "midnight-metal",
  "midnight-proofs",
+ "midnight-zk-stdlib",
  "rand 0.8.7",
+ "rand_chacha",
  "rayon",
  "serde",
  "serde_json",
+ "sha2",
 ]
 
 [[package]]
