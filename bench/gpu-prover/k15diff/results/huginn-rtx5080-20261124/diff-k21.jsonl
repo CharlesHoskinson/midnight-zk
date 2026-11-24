@@ -1,0 +1,11 @@
+{"mode":"gpu","event":"keygen","k":21,"npos":18000,"nsha":400,"threads":16,"keygen_s":39.6440,"vk_bytes":4060,"vk_sha256":"3dd48ac0453613c0383ad45d633c841fcb8e8a00e8f034889fce614abc1d2ef7","pk_bytes":2818576516,"pk_sha256":"d61ff9b8bd542e5def9c08f799afe35c874ea4d309a51398a8409dcfaacac2bc","msm":42,"ntt":45,"quotient_runs":0,"device_errors":0,"declines":"[]","hook_declines":"[]","peak_device_bytes":305588224}
+{"mode":"gpu","event":"register_key","ok":true}
+{"mode":"gpu","event":"warm","i":0,"prove_s":45.1709,"msm":25,"ntt":20,"quotient_runs":0,"device_errors":0,"declines":"[("quotient", "memory", 1)]","hook_declines":"[("quotient", "hook", 1)]","peak_device_bytes":364308480}
+{"mode":"gpu","event":"warm","i":1,"prove_s":39.3972,"msm":25,"ntt":20,"quotient_runs":0,"device_errors":0,"declines":"[("quotient", "memory", 1)]","hook_declines":"[("quotient", "hook", 1)]","peak_device_bytes":364308480}
+{"mode":"cpu","event":"keygen","k":21,"npos":18000,"nsha":400,"threads":16,"keygen_s":63.5002,"vk_bytes":4060,"vk_sha256":"3dd48ac0453613c0383ad45d633c841fcb8e8a00e8f034889fce614abc1d2ef7","pk_bytes":2818576516,"pk_sha256":"d61ff9b8bd542e5def9c08f799afe35c874ea4d309a51398a8409dcfaacac2bc","device":null}
+{"mode":"cpu","event":"warm","i":0,"prove_s":82.8227,"device":null}
+{"mode":"cpu","event":"warm","i":1,"prove_s":65.7272,"device":null}
+{"event":"vk_equal","stock_vk_sha256":"3dd48ac0453613c0383ad45d633c841fcb8e8a00e8f034889fce614abc1d2ef7","gpu_vk_sha256":"3dd48ac0453613c0383ad45d633c841fcb8e8a00e8f034889fce614abc1d2ef7","equal":true}
+{"event":"verify","file":"gpu-warm-0.bin","ok":true,"verify_s":0.0414}
+{"event":"verify","file":"gpu-warm-1.bin","ok":true,"verify_s":0.0412}
+{"event":"verify_summary","mode":"gpu","n":2,"failed":0}
