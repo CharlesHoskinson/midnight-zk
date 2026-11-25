@@ -1112,6 +1112,21 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "cf8baf1c55e62ffcace7a9f06f4bd9cd3f0c4beb022d3b367256b91b87513d98"
 
 [[package]]
+name = "midnight-accel"
+version = "0.1.0"
+dependencies = [
+ "blst",
+ "ff",
+ "group",
+ "midnight-circuits",
+ "midnight-curves",
+ "midnight-proofs",
+ "rand_chacha",
+ "rand_core 0.6.4",
+ "rayon",
+]
+
+[[package]]
 name = "midnight-aggregation"
 version = "0.1.0"
 dependencies = [
@@ -1261,20 +1276,12 @@ dependencies = [
 name = "midnight-metal"
 version = "0.1.0"
 dependencies = [
- "blst",
  "dispatch2",
- "ff",
- "group",
- "midnight-circuits",
- "midnight-curves",
+ "midnight-accel",
  "midnight-metal",
- "midnight-proofs",
  "objc2",
  "objc2-foundation",
  "objc2-metal",
- "rand_chacha",
- "rand_core 0.6.4",
- "rayon",
 ]
 
 [[package]]

@@ -11,9 +11,8 @@
 // See the License for the specific language governing permissions and
 // limitations under the License.
 
-//! The G1 MSM: sppark's Pippenger MSM ported to Metal. The kernels are in
-//! `shaders/msm.metal`, the curve formulas in `shaders/include/g1.h`. The host
-//! side is ported from sppark `msm/pippenger.cuh` (Copyright Supranational
+//! The G1 MSM: sppark's Pippenger MSM on a GPU backend. The host side is
+//! ported from sppark `msm/pippenger.cuh` (Copyright Supranational
 //! LLC, Apache-2.0, <https://github.com/supranational/sppark>, commit
 //! 08033103c14ff3c742e710b9463dde42acc0f058).
 //!
@@ -50,7 +49,7 @@ use std::sync::Arc;
 use blst::{blst_p1, blst_p1_affine};
 
 use crate::{
-    G1AffineLimbs, G1JacobianLimbs, Scalar,
+    Backend, G1AffineLimbs, G1JacobianLimbs, Scalar,
     account::{self, Class, Reason},
     ctx::{self, Error},
 };
@@ -67,26 +66,24 @@ macro_rules! trace {
     };
 }
 
-mod checks;
-mod collect;
-mod effective;
-mod par;
-mod pipeline;
-mod plan;
-mod registry;
-mod secret;
-mod split;
+pub mod checks;
+pub mod collect;
+pub mod effective;
+pub mod par;
+pub mod pipeline;
+pub mod plan;
+pub mod registry;
+pub mod secret;
+pub mod split;
 
-pub(crate) use effective::{effective_need, effective_size_reaches};
+pub use effective::{effective_need, effective_size_reaches};
+pub(crate) use registry::MsmState;
+use registry::Table;
 #[cfg(any(test, feature = "test-support"))]
 pub use registry::one_shot_g1_checks;
-use registry::{ONE_SHOT, Store, TABLES_SERVED, Table};
 pub use registry::{SrsHandle, msm_counts, register_srs, srs_handles, srs_stale};
 use secret::{Secret, scrub_stack};
 use split::{Points, split};
-
-/// A device XYZZ record (`g1::Xyzz`): `X, Y, ZZZ, ZZ`, six limbs each.
-type Xyzz = [u64; 24];
 
 // The host types the code reinterprets.
 const _: () = {
@@ -100,6 +97,9 @@ const _: () = {
     assert!(size_of::<midnight_curves::G1Projective>() == size_of::<blst_p1>());
 };
 
+/// A device XYZZ record (`g1::Xyzz`): `X, Y, ZZZ, ZZ`, six limbs each.
+pub type Xyzz = [u64; 24];
+
 /// The decline reason of a base outside G1.
 pub(crate) const BASES_REASON: Reason = Reason::BasesNotInSubgroup;
 
@@ -107,12 +107,12 @@ pub(crate) const BASES_REASON: Reason = Reason::BasesNotInSubgroup;
 // Admission.
 
 /// A registered table that serves an MSM ([`lookup`]).
-pub(crate) struct Pinned(Arc<Table>);
+pub(crate) struct Pinned<B: Backend>(Arc<Table<B>>);
 
 /// What [`lookup`] found for an MSM's bases.
-pub(crate) enum Lookup {
+pub(crate) enum Lookup<B: Backend> {
     /// A registered table serves them.
-    Table(Pinned),
+    Table(Pinned<B>),
     /// A registered table holds them, but a point of the prefix is not in G1.
     NotInG1,
     /// No registered table serves them (none was registered, or it was stale).
@@ -122,8 +122,8 @@ pub(crate) enum Lookup {
 /// The table that serves an MSM of `n` scalars on `bases`: lookup by address
 /// and length, comparison of every point (a mismatch, or a panic in the
 /// comparison, drops the table), then the table's G1 check. Reads no scalar.
-pub(crate) fn lookup(bases: &[G1AffineLimbs], n: usize) -> Lookup {
-    match registry::serving_table(bases, n) {
+pub(crate) fn lookup<B: Backend>(bases: &[G1AffineLimbs], n: usize) -> Lookup<B> {
+    match registry::serving_table::<B>(bases, n) {
         Some(t) if n > t.first_bad => Lookup::NotInG1,
         Some(t) => Lookup::Table(Pinned(t)),
         None => Lookup::Unregistered,
@@ -136,33 +136,33 @@ pub(crate) fn lookup(bases: &[G1AffineLimbs], n: usize) -> Lookup {
 /// `sum scalars[i] * bases[i]` on the pinned `table`, or on the one-shot path
 /// without one. Never panics (a panic below is a `panic` decline) and scrubs
 /// the calling thread's stack before returning.
-pub(crate) fn msm_g1(
+pub(crate) fn msm_g1<B: Backend>(
     scalars: &[Scalar],
     bases: &[G1AffineLimbs],
-    table: Option<Pinned>,
+    table: Option<Pinned<B>>,
 ) -> Option<G1JacobianLimbs> {
     if scalars.is_empty() || scalars.len() != bases.len() {
-        account::decline(Class::Msm, Reason::Shape);
+        account::decline::<B>(Class::Msm, Reason::Shape);
         return None;
     }
     let ran = par::catch(|| dispatch(scalars, bases, table.map(|p| p.0), None));
     scrub_stack();
     match ran {
         Some(Ok((r, ns))) => {
-            account::served(Class::Msm, ns);
+            account::served::<B>(Class::Msm, ns);
             // the result leaves; the guard `r` zeroes its own copy
             Some(*r)
         }
         Some(Err(Fail::Bases)) => {
-            account::decline(Class::Msm, BASES_REASON);
+            account::decline::<B>(Class::Msm, BASES_REASON);
             None
         }
         Some(Err(Fail::Ctx(e))) => {
-            account::decline(Class::Msm, Reason::of(&e));
+            account::decline::<B>(Class::Msm, Reason::of(&e));
             None
         }
         None => {
-            account::decline(Class::Msm, Reason::Panic);
+            account::decline::<B>(Class::Msm, Reason::Panic);
             None
         }
     }
@@ -186,32 +186,32 @@ impl From<Error> for Fail {
 type Served = (Secret<G1JacobianLimbs>, u64);
 
 /// The table path on the pinned `table`, or the one-shot path without one.
-fn dispatch(
+fn dispatch<B: Backend>(
     scalars: &[Scalar],
     bases: &[G1AffineLimbs],
-    table: Option<Arc<Table>>,
+    table: Option<Arc<Table<B>>>,
     trace: Trace<'_>,
 ) -> Result<Served, Fail> {
     match table {
         Some(t) => table_path(scalars, bases, t, trace),
-        None => one_shot_path(scalars, bases, trace),
+        None => one_shot_path::<B>(scalars, bases, trace),
     }
 }
 
 /// The MSM on the pinned table `t`; the first MSM on a table uploads it.
-fn table_path(
+fn table_path<B: Backend>(
     scalars: &[Scalar],
     bases: &[G1AffineLimbs],
-    t: Arc<Table>,
+    t: Arc<Table<B>>,
     mut trace: Trace<'_>,
 ) -> Result<Served, Fail> {
     debug_assert!(scalars.len() <= t.first_bad);
-    let mut s = ctx::lock()?;
+    let mut s = ctx::lock::<B>()?;
     t.upload(s.ctx())?;
-    TABLES_SERVED.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+    B::host().msm.tables_served.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
     trace!(trace, |st| st.table = true);
     let store = par::read(&t.store);
-    let Store::Device(points) = &*store else {
+    let Some(points) = store.device() else {
         return Err(Error::Device("msm: the table was not uploaded".into()).into());
     };
     let r = split(
@@ -231,18 +231,18 @@ fn table_path(
 }
 
 /// The MSM on the caller's points after the G1 check of every base.
-fn one_shot_path(
+fn one_shot_path<B: Backend>(
     scalars: &[Scalar],
     bases: &[G1AffineLimbs],
     trace: Trace<'_>,
 ) -> Result<Served, Fail> {
     #[cfg(any(test, feature = "test-support"))]
-    registry::G1_CHECKS.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+    B::host().msm.g1_checks.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
     if !checks::all_in_g1(bases) {
         return Err(Fail::Bases);
     }
-    ONE_SHOT.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
-    let mut s = ctx::lock()?;
+    B::host().msm.one_shot.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+    let mut s = ctx::lock::<B>()?;
     Ok(split(
         &mut s,
         Points::Host(bases),
@@ -283,7 +283,7 @@ pub struct MsmStages {
 /// counted in [`crate::stats`] or [`crate::declines`]; not a stable interface.
 #[doc(hidden)]
 #[cfg(any(test, feature = "test-support"))]
-pub fn msm_g1_stages(
+pub fn msm_g1_stages<B: Backend>(
     scalars: &[Scalar],
     bases: &[G1AffineLimbs],
 ) -> Option<(G1JacobianLimbs, MsmStages)> {
@@ -291,12 +291,12 @@ pub fn msm_g1_stages(
     {
         return None;
     }
-    if !crate::device() || !crate::field::all_reduced(scalars) {
+    if !crate::device::<B>() || !crate::field::all_reduced(scalars) {
         return None;
     }
     let mut st = MsmStages::default();
     let ran = par::catch(|| {
-        let table = match lookup(bases, scalars.len()) {
+        let table = match lookup::<B>(bases, scalars.len()) {
             Lookup::Table(p) => Some(p.0),
             Lookup::NotInG1 => return Err(Fail::Bases),
             Lookup::Unregistered => None,

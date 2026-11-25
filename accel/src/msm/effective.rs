@@ -19,23 +19,15 @@
 use std::sync::atomic::{AtomicUsize, Ordering::Relaxed};
 
 use super::par::{host_threads, par_parts};
-use crate::Scalar;
-
-/// Default need on the table path: `SPARSE_TABLE_FIXED + n / SPARSE_TABLE_DIV`
-/// non-zero scalars. Both parts are measured crossovers against the stock CPU
-/// MSM on Apple silicon: `n/5` at large `n`, plus a fixed part for the
-/// device's fixed cost near the threshold. A function of the length only.
-const SPARSE_TABLE_DIV: usize = 5;
-/// See [`SPARSE_TABLE_DIV`].
-const SPARSE_TABLE_FIXED: usize = 1 << 12;
+use crate::{Scalar, Tuning};
 
 /// The non-zero scalars an MSM of `n` scalars needs for the device under the
 /// log2 threshold `k` of its path. With the default thresholds the table path
-/// needs [`SPARSE_TABLE_DIV`]'s formula; with an explicit threshold either path
-/// needs `2^k`. The one-shot path is only reached with an explicit threshold.
-pub(crate) fn effective_need(n: usize, k: u32, table: bool, explicit: bool) -> usize {
+/// needs the formula of [`Tuning::msm_sparse_div`]; with an explicit threshold
+/// either path needs `2^k`, and only then is the one-shot path reached.
+pub fn effective_need(n: usize, k: u32, table: bool, explicit: bool, t: &Tuning) -> usize {
     if table && !explicit {
-        SPARSE_TABLE_FIXED + n / SPARSE_TABLE_DIV
+        t.msm_sparse_fixed + n / t.msm_sparse_div.max(1)
     } else {
         1usize << k.min(40)
     }
@@ -44,7 +36,7 @@ pub(crate) fn effective_need(n: usize, k: u32, table: bool, explicit: bool) -> u
 /// Whether `scalars` has at least `need` non-zero scalars (all zero counts as
 /// 1). Scans a prefix first so a dense input decides early, then counts the
 /// rest in parallel with early exit.
-pub(crate) fn effective_size_reaches(scalars: &[Scalar], need: usize) -> bool {
+pub fn effective_size_reaches(scalars: &[Scalar], need: usize) -> bool {
     const BLOCK: usize = 1 << 13;
     if need <= 1 {
         return true;

@@ -18,9 +18,9 @@
 //! `EvaluationDomain` derives it) or its inverse; any other root declines
 //! `shape`.
 //!
-//! The kernel (`shaders/ntt.metal`) is a Stockham transform with natural
+//! The kernel (`ntt_pass`) is a Stockham transform with natural
 //! order in and out: `ceil(log_n / 10)` passes of near-equal radix up to
-//! `2^10`, each done in threadgroup memory (32 KiB holds 1024 elements).
+//! `2^10`, each done in shared memory (32 KiB holds 1024 elements).
 //! The transform is bound by field multiplications, not memory, so the design
 //! minimises passes. Passes ping-pong with a scratch buffer, and an inverse
 //! transform's divisor is folded into the last pass.
@@ -29,25 +29,26 @@
 //! every size up to `2^28` with at most one product per factor. They are
 //! public and stay on the device for the life of the process.
 
-use std::sync::{Mutex, OnceLock};
+use std::sync::OnceLock;
 
 use blst::{blst_fr, blst_fr_inverse, blst_fr_mul, blst_fr_sqr};
 
 use crate::{
     MAX_LOG_N, Scalar,
     account::{self, Class, Reason},
+    backend::Backend,
     ctx::{self, Arg, Buffer, Command, Ctx, Error, Pod},
     field,
 };
 
 /// Bytes of one scalar.
-const SCALAR_BYTES: usize = 32;
+pub const SCALAR_BYTES: usize = 32;
 
 /// `2^S` is the largest power of two dividing `r - 1`.
-const S: u32 = 32;
+pub const S: u32 = 32;
 
 /// `ROOT_OF_UNITY` of `midnight_curves::Fq`, Montgomery limbs.
-const ROOT_OF_UNITY: Scalar = [
+pub const ROOT_OF_UNITY: Scalar = [
     0xb9b5_8d8c_5f0e_466a,
     0x5b1b_4c80_1819_d7ec,
     0x0af5_3ae3_52a3_1e64,
@@ -55,31 +56,27 @@ const ROOT_OF_UNITY: Scalar = [
 ];
 
 /// The factors of the passes are powers of the `2^UNIVERSAL_LOG`-th root.
-const UNIVERSAL_LOG: u32 = 28;
+pub const UNIVERSAL_LOG: u32 = 28;
 const _: () = assert!(MAX_LOG_N <= UNIVERSAL_LOG);
 
 /// Log2 of the length of the high twiddle table (`w_{2^HI_BITS}^j`); the
 /// low table (`w_{2^28}^j`) has `2^(28 - HI_BITS)` elements.
-const HI_BITS: u32 = 16;
+pub const HI_BITS: u32 = 16;
 
 /// Bytes of the scaled low twiddle table a transform with a divisor
 /// allocates; the quotient's memory need counts it.
-pub(crate) const SCALE_TABLE_BYTES: usize = SCALAR_BYTES << (UNIVERSAL_LOG - HI_BITS);
+pub const SCALE_TABLE_BYTES: usize = SCALAR_BYTES << (UNIVERSAL_LOG - HI_BITS);
 
 /// The largest radix (log2) of a pass: `2^MAX_PASS_LOG` elements fill a
 /// threadgroup's 32 KiB.
-const MAX_PASS_LOG: u32 = 10;
+pub const MAX_PASS_LOG: u32 = 10;
 
 /// Log2 of the elements one threadgroup holds (radix times columns).
-const GROUP_LOG: u32 = 10;
-
-/// Field multiplications per command buffer, a fraction of a second of GPU
-/// time. A pass is never split.
-const RUN_BUDGET: u64 = 1_500_000_000;
+pub const GROUP_LOG: u32 = 10;
 
 /// The direction of a transform.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
-pub(crate) enum Dir {
+pub enum Dir {
     /// At the standard root `w_n`.
     Forward,
     /// At `w_n^-1`.
@@ -88,7 +85,7 @@ pub(crate) enum Dir {
 
 impl Dir {
     /// The index of the direction in the root and twiddle tables.
-    fn index(self) -> usize {
+    pub fn index(self) -> usize {
         match self {
             Dir::Forward => 0,
             Dir::Inverse => 1,
@@ -100,7 +97,7 @@ impl Dir {
 // Host field operations (blst)
 
 /// `a * b` in `Fr` (Montgomery limbs).
-fn mul(a: &Scalar, b: &Scalar) -> Scalar {
+pub fn mul(a: &Scalar, b: &Scalar) -> Scalar {
     let mut r = blst_fr::default();
     // SAFETY: valid pointers to blst_fr values.
     unsafe { blst_fr_mul(&mut r, &blst_fr { l: *a }, &blst_fr { l: *b }) };
@@ -108,7 +105,7 @@ fn mul(a: &Scalar, b: &Scalar) -> Scalar {
 }
 
 /// `a^2` in `Fr`.
-fn square(a: &Scalar) -> Scalar {
+pub fn square(a: &Scalar) -> Scalar {
     let mut r = blst_fr::default();
     // SAFETY: as `mul`.
     unsafe { blst_fr_sqr(&mut r, &blst_fr { l: *a }) };
@@ -116,7 +113,7 @@ fn square(a: &Scalar) -> Scalar {
 }
 
 /// `a^-1` in `Fr` (`a` non-zero).
-fn invert(a: &Scalar) -> Scalar {
+pub fn invert(a: &Scalar) -> Scalar {
     let mut r = blst_fr::default();
     // SAFETY: as `mul`; the argument is a root of unity, never zero.
     unsafe { blst_fr_inverse(&mut r, &blst_fr { l: *a }) };
@@ -125,7 +122,7 @@ fn invert(a: &Scalar) -> Scalar {
 
 /// `roots[dir][m]`: the standard `2^m`-th root of unity (`m <= 28`) or its
 /// inverse.
-fn roots() -> &'static [[Scalar; UNIVERSAL_LOG as usize + 1]; 2] {
+pub fn roots() -> &'static [[Scalar; UNIVERSAL_LOG as usize + 1]; 2] {
     static ROOTS: OnceLock<[[Scalar; UNIVERSAL_LOG as usize + 1]; 2]> = OnceLock::new();
     ROOTS.get_or_init(|| {
         let mut w = ROOT_OF_UNITY;
@@ -147,13 +144,13 @@ fn roots() -> &'static [[Scalar; UNIVERSAL_LOG as usize + 1]; 2] {
 
 /// The standard `2^log_n`-th root of unity of `Fr` (`dir` forward) or its
 /// inverse; `None` above `2^28`.
-pub(crate) fn std_root(log_n: u32, dir: Dir) -> Option<Scalar> {
+pub fn std_root(log_n: u32, dir: Dir) -> Option<Scalar> {
     (log_n <= UNIVERSAL_LOG).then(|| roots()[dir.index()][log_n as usize])
 }
 
 /// The direction of `omega` for a `2^log_n` transform, if it is the standard
 /// root or its inverse.
-fn direction(omega: &Scalar, log_n: u32) -> Option<Dir> {
+pub fn direction(omega: &Scalar, log_n: u32) -> Option<Dir> {
     if std_root(log_n, Dir::Forward).as_ref() == Some(omega) {
         Some(Dir::Forward)
     } else if std_root(log_n, Dir::Inverse).as_ref() == Some(omega) {
@@ -163,18 +160,8 @@ fn direction(omega: &Scalar, log_n: u32) -> Option<Dir> {
     }
 }
 
-// ---------------------------------------------------------------------------
-// Twiddle tables (public, resident)
-
-/// `hi[dir]`: `w_{2^H}^j`, `j < 2^H`; `lo[dir]`: `w_{2^28}^j`,
-/// `j < 2^(28 - H)` (`H` = [`HI_BITS`]; 2 MiB in all).
-struct Tables {
-    hi: [Buffer; 2],
-    lo: [Buffer; 2],
-}
-
 /// `[1, w, w^2, ..., w^(len - 1)]`.
-fn powers(w: &Scalar, len: usize) -> Vec<Scalar> {
+pub fn powers(w: &Scalar, len: usize) -> Vec<Scalar> {
     let mut v = Vec::with_capacity(len);
     // Montgomery one: 2^256 mod r
     let mut acc: Scalar = [
@@ -190,13 +177,82 @@ fn powers(w: &Scalar, len: usize) -> Vec<Scalar> {
     v
 }
 
-/// The twiddle tables, made at the first transform.
-static TABLES: Mutex<Option<&'static Tables>> = Mutex::new(None);
+/// The parameters of one pass (`ntt::PassParams` of the shader).
+#[repr(C)]
+#[derive(Clone, Copy, Debug, Default)]
+pub struct PassParams {
+    pub log_n: u32,
+    pub log_r: u32,
+    pub log_p: u32,
+    pub log_g: u32,
+    pub flags: u32,
+    pub n_src: u32,
+    pub hi_bits: u32,
+    pub pad: u32,
+    pub z1: Scalar,
+    pub z2: Scalar,
+}
+// SAFETY: `repr(C)`, eight `u32` then two `[u64; 4]`: no padding, every bit
+// pattern valid.
+unsafe impl Pod for PassParams {}
+
+/// Pass flag: multiply the inputs by the pass factors.
+pub const F_TWIDDLE: u32 = 1;
+/// Pass flag: the factors read the high and the low table.
+pub const F_TWO_LEVEL: u32 = 2;
+/// Pass flag: the input is `coeff_to_extended`'s (distributed, zero-padded).
+pub const F_COSET: u32 = 4;
+
+/// The radices (log2) of the passes of a `2^log_n` transform: as few passes
+/// as the threadgroup memory allows, of near-equal radices (larger first).
+pub fn plan(log_n: u32) -> Vec<u32> {
+    let passes = log_n.div_ceil(MAX_PASS_LOG).max(1);
+    let base = log_n / passes;
+    let extra = log_n % passes;
+    (0..passes).map(|i| base + u32::from(i < extra)).collect()
+}
+
+/// Log2 of the columns of one threadgroup of a pass of radix `2^r` in a
+/// `2^log_n` transform.
+pub fn group_columns_log(log_n: u32, r: u32) -> u32 {
+    GROUP_LOG.saturating_sub(r).min(log_n - r)
+}
+
+/// Threads of one threadgroup of a pass holding `2^e_log` elements: one per
+/// four elements, the measured best.
+pub fn group_threads(e_log: u32) -> usize {
+    1usize << e_log.saturating_sub(2)
+}
+
+/// The threadgroup size of each `ntt_pass` dispatch of a `2^log_n` transform.
+pub fn pass_group_threads(log_n: u32) -> Vec<usize> {
+    plan(log_n)
+        .into_iter()
+        .map(|r| group_threads(r + group_columns_log(log_n, r)))
+        .collect()
+}
+
+/// Scratch bytes of a [`ntt_dev`] or [`coeff_to_extended_dev_at`] of `2^log_n`:
+/// none for one pass (`log_n <= 10`), else the transform's length.
+pub fn scratch_bytes(log_n: u32) -> usize {
+    if plan(log_n).len() > 1 {
+        SCALAR_BYTES << log_n
+    } else {
+        0
+    }
+}
+
+/// `hi[dir]`: `w_{2^H}^j`, `j < 2^H`; `lo[dir]`: `w_{2^28}^j`,
+/// `j < 2^(28 - H)` (`H` = [`HI_BITS`]; 2 MiB in all).
+pub(crate) struct Tables<B: Backend> {
+    hi: [Buffer<B>; 2],
+    lo: [Buffer<B>; 2],
+}
 
 /// The twiddle tables (made at the first call, kept for the process).
-fn tables(ctx: &Ctx) -> Result<&'static Tables, Error> {
+fn tables<B: Backend>(ctx: &Ctx<B>) -> Result<&'static Tables<B>, Error> {
     let hb = HI_BITS;
-    let mut t = TABLES.lock().unwrap_or_else(|e| e.into_inner());
+    let mut t = B::host().ntt_tables.lock().unwrap_or_else(|e| e.into_inner());
     if let Some(t) = *t {
         return Ok(t);
     }
@@ -208,91 +264,22 @@ fn tables(ctx: &Ctx) -> Result<&'static Tables, Error> {
         lo: [make(0, UNIVERSAL_LOG, lb)?, make(1, UNIVERSAL_LOG, lb)?],
     };
     // public data kept for the life of the process
-    let leaked: &'static Tables = Box::leak(Box::new(made));
+    let leaked: &'static Tables<B> = Box::leak(Box::new(made));
     *t = Some(leaked);
     Ok(leaked)
 }
 
-// ---------------------------------------------------------------------------
-// Plan
-
-/// The parameters of one pass (`ntt::PassParams` of the shader).
-#[repr(C)]
-#[derive(Clone, Copy, Debug, Default)]
-struct PassParams {
-    log_n: u32,
-    log_r: u32,
-    log_p: u32,
-    log_g: u32,
-    flags: u32,
-    n_src: u32,
-    hi_bits: u32,
-    pad: u32,
-    z1: Scalar,
-    z2: Scalar,
-}
-// SAFETY: `repr(C)`, eight `u32` then two `[u64; 4]`: no padding, every bit
-// pattern valid.
-unsafe impl Pod for PassParams {}
-
-/// Pass flag: multiply the inputs by the pass factors.
-const F_TWIDDLE: u32 = 1;
-/// Pass flag: the factors read the high and the low table.
-const F_TWO_LEVEL: u32 = 2;
-/// Pass flag: the input is `coeff_to_extended`'s (distributed, zero-padded).
-const F_COSET: u32 = 4;
-
-/// The radices (log2) of the passes of a `2^log_n` transform: as few passes
-/// as the threadgroup memory allows, of near-equal radices (larger first).
-fn plan(log_n: u32) -> Vec<u32> {
-    let passes = log_n.div_ceil(MAX_PASS_LOG).max(1);
-    let base = log_n / passes;
-    let extra = log_n % passes;
-    (0..passes).map(|i| base + u32::from(i < extra)).collect()
-}
-
-/// Log2 of the columns of one threadgroup of a pass of radix `2^r` in a
-/// `2^log_n` transform.
-fn group_columns_log(log_n: u32, r: u32) -> u32 {
-    GROUP_LOG.saturating_sub(r).min(log_n - r)
-}
-
-/// Threads of one threadgroup of a pass holding `2^e_log` elements: one per
-/// four elements, the measured best.
-fn group_threads(e_log: u32) -> usize {
-    1usize << e_log.saturating_sub(2)
-}
-
-/// The threadgroup size of each `ntt_pass` dispatch of a `2^log_n` transform.
-#[cfg(test)]
-pub(crate) fn pass_group_threads(log_n: u32) -> Vec<usize> {
-    plan(log_n)
-        .into_iter()
-        .map(|r| group_threads(r + group_columns_log(log_n, r)))
-        .collect()
-}
-
-/// Scratch bytes of a [`ntt_dev`] or [`coeff_to_extended_dev_at`] of `2^log_n`:
-/// none for one pass (`log_n <= 10`), else the transform's length.
-pub(crate) fn scratch_bytes(log_n: u32) -> usize {
-    if plan(log_n).len() > 1 {
-        SCALAR_BYTES << log_n
-    } else {
-        0
-    }
-}
-
 /// What a sequence of passes reads and writes.
-struct Job<'b> {
+struct Job<'b, B: Backend> {
     log_n: u32,
     dir: Dir,
     /// The first pass's input: `2^log_n` elements, or `n_src` with `coset`.
-    src: &'b Buffer,
+    src: &'b Buffer<B>,
     /// The result's buffer, and the byte offset of the result in it.
-    dst: &'b Buffer,
+    dst: &'b Buffer<B>,
     dst_off: usize,
     /// Scratch of `2^log_n` elements (unused by one pass).
-    tmp: &'b Buffer,
+    tmp: &'b Buffer<B>,
     /// The divisor folded into the last pass.
     scale: Option<Scalar>,
     /// `(n_src, [z1, z2])`: the first pass reads `src` as coeff_to_extended
@@ -300,13 +287,16 @@ struct Job<'b> {
     coset: Option<(usize, [Scalar; 2])>,
     /// `(t, log_tn)`: before the first pass, `src[i] *= t[i mod 2^log_tn]`
     /// (`src` is then `dst` at offset 0).
-    pre_mul: Option<(&'b Buffer, u32)>,
+    pre_mul: Option<(&'b Buffer<B>, u32)>,
     /// After the last pass, `dst[i] *= [1, z1, z2][i mod 3]`.
     post_zeta: Option<[Scalar; 2]>,
+    /// Whether the host reads `dst` afterwards ([`Command::download`] in the
+    /// last command buffer).
+    read_back: bool,
 }
 
 /// `b` holds at least `elems` scalars.
-fn check_len(b: &Buffer, elems: usize, what: &str) -> Result<(), Error> {
+fn check_len<B: Backend>(b: &Buffer<B>, elems: usize, what: &str) -> Result<(), Error> {
     if b.len_bytes() < elems * SCALAR_BYTES {
         return Err(Error::Device(format!(
             "ntt: the {what} buffer holds {} bytes, {} needed",
@@ -318,12 +308,12 @@ fn check_len(b: &Buffer, elems: usize, what: &str) -> Result<(), Error> {
 }
 
 /// A buffer and a byte offset in it.
-type At<'b> = (&'b Buffer, usize);
+type At<'b, B> = (&'b Buffer<B>, usize);
 
 /// Checks the scalar arguments, size and buffers of `job` before any device
 /// work. An unreduced scalar is [`Error::Unreduced`]: the kernels silently
 /// mis-compute on such inputs.
-fn check_job(job: &Job<'_>) -> Result<(), Error> {
+fn check_job<B: Backend>(job: &Job<'_, B>) -> Result<(), Error> {
     let by_value = job
         .scale
         .iter()
@@ -374,7 +364,7 @@ fn check_job(job: &Job<'_>) -> Result<(), Error> {
 
 /// The (input, output) of each pass: passes alternate between `tmp` and
 /// `dst`, never writing their own input; the last writes `dst`.
-fn pass_io<'b>(job: &Job<'b>, passes: usize) -> Vec<(At<'b>, At<'b>)> {
+fn pass_io<'b, B: Backend>(job: &Job<'b, B>, passes: usize) -> Vec<(At<'b, B>, At<'b, B>)> {
     let mut cur = (job.src, 0);
     (0..passes)
         .map(|q| {
@@ -392,7 +382,7 @@ fn pass_io<'b>(job: &Job<'b>, passes: usize) -> Vec<(At<'b>, At<'b>)> {
 
 /// The parameters of each pass of `job` with the radices `radices`;
 /// `scaled`: the last pass folds in the divisor.
-fn pass_params(job: &Job<'_>, radices: &[u32], scaled: bool) -> Vec<PassParams> {
+fn pass_params<B: Backend>(job: &Job<'_, B>, radices: &[u32], scaled: bool) -> Vec<PassParams> {
     let passes = radices.len();
     let mut params = Vec::with_capacity(passes);
     let mut log_p = 0u32;
@@ -428,14 +418,15 @@ fn pass_params(job: &Job<'_>, radices: &[u32], scaled: bool) -> Vec<PassParams> 
 }
 
 /// The end of the command buffer that starts at pass `q`: the passes
-/// `q..end` stay within [`RUN_BUDGET`] (at least one pass).
-fn run_end(params: &[PassParams], q: usize, n: usize) -> usize {
+/// `q..end` stay within [`crate::Tuning::ntt_run_budget`] (at least one
+/// pass).
+fn run_end(params: &[PassParams], q: usize, n: usize, budget: u64) -> usize {
     let mut end = q;
     let mut cost = 0u64;
     while end < params.len() {
         let p = &params[end];
         let c = (n as u64) * (u64::from(p.log_r) / 2 + 1 + 2 * u64::from(p.flags & F_TWIDDLE));
-        if end > q && cost + c > RUN_BUDGET {
+        if end > q && cost + c > budget {
             break;
         }
         cost += c;
@@ -444,9 +435,9 @@ fn run_end(params: &[PassParams], q: usize, n: usize) -> usize {
     end
 }
 
-/// Runs the passes of `job` in as many command buffers as [`RUN_BUDGET`]
-/// asks. Returns the GPU time.
-fn run_job(ctx: &Ctx, job: &Job<'_>) -> Result<u64, Error> {
+/// Runs the passes of `job` in as many command buffers as
+/// [`crate::Tuning::ntt_run_budget`] asks. Returns the GPU time.
+fn run_job<B: Backend>(ctx: &Ctx<B>, job: &Job<'_, B>) -> Result<u64, Error> {
     check_job(job)?;
     let n = 1usize << job.log_n;
     let radices = plan(job.log_n);
@@ -467,7 +458,7 @@ fn run_job(ctx: &Ctx, job: &Job<'_>) -> Result<u64, Error> {
     let mut ns = 0;
     let mut q = 0;
     while q < passes {
-        let end = run_end(&params, q, n);
+        let end = run_end(&params, q, n, B::tuning().ntt_run_budget);
         let lo = scaled.as_ref();
         let first = q == 0;
         let last_cb = end == passes;
@@ -480,7 +471,8 @@ fn run_job(ctx: &Ctx, job: &Job<'_>) -> Result<u64, Error> {
                     cmd.dispatch(
                         "ntt_scale_copy",
                         1usize << (UNIVERSAL_LOG - HI_BITS),
-                        &[Arg::Buffer(&tables.lo[d]), Arg::Buffer(b), Arg::value(c)],
+                        &[Arg::Buffer(&tables.lo[d]), Arg::Buffer(b)],
+                        c,
                     )?;
                 }
                 for i in q..end {
@@ -495,7 +487,6 @@ fn run_job(ctx: &Ctx, job: &Job<'_>) -> Result<u64, Error> {
                         Arg::BufferAt(dst, dst_off),
                         Arg::Buffer(hi),
                         Arg::Buffer(lo_tab),
-                        Arg::value(p),
                     ];
                     let e_log = p.log_r + p.log_g;
                     cmd.dispatch_groups(
@@ -503,12 +494,16 @@ fn run_job(ctx: &Ctx, job: &Job<'_>) -> Result<u64, Error> {
                         n >> e_log,
                         group_threads(e_log),
                         &args,
+                        p,
                         &[SCALAR_BYTES << e_log],
                     )?;
                 }
                 if let (true, Some(z)) = (last_cb, job.post_zeta.as_ref()) {
                     // the data is at offset 0 here (checked by `check_job`)
                     encode_distribute_zeta(cmd, job.dst, n, z)?;
+                }
+                if last_cb && job.read_back {
+                    cmd.download(job.dst)?;
                 }
                 Ok(())
             })?
@@ -519,7 +514,7 @@ fn run_job(ctx: &Ctx, job: &Job<'_>) -> Result<u64, Error> {
 }
 
 // ---------------------------------------------------------------------------
-// Building blocks (device buffers, nothing read back)
+// Building blocks (device buffers)
 //
 // The caller holds the device for the whole sequence. The data must already
 // be reduced, and so must every scalar argument (else `Error::Unreduced`
@@ -529,14 +524,16 @@ fn run_job(ctx: &Ctx, job: &Job<'_>) -> Result<u64, Error> {
 /// The NTT of the first `2^log_n` elements of `a`, in place, natural order,
 /// at `w_n` or `w_n^-1`, then times `scale` if given. `tmp` is scratch of at
 /// least [`scratch_bytes`]`(log_n)` bytes (unused, and may be `a`, for
-/// `log_n <= 10`). Returns the GPU time.
-pub(crate) fn ntt_dev(
-    ctx: &Ctx,
-    a: &Buffer,
-    tmp: &Buffer,
+/// `log_n <= 10`). `read_back`: the host reads `a` afterwards. Returns the GPU
+/// time.
+pub fn ntt_dev<B: Backend>(
+    ctx: &Ctx<B>,
+    a: &Buffer<B>,
+    tmp: &Buffer<B>,
     log_n: u32,
     dir: Dir,
     scale: Option<&Scalar>,
+    read_back: bool,
 ) -> Result<u64, Error> {
     run_job(
         ctx,
@@ -551,6 +548,7 @@ pub(crate) fn ntt_dev(
             coset: None,
             pre_mul: None,
             post_zeta: None,
+            read_back,
         },
     )
 }
@@ -559,17 +557,19 @@ pub(crate) fn ntt_dev(
 /// byte offset `dst_off` (a multiple of 32, so a coset lands in place in a
 /// larger buffer): the forward NTT of `src[i] * [1, zeta[0], zeta[1]][i mod 3]`
 /// for `i < 2^k`, zero-padded. The distribution and padding happen in the
-/// first pass. `zeta` is `[g_coset, g_coset_inv]`. Returns the GPU time.
+/// first pass. `zeta` is `[g_coset, g_coset_inv]`. `read_back`: the host
+/// reads `dst` afterwards. Returns the GPU time.
 #[allow(clippy::too_many_arguments)]
-pub(crate) fn coeff_to_extended_dev_at(
-    ctx: &Ctx,
-    src: &Buffer,
-    dst: &Buffer,
+pub fn coeff_to_extended_dev_at<B: Backend>(
+    ctx: &Ctx<B>,
+    src: &Buffer<B>,
+    dst: &Buffer<B>,
     dst_off: usize,
-    tmp: &Buffer,
+    tmp: &Buffer<B>,
     k: u32,
     ext_k: u32,
     zeta: &[Scalar; 2],
+    read_back: bool,
 ) -> Result<u64, Error> {
     if k < 1 || k > ext_k || ext_k > MAX_LOG_N {
         return Err(Error::Device(format!(
@@ -594,18 +594,19 @@ pub(crate) fn coeff_to_extended_dev_at(
             coset: Some((1usize << k, *zeta)),
             pre_mul: None,
             post_zeta: None,
+            read_back,
         },
     )
 }
 
 /// `extended_to_coeff` in place on `a[..2^ext_k]`: the inverse NTT times
-/// `divisor`, then [`encode_distribute_zeta`] with `zeta_out`. Returns the GPU
-/// time.
+/// `divisor`, then [`encode_distribute_zeta`] with `zeta_out`, for the host to
+/// read `a`. Returns the GPU time.
 #[cfg(any(test, feature = "test-support"))]
-pub(crate) fn extended_to_coeff_dev(
-    ctx: &Ctx,
-    a: &Buffer,
-    tmp: &Buffer,
+pub fn extended_to_coeff_dev<B: Backend>(
+    ctx: &Ctx<B>,
+    a: &Buffer<B>,
+    tmp: &Buffer<B>,
     ext_k: u32,
     divisor: &Scalar,
     zeta_out: &[Scalar; 2],
@@ -623,23 +624,26 @@ pub(crate) fn extended_to_coeff_dev(
             coset: None,
             pre_mul: None,
             post_zeta: Some(*zeta_out),
+            read_back: true,
         },
     )
 }
 
 /// [`encode_mul_periodic`] by `t` (the division by the vanishing polynomial),
 /// then `extended_to_coeff` as [`extended_to_coeff_dev`], fused into the same
-/// command buffers. `t` must be reduced too. Returns the GPU time.
+/// command buffers. `t` must be reduced too. `read_back`: the host reads `a`
+/// afterwards. Returns the GPU time.
 #[allow(clippy::too_many_arguments)]
-pub(crate) fn divide_extended_to_coeff_dev(
-    ctx: &Ctx,
-    a: &Buffer,
-    tmp: &Buffer,
+pub fn divide_extended_to_coeff_dev<B: Backend>(
+    ctx: &Ctx<B>,
+    a: &Buffer<B>,
+    tmp: &Buffer<B>,
     ext_k: u32,
     divisor: &Scalar,
     zeta_out: &[Scalar; 2],
-    t: &Buffer,
+    t: &Buffer<B>,
     log_tn: u32,
+    read_back: bool,
 ) -> Result<u64, Error> {
     run_job(
         ctx,
@@ -654,12 +658,13 @@ pub(crate) fn divide_extended_to_coeff_dev(
             coset: None,
             pre_mul: Some((t, log_tn)),
             post_zeta: Some(*zeta_out),
+            read_back,
         },
     )
 }
 
 /// Checks that `a` holds `n <= 2^MAX_LOG_N` scalars.
-fn elementwise_len(a: &Buffer, n: usize) -> Result<(), Error> {
+fn elementwise_len<B: Backend>(a: &Buffer<B>, n: usize) -> Result<(), Error> {
     check_len(a, n, "data")?;
     if n > 1usize << MAX_LOG_N {
         return Err(Error::Device(format!("ntt: {n} elements")));
@@ -680,9 +685,9 @@ static MASKS: [u32; 32] = {
 
 /// Encodes `a[i] *= [1, zeta[0], zeta[1]][i mod 3]` for `i < n`. `zeta` must be
 /// reduced.
-pub(crate) fn encode_distribute_zeta<'a>(
-    cmd: &mut Command<'a>,
-    a: &'a Buffer,
+pub fn encode_distribute_zeta<'a, B: Backend>(
+    cmd: &mut Command<'_, 'a, B>,
+    a: &'a Buffer<B>,
     n: usize,
     zeta: &'a [Scalar; 2],
 ) -> Result<(), Error> {
@@ -690,18 +695,14 @@ pub(crate) fn encode_distribute_zeta<'a>(
     if !zeta.iter().all(field::is_reduced) {
         return Err(Error::Unreduced("distribute_zeta: zeta".into()));
     }
-    cmd.dispatch(
-        "ntt_distribute_zeta",
-        n,
-        &[Arg::Buffer(a), Arg::value(&zeta[0]), Arg::value(&zeta[1])],
-    )
+    cmd.dispatch("ntt_distribute_zeta", n, &[Arg::Buffer(a)], zeta)
 }
 
 /// Encodes `a[i] *= c` for `i < n`. `c` must be reduced.
 #[cfg(any(test, feature = "test-support"))]
-pub(crate) fn encode_scale<'a>(
-    cmd: &mut Command<'a>,
-    a: &'a Buffer,
+pub fn encode_scale<'a, B: Backend>(
+    cmd: &mut Command<'_, 'a, B>,
+    a: &'a Buffer<B>,
     n: usize,
     c: &'a Scalar,
 ) -> Result<(), Error> {
@@ -709,16 +710,16 @@ pub(crate) fn encode_scale<'a>(
     if !field::is_reduced(c) {
         return Err(Error::Unreduced("scale: the factor".into()));
     }
-    cmd.dispatch("ntt_scale", n, &[Arg::Buffer(a), Arg::value(c)])
+    cmd.dispatch("ntt_scale", n, &[Arg::Buffer(a)], c)
 }
 
 /// Encodes `a[i] *= t[i mod 2^log_tn]` for `i < n`, as
 /// `divide_by_vanishing_poly` does with its power-of-two table.
-pub(crate) fn encode_mul_periodic<'a>(
-    cmd: &mut Command<'a>,
-    a: &'a Buffer,
+pub fn encode_mul_periodic<'a, B: Backend>(
+    cmd: &mut Command<'_, 'a, B>,
+    a: &'a Buffer<B>,
     n: usize,
-    t: &'a Buffer,
+    t: &'a Buffer<B>,
     log_tn: u32,
 ) -> Result<(), Error> {
     elementwise_len(a, n)?;
@@ -729,11 +730,8 @@ pub(crate) fn encode_mul_periodic<'a>(
     cmd.dispatch(
         "ntt_mul_periodic",
         n,
-        &[
-            Arg::Buffer(a),
-            Arg::Buffer(t),
-            Arg::value(&MASKS[log_tn as usize]),
-        ],
+        &[Arg::Buffer(a), Arg::Buffer(t)],
+        &MASKS[log_tn as usize],
     )
 }
 
@@ -744,26 +742,27 @@ pub(crate) fn encode_mul_periodic<'a>(
 /// the device ([`ctx::take_request_buffer`]), so the host copies of calls on
 /// several threads overlap each other's device work. `a` is written only after
 /// every command buffer completed. Returns the GPU time.
-fn transform_host(
+fn transform_host<B: Backend>(
     class: Class,
     a: &mut [Scalar],
     log_n: u32,
     dir: Dir,
     scale: Option<&Scalar>,
 ) -> Result<u64, Error> {
-    let ctx = ctx::context()?;
+    let ctx = ctx::context::<B>()?;
     let bytes = std::mem::size_of_val(a);
-    let mut data = ctx::take_request_buffer("ntt-data", bytes)?;
-    ctx::par_copy(&mut data.buf_mut().as_mut_slice::<Scalar>()[..a.len()], a);
+    let mut data = ctx::take_request_buffer::<B>("ntt-data", bytes)?;
+    data.buf_mut()
+        .host_write(|d: &mut [Scalar]| ctx::par_copy(&mut d[..a.len()], a))?;
     let tmp = if scratch_bytes(log_n) > 0 {
-        Some(ctx::take_request_buffer("ntt-scratch", bytes)?)
+        Some(ctx::take_request_buffer::<B>("ntt-scratch", bytes)?)
     } else {
         None
     };
     // the test panic fires with the request buffers filled and `a` unchanged
-    crate::test_switch::hook_panic(class);
+    crate::test_switch::hook_panic::<B>(class);
     let ns = {
-        let _device = ctx::lock()?;
+        let _device = ctx::lock::<B>()?;
         let d = data.buf();
         ntt_dev(
             ctx,
@@ -772,9 +771,10 @@ fn transform_host(
             log_n,
             dir,
             scale,
+            true,
         )?
     };
-    ctx::par_copy(a, &data.buf().as_slice::<Scalar>()[..a.len()]);
+    data.buf().host_read(|d: &[Scalar]| ctx::par_copy(a, &d[..a.len()]))?;
     data.give_back();
     if let Some(t) = tmp {
         t.give_back();
@@ -784,34 +784,37 @@ fn transform_host(
 
 /// Accounts the end of a hook call: served with its GPU time, or declined
 /// with the reason of the error.
-fn finish(class: Class, r: Result<u64, Error>) -> bool {
+fn finish<B: Backend>(class: Class, r: Result<u64, Error>) -> bool {
     match r {
         Ok(ns) => {
-            account::served(class, ns);
+            account::served::<B>(class, ns);
             true
         }
-        Err(e) => account::decline(class, Reason::of(&e)),
+        Err(e) => account::decline::<B>(class, Reason::of(&e)),
     }
 }
 
 /// The FFT of `a` at `omega`, natural order, in place. `false`: declined, `a`
 /// unchanged.
-pub(crate) fn fft(a: &mut [Scalar], omega: Scalar, log_n: u32) -> bool {
+pub fn fft<B: Backend>(a: &mut [Scalar], omega: Scalar, log_n: u32) -> bool {
     let Some(dir) = direction(&omega, log_n) else {
-        return account::decline(Class::Fft, Reason::Shape);
+        return account::decline::<B>(Class::Fft, Reason::Shape);
     };
-    finish(Class::Fft, transform_host(Class::Fft, a, log_n, dir, None))
+    finish::<B>(
+        Class::Fft,
+        transform_host::<B>(Class::Fft, a, log_n, dir, None),
+    )
 }
 
 /// The FFT of `a` at `omega_inv`, then each element times `divisor`, in
 /// place. `false`: declined, `a` unchanged.
-pub(crate) fn ifft(a: &mut [Scalar], omega_inv: Scalar, log_n: u32, divisor: Scalar) -> bool {
+pub fn ifft<B: Backend>(a: &mut [Scalar], omega_inv: Scalar, log_n: u32, divisor: Scalar) -> bool {
     let Some(dir) = direction(&omega_inv, log_n) else {
-        return account::decline(Class::Ifft, Reason::Shape);
+        return account::decline::<B>(Class::Ifft, Reason::Shape);
     };
-    finish(
+    finish::<B>(
         Class::Ifft,
-        transform_host(Class::Ifft, a, log_n, dir, Some(&divisor)),
+        transform_host::<B>(Class::Ifft, a, log_n, dir, Some(&divisor)),
     )
 }
 
@@ -825,19 +828,19 @@ pub mod test_support {
     use super::*;
 
     /// Runs `f` holding the device.
-    fn on_device<R>(f: impl FnOnce(&Ctx) -> Result<R, Error>) -> Result<R, String> {
-        let s = ctx::lock().map_err(|e| e.to_string())?;
+    fn on_device<B: Backend, R>(f: impl FnOnce(&Ctx<B>) -> Result<R, Error>) -> Result<R, String> {
+        let s = ctx::lock::<B>().map_err(|e| e.to_string())?;
         f(s.ctx()).map_err(|e| e.to_string())
     }
 
     /// The scratch of a `2^log_n` transform.
-    fn scratch(ctx: &Ctx, log_n: u32) -> Result<Buffer, Error> {
+    fn scratch<B: Backend>(ctx: &Ctx<B>, log_n: u32) -> Result<Buffer<B>, Error> {
         ctx.alloc(scratch_bytes(log_n))
     }
 
     /// `coeff_to_extended` through [`coeff_to_extended_dev_at`]: `coeffs` has
     /// `2^k` elements; the result `2^ext_k`.
-    pub fn coeff_to_extended(
+    pub fn coeff_to_extended<B: Backend>(
         coeffs: &[Scalar],
         k: u32,
         ext_k: u32,
@@ -846,18 +849,18 @@ pub mod test_support {
         if coeffs.len() != 1usize << k {
             return Err("length".into());
         }
-        on_device(|ctx| {
+        on_device::<B, _>(|ctx| {
             let src = ctx.upload(coeffs)?;
             let dst = ctx.alloc(SCALAR_BYTES << ext_k)?;
             let tmp = scratch(ctx, ext_k)?;
-            coeff_to_extended_dev_at(ctx, &src, &dst, 0, &tmp, k, ext_k, &zeta)?;
-            Ok(dst.as_slice::<Scalar>()[..1usize << ext_k].to_vec())
+            coeff_to_extended_dev_at(ctx, &src, &dst, 0, &tmp, k, ext_k, &zeta, true)?;
+            dst.host_read(|d: &[Scalar]| d[..1usize << ext_k].to_vec())
         })
     }
 
     /// `extended_to_coeff` through [`extended_to_coeff_dev`] (the whole
     /// `2^ext_k` result, before any truncation).
-    pub fn extended_to_coeff(
+    pub fn extended_to_coeff<B: Backend>(
         values: &[Scalar],
         ext_k: u32,
         divisor: Scalar,
@@ -866,33 +869,33 @@ pub mod test_support {
         if values.len() != 1usize << ext_k {
             return Err("length".into());
         }
-        on_device(|ctx| {
+        on_device::<B, _>(|ctx| {
             let a = ctx.upload(values)?;
             let tmp = scratch(ctx, ext_k)?;
             extended_to_coeff_dev(ctx, &a, &tmp, ext_k, &divisor, &zeta_out)?;
-            Ok(a.as_slice::<Scalar>()[..values.len()].to_vec())
+            a.host_read(|d: &[Scalar]| d[..values.len()].to_vec())
         })
     }
 
     /// [`ntt_dev`] on a copy of `values` (`inverse`: at `w^-1`).
-    pub fn ntt(
+    pub fn ntt<B: Backend>(
         values: &[Scalar],
         log_n: u32,
         inverse: bool,
         scale: Option<Scalar>,
     ) -> Result<Vec<Scalar>, String> {
         let dir = if inverse { Dir::Inverse } else { Dir::Forward };
-        on_device(|ctx| {
+        on_device::<B, _>(|ctx| {
             let a = ctx.upload(values)?;
             let tmp = scratch(ctx, log_n)?;
-            ntt_dev(ctx, &a, &tmp, log_n, dir, scale.as_ref())?;
-            Ok(a.as_slice::<Scalar>()[..values.len()].to_vec())
+            ntt_dev(ctx, &a, &tmp, log_n, dir, scale.as_ref(), true)?;
+            a.host_read(|d: &[Scalar]| d[..values.len()].to_vec())
         })
     }
 
     /// The elementwise blocks on a copy of `values` in one command buffer:
     /// distribute by `zeta`, scale by `c`, multiply by `table` periodically.
-    pub fn elementwise(
+    pub fn elementwise<B: Backend>(
         values: &[Scalar],
         zeta: [Scalar; 2],
         c: Scalar,
@@ -901,16 +904,17 @@ pub mod test_support {
         if !table.len().is_power_of_two() {
             return Err("table length".into());
         }
-        on_device(|ctx| {
+        on_device::<B, _>(|ctx| {
             let a = ctx.upload(values)?;
             let t = ctx.upload(table)?;
             let n = values.len();
             ctx.run(|cmd| {
                 encode_distribute_zeta(cmd, &a, n, &zeta)?;
                 encode_scale(cmd, &a, n, &c)?;
-                encode_mul_periodic(cmd, &a, n, &t, table.len().ilog2())
+                encode_mul_periodic(cmd, &a, n, &t, table.len().ilog2())?;
+                cmd.download(&a)
             })?;
-            Ok(a.as_slice::<Scalar>()[..n].to_vec())
+            a.host_read(|d: &[Scalar]| d[..n].to_vec())
         })
     }
 

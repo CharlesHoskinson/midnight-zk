@@ -22,22 +22,24 @@ use std::{
     },
 };
 
+use crate::backend::Backend;
+
 /// A hook class.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
-pub(crate) enum Class {
-    /// [`crate::msm_g1`].
+pub enum Class {
+    /// The G1 MSM.
     Msm,
-    /// [`crate::fft`].
+    /// The forward FFT.
     Fft,
-    /// [`crate::ifft`].
+    /// The inverse FFT.
     Ifft,
-    /// [`crate::quotient`].
+    /// The quotient.
     Quotient,
 }
 
 impl Class {
-    /// The class's name in [`crate::declines`] and the reports.
-    pub(crate) const fn name(self) -> &'static str {
+    /// The class's name in the decline report and the reports.
+    pub const fn name(self) -> &'static str {
         match self {
             Class::Msm => "msm",
             Class::Fft => "fft",
@@ -53,7 +55,7 @@ impl Class {
 
 /// A decline reason.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
-pub(crate) enum Reason {
+pub enum Reason {
     /// Stub build, no usable device, or `MIDNIGHT_METAL=off`.
     NoDevice,
     /// The size is below the class's threshold (`crate::thresholds`).
@@ -62,7 +64,7 @@ pub(crate) enum Reason {
     Shape,
     /// A scalar not below the modulus.
     Unreduced,
-    /// A buffer above `maxBufferLength`, a failed allocation, or a budget.
+    /// A buffer above the largest buffer, a failed allocation, or a budget.
     Memory,
     /// A pipeline, encoder or command buffer failed.
     DeviceError,
@@ -76,8 +78,8 @@ pub(crate) enum Reason {
 }
 
 impl Reason {
-    /// The reason's name in [`crate::declines`].
-    pub(crate) const fn name(self) -> &'static str {
+    /// The reason's name in the decline report.
+    pub const fn name(self) -> &'static str {
         match self {
             Reason::NoDevice => "no-device",
             Reason::BelowMinK => "below-min-k",
@@ -92,8 +94,7 @@ impl Reason {
     }
 
     /// The decline reason of a device-context error.
-    #[cfg(target_os = "macos")]
-    pub(crate) fn of(e: &crate::ctx::Error) -> Self {
+    pub fn of(e: &crate::ctx::Error) -> Self {
         match e {
             crate::ctx::Error::NoDevice(_) => Reason::NoDevice,
             crate::ctx::Error::Memory(_) => Reason::Memory,
@@ -103,15 +104,72 @@ impl Reason {
     }
 }
 
-/// Declines by `(class, reason)`.
-static DECLINES: Mutex<BTreeMap<(&'static str, &'static str), u64>> = Mutex::new(BTreeMap::new());
-/// Calls served, and their GPU nanoseconds, by [`Class::index`].
-static SERVED: [AtomicU64; 4] = [const { AtomicU64::new(0) }; 4];
-static NANOS: [AtomicU64; 4] = [const { AtomicU64::new(0) }; 4];
+/// The decline and service counters of one backend.
+pub(crate) struct Account {
+    /// Declines by `(class, reason)`.
+    declines: Mutex<BTreeMap<(&'static str, &'static str), u64>>,
+    /// Calls served, and their GPU nanoseconds, by [`Class::index`].
+    served: [AtomicU64; 4],
+    nanos: [AtomicU64; 4],
+    /// Host time by [`HostPhase`], in nanoseconds, and the command buffers.
+    host: [AtomicU64; 6],
+}
+
+/// A part of the host time around the device work ([`crate::HostTimes`]).
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(crate) enum HostPhase {
+    Copy = 0,
+    Zero = 1,
+    ZeroBackground = 2,
+    Run = 3,
+    RunGpu = 4,
+    Runs = 5,
+}
+
+/// Adds `n` to the host counter `p`.
+pub(crate) fn add_host<B: Backend>(p: HostPhase, n: u64) {
+    account::<B>().host[p as usize].fetch_add(n, Relaxed);
+}
+
+/// Adds the time since `t` to the host counter `p`.
+pub(crate) fn add_host_since<B: Backend>(p: HostPhase, t: std::time::Instant) {
+    add_host::<B>(p, t.elapsed().as_nanos().min(u64::MAX as u128) as u64);
+}
+
+/// The host times since the last [`reset`].
+pub fn host_times<B: Backend>() -> crate::HostTimes {
+    let h = &account::<B>().host;
+    let at = |p: HostPhase| h[p as usize].load(Relaxed);
+    crate::HostTimes {
+        copy_nanos: at(HostPhase::Copy),
+        zero_nanos: at(HostPhase::Zero),
+        zero_background_nanos: at(HostPhase::ZeroBackground),
+        run_nanos: at(HostPhase::Run),
+        run_gpu_nanos: at(HostPhase::RunGpu),
+        runs: at(HostPhase::Runs),
+    }
+}
+
+impl Account {
+    /// Every counter zero.
+    pub(crate) const fn new() -> Self {
+        Account {
+            declines: Mutex::new(BTreeMap::new()),
+            served: [const { AtomicU64::new(0) }; 4],
+            nanos: [const { AtomicU64::new(0) }; 4],
+            host: [const { AtomicU64::new(0) }; 6],
+        }
+    }
+}
+
+fn account<B: Backend>() -> &'static Account {
+    &B::host().account
+}
 
 /// Counts a decline; returns `false` (the decline value of a `bool` hook).
-pub(crate) fn decline(class: Class, reason: Reason) -> bool {
-    *DECLINES
+pub fn decline<B: Backend>(class: Class, reason: Reason) -> bool {
+    *account::<B>()
+        .declines
         .lock()
         .unwrap_or_else(|e| e.into_inner())
         .entry((class.name(), reason.name()))
@@ -120,14 +178,16 @@ pub(crate) fn decline(class: Class, reason: Reason) -> bool {
 }
 
 /// Counts a call served by the device, with its GPU time.
-pub(crate) fn served(class: Class, device_nanos: u64) {
-    SERVED[class.index()].fetch_add(1, Relaxed);
-    NANOS[class.index()].fetch_add(device_nanos, Relaxed);
+pub fn served<B: Backend>(class: Class, device_nanos: u64) {
+    let a = account::<B>();
+    a.served[class.index()].fetch_add(1, Relaxed);
+    a.nanos[class.index()].fetch_add(device_nanos, Relaxed);
 }
 
 /// Every decline: `(class, reason, count)`.
-pub(crate) fn declines() -> Vec<(&'static str, &'static str, u64)> {
-    DECLINES
+pub fn declines<B: Backend>() -> Vec<(&'static str, &'static str, u64)> {
+    account::<B>()
+        .declines
         .lock()
         .unwrap_or_else(|e| e.into_inner())
         .iter()
@@ -136,17 +196,19 @@ pub(crate) fn declines() -> Vec<(&'static str, &'static str, u64)> {
 }
 
 /// The service counters of `class`.
-pub(crate) fn class_stats(class: Class) -> crate::ClassStats {
+pub fn class_stats<B: Backend>(class: Class) -> crate::ClassStats {
+    let a = account::<B>();
     crate::ClassStats {
-        served: SERVED[class.index()].load(Relaxed),
-        device_nanos: NANOS[class.index()].load(Relaxed),
+        served: a.served[class.index()].load(Relaxed),
+        device_nanos: a.nanos[class.index()].load(Relaxed),
     }
 }
 
 /// Clears every counter.
-pub(crate) fn reset() {
-    for c in SERVED.iter().chain(NANOS.iter()) {
+pub fn reset<B: Backend>() {
+    let a = account::<B>();
+    for c in a.served.iter().chain(a.nanos.iter()).chain(a.host.iter()) {
         c.store(0, Relaxed);
     }
-    DECLINES.lock().unwrap_or_else(|e| e.into_inner()).clear();
+    a.declines.lock().unwrap_or_else(|e| e.into_inner()).clear();
 }

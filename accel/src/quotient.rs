@@ -11,7 +11,7 @@
 // See the License for the specific language governing permissions and
 // limitations under the License.
 
-//! The quotient on the device and the resident proving-key copies; the
+//! The quotient on a GPU backend and the resident proving-key copies; the
 //! counterpart of the CUDA crate's `gpu/src/quotient.rs`.
 //!
 //! [`quotient`] takes the job of the `midnight_proofs::gpu` quotient hook
@@ -26,18 +26,20 @@
 //! is read.
 //!
 //! Departures from the CUDA backend:
-//! - A Metal kernel takes at most 31 buffers, so the CUDA tables of device
-//!   pointers become flat buffers with index tables
-//!   (`shaders/include/quotient.h`).
-//! - The numerator runs over row ranges of about [`TARGET_NANOS`] each, so no
-//!   command buffer runs long.
+//! - The CUDA tables of device pointers become flat buffers with index
+//!   tables ([`tables`]): a kernel takes seven buffers (a Metal kernel takes
+//!   at most 31).
+//! - The numerator runs over row ranges of about
+//!   [`crate::Tuning::quotient_target_nanos`] each, so no command buffer runs
+//!   long.
 //! - Proving-key polynomials are also checked reduced.
 //! - Outside a request every serve checks the digests of the registered
 //!   polynomials it reads; the CUDA crate checks once per request.
 
 pub mod abi;
+pub mod digest;
 mod keys;
-mod tables;
+pub mod tables;
 
 use std::{
     ffi::c_void,
@@ -45,11 +47,11 @@ use std::{
 };
 
 use blst::{blst_fr, blst_fr_mul, blst_fr_sqr};
+pub(crate) use keys::KeyState;
 pub use keys::{
-    KeyHandle, evict_key_copies, keep_resident, key_stale, keys_registered, register_key,
-    set_keep_resident,
+    KeyHandle, begin_request, end_request, evict_key_copies, keep_resident, key_stale,
+    keys_registered, register_key, set_keep_resident,
 };
-pub(crate) use keys::{begin_request, end_request};
 
 use self::{
     abi::QuotientJobAbi,
@@ -57,17 +59,14 @@ use self::{
     tables::Tables,
 };
 use crate::{
-    MAX_LOG_N, MetalInfo, Scalar,
+    Backend, MAX_LOG_N, Scalar,
     account::{self, Class, Reason},
-    ctx::{self, Arg, Buffer, Ctx, Error, Pod},
+    ctx::{self, Arg, Buffer, Ctx, Error, Pod, Session},
     field,
     ntt::{self, Dir},
 };
 
 const SCALAR_BYTES: usize = 32;
-
-/// The GPU time one command buffer of the numerator aims at.
-const TARGET_NANOS: u64 = 250_000_000;
 
 /// The Montgomery form of one (`2^256 mod r`).
 const ONE: Scalar = [
@@ -106,24 +105,55 @@ fn pow(b: &Scalar, mut e: u64) -> Scalar {
 // ---------------------------------------------------------------------------
 // Counters and settings
 
-static RUNS: AtomicU64 = AtomicU64::new(0);
-static DECLINES: AtomicU64 = AtomicU64::new(0);
-/// [`threads`] once read (0: not yet).
-static THREADS: AtomicU32 = AtomicU32::new(0);
-/// The admission's memory limit in bytes besides the device's (tests).
-static MEMORY_LIMIT: AtomicU64 = AtomicU64::new(u64::MAX);
-/// The GPU time a numerator command buffer aims at (tests lower it).
-static TARGET: AtomicU64 = AtomicU64::new(TARGET_NANOS);
+/// The quotient state of one backend: counters and settings.
+pub(crate) struct QuotientState {
+    runs: AtomicU64,
+    declines: AtomicU64,
+    /// [`threads`] once read (0: not yet).
+    threads: AtomicU32,
+    /// The admission's memory limit in bytes besides the device's (tests).
+    memory_limit: AtomicU64,
+    /// The GPU time a numerator command buffer aims at (tests lower it; 0:
+    /// the backend's tuning).
+    target: AtomicU64,
+    /// The placement counts of the last quotient served.
+    #[cfg(any(test, feature = "test-support"))]
+    last_stages: std::sync::Mutex<Option<QuotientStages>>,
+}
+
+impl QuotientState {
+    /// Every counter zero, every setting at its default.
+    pub(crate) const fn new() -> Self {
+        QuotientState {
+            runs: AtomicU64::new(0),
+            declines: AtomicU64::new(0),
+            threads: AtomicU32::new(0),
+            memory_limit: AtomicU64::new(u64::MAX),
+            target: AtomicU64::new(0),
+            #[cfg(any(test, feature = "test-support"))]
+            last_stages: std::sync::Mutex::new(None),
+        }
+    }
+}
+
+fn state<B: Backend>() -> &'static QuotientState {
+    &B::host().quotient
+}
+
+/// The GPU time one command buffer of the numerator aims at.
+fn target<B: Backend>() -> u64 {
+    match state::<B>().target.load(Relaxed) {
+        0 => B::tuning().quotient_target_nanos.max(1),
+        t => t,
+    }
+}
 
 /// (quotients computed on the device, quotient jobs declined) since process
 /// start.
-pub fn quotient_counts() -> (u64, u64) {
-    (RUNS.load(Relaxed), DECLINES.load(Relaxed))
+pub fn quotient_counts<B: Backend>() -> (u64, u64) {
+    let q = state::<B>();
+    (q.runs.load(Relaxed), q.declines.load(Relaxed))
 }
-
-/// The default of [`threads`]: near the measured best numerator time while
-/// keeping the scratch at `nslots * 2 MiB`.
-const DEFAULT_THREADS: u32 = 1 << 16;
 
 /// A thread count rounded down to a multiple of 256 in `[256, 2^24]`.
 fn normalize_threads(t: u64) -> u32 {
@@ -131,25 +161,26 @@ fn normalize_threads(t: u64) -> u32 {
 }
 
 /// The threads of one numerator dispatch, which is also the scratch slot
-/// stride: `MIDNIGHT_METAL_QUOTIENT_THREADS`, else 2^16; a multiple of 256 in
-/// `[256, 2^24]`.
-pub fn threads() -> u32 {
-    let t = THREADS.load(Relaxed);
+/// stride: `{ENV_PREFIX}_QUOTIENT_THREADS`, else
+/// [`crate::Tuning::quotient_threads`]; a multiple of 256 in `[256, 2^24]`.
+pub fn threads<B: Backend>() -> u32 {
+    let q = state::<B>();
+    let t = q.threads.load(Relaxed);
     if t != 0 {
         return t;
     }
-    let t = std::env::var("MIDNIGHT_METAL_QUOTIENT_THREADS")
+    let t = std::env::var(format!("{}_QUOTIENT_THREADS", B::ENV_PREFIX))
         .ok()
         .and_then(|e| e.trim().parse::<u64>().ok())
-        .map_or(DEFAULT_THREADS, normalize_threads);
-    let _ = THREADS.compare_exchange(0, t, Relaxed, Relaxed);
-    THREADS.load(Relaxed)
+        .map_or(B::tuning().quotient_threads, normalize_threads);
+    let _ = q.threads.compare_exchange(0, t, Relaxed, Relaxed);
+    q.threads.load(Relaxed)
 }
 
 /// The dispatch threads (the scratch stride) for an extended domain of
 /// `2^ext_k` rows.
-fn stride(ext_k: u32) -> usize {
-    (threads() as usize).min(1usize << ext_k)
+fn stride<B: Backend>(ext_k: u32) -> usize {
+    (threads::<B>() as usize).min(1usize << ext_k)
 }
 
 // ---------------------------------------------------------------------------
@@ -223,14 +254,14 @@ impl Need {
         self.buffers().iter().sum()
     }
 
-    /// The largest single buffer (against `maxBufferLength`).
+    /// The largest single buffer (against the device's largest buffer).
     fn biggest(&self) -> usize {
         self.buffers().into_iter().max().unwrap_or(0)
     }
 
-    /// Whether the call fits the free device memory and `maxBufferLength`.
-    fn fits(&self, info: &MetalInfo) -> bool {
-        self.total() as u64 <= memory_limit() && self.biggest() as u64 <= info.max_buffer_length
+    /// Whether the call fits the free device memory and the largest buffer.
+    fn fits<B: Backend>(&self, c: &Ctx<B>) -> bool {
+        self.total() as u64 <= memory_limit::<B>() && self.biggest() as u64 <= c.max_buffer_len()
     }
 }
 
@@ -239,7 +270,12 @@ impl Need {
 /// resident copy holds only the job's key polynomials and ignores the few KiB
 /// of program words and uniforms. The arguments are the fields of
 /// `midnight_proofs::gpu::QuotientShape`.
-pub fn need_bytes(ext_k: u32, proof_polys: usize, key_polys: usize, nslots: u32) -> usize {
+pub fn need_bytes<B: Backend>(
+    ext_k: u32,
+    proof_polys: usize,
+    key_polys: usize,
+    nslots: u32,
+) -> usize {
     let e = SCALAR_BYTES << ext_k;
     let mut worst = 0;
     for k in 1..=ext_k.max(1) {
@@ -251,7 +287,7 @@ pub fn need_bytes(ext_k: u32, proof_polys: usize, key_polys: usize, nslots: u32)
                 ntemp: key_polys - resident,
                 lent_new: resident * e,
                 restale: if resident > 0 { key_polys } else { 0 },
-                slots_bytes: (nslots as usize).max(1) * stride(ext_k) * SCALAR_BYTES,
+                slots_bytes: (nslots as usize).max(1) * stride::<B>(ext_k) * SCALAR_BYTES,
                 tmp_new: ntt::scratch_bytes(ext_k),
                 words_bytes: 0,
                 uniforms_bytes: 0,
@@ -265,12 +301,12 @@ pub fn need_bytes(ext_k: u32, proof_polys: usize, key_polys: usize, nslots: u32)
 }
 
 /// The [`Need`] of a planned call.
-fn need_of(
+fn need_of<B: Backend>(
     j: &QuotientJobAbi,
     tab: &Tables<'_>,
     t_inv: &[Scalar],
-    plan: &Plan,
-    s: &ctx::Session,
+    plan: &Plan<B>,
+    s: &Session<B>,
     inverse: bool,
 ) -> Need {
     let ntemp = plan.places.iter().filter(|p| **p == Place::Temp).count();
@@ -289,7 +325,7 @@ fn need_of(
         } else {
             0
         },
-        slots_bytes: (j.nslots as usize).max(1) * stride(j.ext_k) * SCALAR_BYTES,
+        slots_bytes: (j.nslots as usize).max(1) * stride::<B>(j.ext_k) * SCALAR_BYTES,
         // a shorter one is replaced by a new one
         tmp_new: if tmp_need > 0 && tmp_have < tmp_need {
             tmp_need
@@ -305,9 +341,9 @@ fn need_of(
 
 /// Bytes this call may allocate: the free working set (idle pool buffers
 /// included) or the test limit, whichever is smaller.
-fn memory_limit() -> u64 {
-    let free = ctx::mem_info().map_or(0, |(free, _)| free as u64);
-    free.min(MEMORY_LIMIT.load(Relaxed))
+fn memory_limit<B: Backend>() -> u64 {
+    let free = ctx::mem_info::<B>().map_or(0, |(free, _)| free as u64);
+    free.min(state::<B>().memory_limit.load(Relaxed))
 }
 
 // ---------------------------------------------------------------------------
@@ -326,9 +362,6 @@ pub struct QuotientStages {
     pub key_copies_made: u32,
 }
 
-#[cfg(any(test, feature = "test-support"))]
-static LAST_STAGES: std::sync::Mutex<Option<QuotientStages>> = std::sync::Mutex::new(None);
-
 /// Test entry points (not a stable interface; [`test_support::numerator`]
 /// returns witness-dependent values).
 #[cfg(any(test, feature = "test-support"))]
@@ -340,19 +373,19 @@ pub mod test_support {
     ///
     /// # Safety
     /// As [`crate::quotient`].
-    pub unsafe fn need_bytes_job(job: *const c_void) -> Result<usize, &'static str> {
-        if job.is_null() || !crate::device() {
+    pub unsafe fn need_bytes_job<B: Backend>(job: *const c_void) -> Result<usize, &'static str> {
+        if job.is_null() || !crate::device::<B>() {
             return Err("no-device");
         }
         // SAFETY: the caller's contract.
         let j = unsafe { &*(job as *const QuotientJobAbi) };
-        checked(j, None).map_err(|r| r.name())?;
+        checked::<B>(j, None).map_err(|r| r.name())?;
         // SAFETY: the caller's contract; `checked` has passed.
         let tab = unsafe { Tables::new(j) }.map_err(|r| r.name())?;
         // SAFETY: the caller's contract.
         let t_inv = unsafe { abi::slice(j.t_inv, j.nt_inv) };
-        let s = ctx::lock().map_err(|e| err(e).name())?;
-        let mut plan = keys::plan(&tab.keys, 1usize << j.ext_k);
+        let s = ctx::lock::<B>().map_err(|e| err(e).name())?;
+        let mut plan = keys::plan::<B>(&tab.keys, 1usize << j.ext_k);
         let need = need_of(j, &tab, t_inv, &plan, &s, true);
         drop(s);
         if let Some(l) = plan.lent.take() {
@@ -362,25 +395,27 @@ pub mod test_support {
     }
 
     /// The placement counts of the last quotient served.
-    pub fn last_stages() -> Option<QuotientStages> {
-        *LAST_STAGES.lock().unwrap_or_else(|e| e.into_inner())
+    pub fn last_stages<B: Backend>() -> Option<QuotientStages> {
+        *state::<B>().last_stages.lock().unwrap_or_else(|e| e.into_inner())
     }
 
     /// A device-memory limit for the admission (`None`: the free working
     /// set).
-    pub fn set_memory_limit(limit: Option<u64>) {
-        MEMORY_LIMIT.store(limit.unwrap_or(u64::MAX), Relaxed);
+    pub fn set_memory_limit<B: Backend>(limit: Option<u64>) {
+        state::<B>().memory_limit.store(limit.unwrap_or(u64::MAX), Relaxed);
     }
 
     /// Sets the numerator's target GPU time per command buffer (`None`:
-    /// [`TARGET_NANOS`]).
-    pub fn set_target_nanos(ns: Option<u64>) {
-        TARGET.store(ns.unwrap_or(TARGET_NANOS).max(1), Relaxed);
+    /// the backend's tuning).
+    pub fn set_target_nanos<B: Backend>(ns: Option<u64>) {
+        state::<B>().target.store(ns.map_or(0, |n| n.max(1)), Relaxed);
     }
 
     /// Sets the dispatch threads ([`threads`]); `None` restores the default.
-    pub fn set_threads(t: Option<u32>) {
-        THREADS.store(t.map_or(0, |t| normalize_threads(t.into())), Relaxed);
+    pub fn set_threads<B: Backend>(t: Option<u32>) {
+        state::<B>()
+            .threads
+            .store(t.map_or(0, |t| normalize_threads(t.into())), Relaxed);
     }
 
     /// The numerator of a job, all `2^ext_k` values read back, for testing the
@@ -388,15 +423,15 @@ pub mod test_support {
     ///
     /// # Safety
     /// As [`crate::quotient`].
-    pub unsafe fn numerator(job: *const c_void) -> Result<Vec<Scalar>, &'static str> {
-        if job.is_null() || !crate::device() {
+    pub unsafe fn numerator<B: Backend>(job: *const c_void) -> Result<Vec<Scalar>, &'static str> {
+        if job.is_null() || !crate::device::<B>() {
             return Err("no-device");
         }
         // SAFETY: the caller's contract.
         let j = unsafe { &*(job as *const QuotientJobAbi) };
         let mut nu = Vec::new();
         // SAFETY: the caller's contract.
-        unsafe { run(j, &mut [], Some(&mut nu)) }.map(|_| nu).map_err(|r| r.name())
+        unsafe { run::<B>(j, &mut [], Some(&mut nu)) }.map(|_| nu).map_err(|r| r.name())
     }
 }
 
@@ -409,23 +444,24 @@ pub mod test_support {
 /// # Safety
 /// `job` is not null and points to a valid `QuotientJobAbi` whose pointers
 /// are valid for reads of their counts and not written during the call.
-pub(crate) unsafe fn quotient(job: *const c_void, out: &mut [Scalar]) -> bool {
+pub unsafe fn quotient<B: Backend>(job: *const c_void, out: &mut [Scalar]) -> bool {
     // SAFETY: the caller's contract.
     let j = unsafe { &*(job as *const QuotientJobAbi) };
     // SAFETY: the caller's contract.
-    match unsafe { run(j, out, None) } {
+    match unsafe { run::<B>(j, out, None) } {
         Ok((ns, _stages)) => {
+            let q = state::<B>();
             #[cfg(any(test, feature = "test-support"))]
             {
-                *LAST_STAGES.lock().unwrap_or_else(|e| e.into_inner()) = Some(_stages);
+                *q.last_stages.lock().unwrap_or_else(|e| e.into_inner()) = Some(_stages);
             }
-            RUNS.fetch_add(1, Relaxed);
-            account::served(Class::Quotient, ns);
+            q.runs.fetch_add(1, Relaxed);
+            account::served::<B>(Class::Quotient, ns);
             true
         }
         Err(r) => {
-            DECLINES.fetch_add(1, Relaxed);
-            account::decline(Class::Quotient, r)
+            state::<B>().declines.fetch_add(1, Relaxed);
+            account::decline::<B>(Class::Quotient, r)
         }
     }
 }
@@ -440,7 +476,7 @@ fn cube_root_shift(zeta: [Scalar; 2], zeta_out: [Scalar; 2]) -> bool {
 
 /// The header checks, in the CUDA crate's order and with its reasons.
 /// `out_len` must be the job's `len` (`None`: the numerator test path).
-fn checked(j: &QuotientJobAbi, out_len: Option<usize>) -> Result<(), Reason> {
+fn checked<B: Backend>(j: &QuotientJobAbi, out_len: Option<usize>) -> Result<(), Reason> {
     if j.abi != abi::QUOTIENT_ABI || j.k < 1 || j.k > j.ext_k || j.ext_k > MAX_LOG_N {
         return Err(Reason::Shape);
     }
@@ -463,7 +499,7 @@ fn checked(j: &QuotientJobAbi, out_len: Option<usize>) -> Result<(), Reason> {
     if !cube_root_shift(j.zeta, j.zeta_out) {
         return Err(Reason::Shape);
     }
-    if j.ext_k < crate::thresholds().quotient {
+    if j.ext_k < crate::thresholds::<B>().quotient {
         return Err(Reason::BelowMinK);
     }
     let en = 1usize << j.ext_k;
@@ -567,7 +603,10 @@ struct Params {
     l0: u32,
     l_last: u32,
     l_active: u32,
-    pad: [u32; 5],
+    /// The words of the job's tables: no kernel reads past them (Metal's
+    /// kernel ignores it).
+    nwords: u32,
+    pad: [u32; 4],
     y: Scalar,
     beta: Scalar,
     gamma: Scalar,
@@ -586,25 +625,24 @@ const _: () = assert!(size_of::<Params>() == 96 + 7 * 32);
 ///
 /// # Safety
 /// As [`quotient`].
-unsafe fn run(
+unsafe fn run<B: Backend>(
     j: &QuotientJobAbi,
     out: &mut [Scalar],
     numerator: Option<&mut Vec<Scalar>>,
 ) -> Result<(u64, QuotientStages), Reason> {
-    checked(j, numerator.is_none().then_some(out.len()))?;
+    checked::<B>(j, numerator.is_none().then_some(out.len()))?;
     // SAFETY: the caller's contract; `checked` has passed.
     let mut tab = unsafe { Tables::new(j)? };
     // SAFETY: the caller's contract.
     let t_inv = unsafe { abi::slice(j.t_inv, j.nt_inv) };
     check_transform_inputs(j, t_inv)?;
 
-    let mut s = ctx::lock().map_err(err)?;
-    let info = crate::present().ok_or(Reason::NoDevice)?;
-    let mut plan = keys::plan(&tab.keys, 1usize << j.ext_k);
+    let mut s = ctx::lock::<B>().map_err(err)?;
+    let mut plan = keys::plan::<B>(&tab.keys, 1usize << j.ext_k);
     // every buffer this call can allocate (the sum of `need_bytes`)
     let need = need_of(j, &tab, t_inv, &plan, &s, numerator.is_none());
-    let r = if need.fits(info) {
-        device_run(j, &mut tab, t_inv, &mut plan, &mut s, info, out, numerator)
+    let r = if need.fits(s.ctx()) {
+        device_run(j, &mut tab, t_inv, &mut plan, &mut s, out, numerator)
     } else {
         Err(Reason::Memory)
     };
@@ -618,21 +656,20 @@ unsafe fn run(
 
 /// The device steps of an admitted job.
 #[allow(clippy::too_many_arguments)]
-fn device_run(
+fn device_run<B: Backend>(
     j: &QuotientJobAbi,
     tab: &mut Tables<'_>,
     t_inv: &[Scalar],
-    plan: &mut Plan,
-    s: &mut ctx::Session,
-    info: &MetalInfo,
+    plan: &mut Plan<B>,
+    s: &mut Session<B>,
     out: &mut [Scalar],
     numerator: Option<&mut Vec<Scalar>>,
 ) -> Result<(u64, QuotientStages), Reason> {
     let (k, ext_k) = (j.k, j.ext_k);
     let (n, en) = (1usize << k, 1usize << ext_k);
     let ebytes = SCALAR_BYTES << ext_k;
-    let threads = stride(ext_k);
-    let c: &'static Ctx = s.ctx();
+    let threads = stride::<B>(ext_k);
+    let c: &'static Ctx<B> = s.ctx();
     let mut stages = QuotientStages::default();
     let mut gpu = 0u64;
 
@@ -652,7 +689,7 @@ fn device_run(
     {
         l.buf = Some(c.alloc_pooled(l.npolys * ebytes).map_err(err)?);
     }
-    let tmp_ref: Option<&Buffer> = if tmp_need > 0 {
+    let tmp_ref: Option<&Buffer<B>> = if tmp_need > 0 {
         s.get_scratch("quotient-tmp")
     } else {
         None
@@ -666,7 +703,7 @@ fn device_run(
     // the coset; the first proof polynomial is copied first, as the device
     // waits for it
     if let Some(first) = tab.proof.first()
-        && !copy_checked(src_a.as_mut_slice::<Scalar>(), first)
+        && !src_a.host_write(|d: &mut [Scalar]| copy_checked(d, first)).map_err(err)?
     {
         return Err(Reason::Unreduced);
     }
@@ -697,11 +734,11 @@ fn device_run(
     if key_work.digests.len() != plan.check.len() {
         return Err(Reason::DeviceError);
     }
-    ctx::release_later(vec![src_a, src_b]);
+    ctx::release_later::<B>(vec![src_a, src_b]);
 
     // the digests settle the placement: a stale polynomial is uploaded
     if keys::settle(plan, &tab.keys, &key_work.digests) {
-        key_tmp = upload_again(c, info, &tab.keys, &plan.places, en)?;
+        key_tmp = upload_again(c, &tab.keys, &plan.places, en)?;
     }
     let (bank_of, ntemp) = banks(&plan.places);
     let lagrange = tab.place_keys(&bank_of);
@@ -725,8 +762,8 @@ fn device_run(
         c.upload(&tab.uniforms)
     }
     .map_err(err)?;
-    let key_res: &Buffer = plan.lent.as_ref().and_then(|l| l.buf.as_ref()).unwrap_or(&dummy);
-    let key_tmp_b: &Buffer = if ntemp > 0 { &key_tmp } else { &dummy };
+    let key_res: &Buffer<B> = plan.lent.as_ref().and_then(|l| l.buf.as_ref()).unwrap_or(&dummy);
+    let key_tmp_b: &Buffer<B> = if ntemp > 0 { &key_tmp } else { &dummy };
     let params = numerator_params(j, tab, lagrange, threads);
     let (ns, runs) = numerator_ranges(
         c,
@@ -743,12 +780,12 @@ fn device_run(
     }
     // zeroed on the CPU in the background while the device divides and
     // transforms; `end_request` waits for it
-    ctx::release_later(vec![scratch, proof_buf, key_tmp, words, unis]);
+    ctx::release_later::<B>(vec![scratch, proof_buf, key_tmp, words, unis]);
 
     if let Some(v) = numerator {
         v.clear();
-        v.extend_from_slice(&nu.as_slice::<Scalar>()[..en]);
-        ctx::release_later(vec![nu]);
+        nu.host_read(|d: &[Scalar]| v.extend_from_slice(&d[..en])).map_err(err)?;
+        ctx::release_later::<B>(vec![nu]);
         return Ok((gpu, stages));
     }
 
@@ -764,19 +801,20 @@ fn device_run(
         &j.zeta_out,
         &tinv,
         t_inv.len().ilog2(),
+        true,
     )
     .map_err(err)?;
 
     // Write `out` last: a panic becomes a decline, which must leave `out`
-    // unchanged, so everything that can fail or panic happens first. What
-    // follows the copy cannot fail: `ctx::par_copy` and `ctx::release_later`
-    // never panic, and the rest only stores counters and takes poison-tolerant
-    // locks.
+    // unchanged, so everything that can fail or panic happens first. The host
+    // view of `nu` fails, if at all, before the copy. What follows the copy
+    // cannot fail: `ctx::par_copy` and `ctx::release_later` never panic, and
+    // the rest only stores counters and takes poison-tolerant locks.
     drop(tinv);
     debug_assert!(plan.lent.is_none());
-    let src = &nu.as_slice::<Scalar>()[..out.len()];
-    ctx::par_copy(out, src);
-    ctx::release_later(vec![nu]);
+    nu.host_read(|src: &[Scalar]| ctx::par_copy(out, &src[..out.len()]))
+        .map_err(err)?;
+    ctx::release_later::<B>(vec![nu]);
     Ok((gpu, stages))
 }
 
@@ -798,26 +836,20 @@ struct KeyWork {
 /// copy's slots (checking them reduced), and hashes the polynomials of
 /// `check`. A filled slot is hashed over the bytes copied into it, so a slot is
 /// only marked present at [`keys::settle`] with verified content.
-fn copy_and_hash_keys(
+fn copy_and_hash_keys<B: Backend>(
     keys: &[&[Scalar]],
     places: &[Place],
     check: &[usize],
     fills: &[bool],
-    lent: &mut Option<Lent>,
-    key_tmp: &mut Buffer,
+    lent: &mut Option<Lent<B>>,
+    key_tmp: &mut Buffer<B>,
     en: usize,
 ) -> KeyWork {
     let host: Vec<&[Scalar]> = check.iter().filter(|&&i| !fills[i]).map(|&i| keys[i]).collect();
-    let (host_digests, reduced, filled) = std::thread::scope(|sc| {
-        let dh = sc.spawn(|| keys::digest_many(&host));
-        // `key_tmp` holds one coset per `Temp` place, the lent copy one per
-        // slot (`keys::plan` places only slots below its `npolys`, and the
-        // copy is `npolys` cosets long)
-        let tmp = key_tmp.as_mut_slice::<Scalar>();
-        // `fills` implies a lent copy, allocated by `device_run`; without one
-        // the slot's digest is missing and the call declines
-        let mut slots =
-            lent.as_mut().and_then(|l| l.buf.as_mut()).map(|b| b.as_mut_slice::<Scalar>());
+    // the copies into `tmp`, one coset per `Temp` place, and into the lent
+    // copy's `slots`, one per slot (`keys::plan` places only slots below its
+    // `npolys`, and the copy is `npolys` cosets long)
+    let copy = |tmp: &mut [Scalar], mut slots: Option<&mut [Scalar]>| {
         let (mut ti, mut reduced, mut filled) = (0, true, Vec::new());
         for (i, (p, pl)) in keys.iter().zip(places).enumerate() {
             match pl {
@@ -838,8 +870,28 @@ fn copy_and_hash_keys(
                 break;
             }
         }
-        (dh.join().unwrap_or_default(), reduced, filled)
+        (reduced, filled)
+    };
+    let (host_digests, copied) = std::thread::scope(|sc| {
+        let dh = sc.spawn(|| keys::digest_many(&host));
+        // `fills` implies a lent copy, allocated by `device_run`; without one
+        // the slot's digest is missing and the call declines
+        let copied = key_tmp.host_write(|tmp: &mut [Scalar]| {
+            match lent.as_mut().and_then(|l| l.buf.as_mut()) {
+                Some(b) => b.host_write(|slots: &mut [Scalar]| copy(tmp, Some(slots))),
+                None => Ok(copy(tmp, None)),
+            }
+        });
+        (dh.join().unwrap_or_default(), copied.and_then(|r| r))
     });
+    // a host view that could not be made: no digest, the call declines
+    let Ok((reduced, filled)) = copied else {
+        return KeyWork {
+            digests: Vec::new(),
+            reduced: true,
+            filled: Vec::new(),
+        };
+    };
     if !reduced {
         return KeyWork {
             digests: Vec::new(),
@@ -847,13 +899,16 @@ fn copy_and_hash_keys(
             filled,
         };
     }
+    // the slots are hashed over the bytes the device gets: the buffer, or the
+    // shadow the next run copies in
     let slot_digests = match lent.as_ref().and_then(|l| l.buf.as_ref()) {
-        Some(b) => {
-            let b = b.as_slice::<Scalar>();
-            let in_slots: Vec<&[Scalar]> =
-                filled.iter().map(|s| &b[s * en..(s + 1) * en]).collect();
-            keys::digest_many(&in_slots)
-        }
+        Some(b) => b
+            .host_read(|b: &[Scalar]| {
+                let in_slots: Vec<&[Scalar]> =
+                    filled.iter().map(|s| &b[s * en..(s + 1) * en]).collect();
+                keys::digest_many(&in_slots)
+            })
+            .unwrap_or_default(),
         None => Vec::new(),
     };
     // in the order of `check` (both lists follow it)
@@ -870,13 +925,13 @@ fn copy_and_hash_keys(
 /// Moves the proof's polynomials to the extended coset, polynomial `i` into
 /// place `i` of `cosets`. The CPU copies polynomial `i + 1` (checking it
 /// reduced) while the device transforms polynomial `i`. Returns the GPU time.
-fn proof_cosets(
-    c: &Ctx,
+fn proof_cosets<B: Backend>(
+    c: &Ctx<B>,
     j: &QuotientJobAbi,
     proof: &[&[Scalar]],
-    src: [&mut Buffer; 2],
-    cosets: &Buffer,
-    tmp: &Buffer,
+    src: [&mut Buffer<B>; 2],
+    cosets: &Buffer<B>,
+    tmp: &Buffer<B>,
 ) -> Result<u64, Reason> {
     let [src_a, src_b] = src;
     let (k, ext_k) = (j.k, j.ext_k);
@@ -890,9 +945,22 @@ fn proof_cosets(
         };
         let following = proof.get(i + 1).copied();
         let (r, copied) = std::thread::scope(|sc| {
-            let h = following.map(|f| sc.spawn(move || copy_checked(next.as_mut_slice(), f)));
-            let r =
-                ntt::coeff_to_extended_dev_at(c, cur, cosets, i * ebytes, tmp, k, ext_k, &j.zeta);
+            let h = following.map(|f| {
+                sc.spawn(move || {
+                    next.host_write(|d: &mut [Scalar]| copy_checked(d, f)).unwrap_or(false)
+                })
+            });
+            let r = ntt::coeff_to_extended_dev_at(
+                c,
+                cur,
+                cosets,
+                i * ebytes,
+                tmp,
+                k,
+                ext_k,
+                &j.zeta,
+                false,
+            );
             (r, h.is_none_or(|h| h.join().unwrap_or(false)))
         });
         ns += r.map_err(err)?;
@@ -906,26 +974,29 @@ fn proof_cosets(
 /// The uploads again after [`keys::settle`] moved a stale polynomial out of
 /// its slot. The call's other buffers already exist, so this one is held to
 /// the limits alone.
-fn upload_again(
-    c: &Ctx,
-    info: &MetalInfo,
+fn upload_again<B: Backend>(
+    c: &Ctx<B>,
     keys: &[&[Scalar]],
     places: &[Place],
     en: usize,
-) -> Result<Buffer, Reason> {
+) -> Result<Buffer<B>, Reason> {
     let (_, nt) = banks(places);
     let bytes = nt * en * SCALAR_BYTES;
-    if bytes as u64 > memory_limit() || bytes as u64 > info.max_buffer_length {
+    if bytes as u64 > memory_limit::<B>() || bytes as u64 > c.max_buffer_len() {
         return Err(Reason::Memory);
     }
     let mut kt = c.alloc_pooled(bytes).map_err(err)?;
-    let ks = kt.as_mut_slice::<Scalar>();
-    let temps = keys.iter().zip(places).filter(|(_, pl)| **pl == Place::Temp);
-    // `kt` holds one coset per `Temp` place
-    for (ti, (p, _)) in temps.enumerate() {
-        if !copy_checked(&mut ks[ti * en..(ti + 1) * en], p) {
-            return Err(Reason::Unreduced);
-        }
+    let reduced = kt
+        .host_write(|ks: &mut [Scalar]| {
+            let temps = keys.iter().zip(places).filter(|(_, pl)| **pl == Place::Temp);
+            // `kt` holds one coset per `Temp` place
+            temps
+                .enumerate()
+                .all(|(ti, (p, _))| copy_checked(&mut ks[ti * en..(ti + 1) * en], p))
+        })
+        .map_err(err)?;
+    if !reduced {
+        return Err(Reason::Unreduced);
     }
     Ok(kt)
 }
@@ -973,6 +1044,7 @@ fn numerator_params(
         l0: lagrange[0],
         l_last: lagrange[1],
         l_active: lagrange[2],
+        nwords: tab.words.len() as u32,
         y: j.y,
         beta: j.beta,
         gamma: j.gamma,
@@ -987,16 +1059,16 @@ fn numerator_params(
 /// The numerator over `en` rows, one command buffer per row range. The first
 /// range is sized from an estimate, the next ones from the measured time per
 /// row. Returns the GPU time and the command buffers.
-fn numerator_ranges(
-    c: &Ctx,
-    bufs: [&Buffer; 7],
+fn numerator_ranges<B: Backend>(
+    c: &Ctx<B>,
+    bufs: [&Buffer<B>; 7],
     mut p: Params,
     cost_per_row: u64,
     en: usize,
     threads: usize,
 ) -> Result<(u64, u32), Reason> {
     let cost = cost_per_row.max(1) + 8;
-    let target = TARGET.load(Relaxed);
+    let target = target::<B>();
     let mut rows = ((target / 2) / cost).max(threads as u64) as usize;
     let (mut row0, mut total, mut runs) = (0usize, 0u64, 0u32);
     while row0 < en {
@@ -1018,8 +1090,8 @@ fn numerator_ranges(
                         Arg::Buffer(bufs[4]),
                         Arg::Buffer(bufs[5]),
                         Arg::Buffer(bufs[6]),
-                        Arg::value(&p),
                     ],
+                    &p,
                 )
             })
             .map_err(err)?
