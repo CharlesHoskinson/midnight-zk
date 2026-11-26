@@ -29,9 +29,13 @@
 //! every size up to `2^28` with at most one product per factor. They are
 //! public and stay on the device for the life of the process.
 
-use std::sync::OnceLock;
+use std::sync::{
+    OnceLock,
+    atomic::{AtomicBool, AtomicUsize, Ordering::Relaxed},
+};
 
 use blst::{blst_fr, blst_fr_inverse, blst_fr_mul, blst_fr_sqr};
+use rayon::prelude::*;
 
 use crate::{
     MAX_LOG_N, Scalar,
@@ -599,6 +603,116 @@ pub fn coeff_to_extended_dev_at<B: Backend>(
     )
 }
 
+/// Batched `coeff_to_extended` on the device for `count` polynomials whose
+/// `2^k` coefficients are already placed at the start of each `2^ext_k`-scalar
+/// slot in `cosets`. Encodes all `count` transforms into as few command buffers
+/// as [`crate::Tuning::ntt_run_budget`] allows (typically one), eliminating
+/// per-polynomial fence stalls. Requires an even pass count (`11 <= ext_k <= 20`,
+/// i.e. 2 passes) so pass 0 reads `cosets[i]` into `tmp` and pass 1 writes
+/// `cosets[i]` without aliasing.
+#[allow(clippy::too_many_arguments)]
+pub fn coeff_to_extended_batch_in_place<B: Backend>(
+    ctx: &Ctx<B>,
+    cosets: &Buffer<B>,
+    count: usize,
+    tmp: &Buffer<B>,
+    k: u32,
+    ext_k: u32,
+    zeta: &[Scalar; 2],
+) -> Result<u64, Error> {
+    if count == 0 {
+        return Ok(0);
+    }
+    if !zeta.iter().all(field::is_reduced) {
+        return Err(Error::Unreduced("coeff_to_extended_batch: zeta".into()));
+    }
+    if k < 1 || k > ext_k || ext_k > MAX_LOG_N {
+        return Err(Error::Device(format!(
+            "coeff_to_extended_batch: dimensions k {k}, ext_k {ext_k}"
+        )));
+    }
+    let radices = plan(ext_k);
+    let passes = radices.len();
+    if passes == 0 || !passes.is_multiple_of(2) {
+        return Err(Error::Device(
+            "coeff_to_extended_batch: requires an even pass count".into(),
+        ));
+    }
+    let n = 1usize << ext_k;
+    let ebytes = n * SCALAR_BYTES;
+    if std::ptr::eq(cosets, tmp) {
+        return Err(Error::Device(
+            "coeff_to_extended_batch: cosets aliases scratch".into(),
+        ));
+    }
+    check_len(cosets, count * n, "cosets")?;
+    check_len(tmp, n, "scratch")?;
+
+    let tables = tables(ctx)?;
+    let d = Dir::Forward.index();
+    let hi = &tables.hi[d];
+    let lo = &tables.lo[d];
+
+    let dummy_job = Job {
+        log_n: ext_k,
+        dir: Dir::Forward,
+        src: cosets,
+        dst: cosets,
+        dst_off: 0,
+        tmp,
+        scale: None,
+        coset: Some((1usize << k, *zeta)),
+        pre_mul: None,
+        post_zeta: None,
+        read_back: false,
+    };
+    let params = pass_params(&dummy_job, &radices, false);
+    let per_poly_cost: u64 = params
+        .iter()
+        .map(|p| (n as u64) * (u64::from(p.log_r) / 2 + 1 + 2 * u64::from(p.flags & F_TWIDDLE)))
+        .sum();
+    let budget = B::tuning().ntt_run_budget;
+    let per_cb = (budget / per_poly_cost.max(1)).max(1) as usize;
+
+    let mut ns = 0u64;
+    let mut i0 = 0usize;
+    while i0 < count {
+        let i1 = (i0 + per_cb).min(count);
+        ns += ctx
+            .run(|cmd| {
+                for poly in i0..i1 {
+                    let off = poly * ebytes;
+                    for (q, p) in params.iter().enumerate() {
+                        let ((src, src_off), (dst, dst_off)) = if q % 2 == 0 {
+                            ((cosets, off), (tmp, 0))
+                        } else {
+                            ((tmp, 0), (cosets, off))
+                        };
+                        let args = [
+                            Arg::BufferAt(src, src_off),
+                            Arg::BufferAt(dst, dst_off),
+                            Arg::Buffer(hi),
+                            Arg::Buffer(lo),
+                        ];
+                        let e_log = p.log_r + p.log_g;
+                        cmd.dispatch_groups(
+                            "ntt_pass",
+                            n >> e_log,
+                            group_threads(e_log),
+                            &args,
+                            p,
+                            &[SCALAR_BYTES << e_log],
+                        )?;
+                    }
+                }
+                Ok(())
+            })?
+            .1;
+        i0 = i1;
+    }
+    Ok(ns)
+}
+
 /// `extended_to_coeff` in place on `a[..2^ext_k]`: the inverse NTT times
 /// `divisor`, then [`encode_distribute_zeta`] with `zeta_out`, for the host to
 /// read `a`. Returns the GPU time.
@@ -738,6 +852,68 @@ pub fn encode_mul_periodic<'a, B: Backend>(
 // ---------------------------------------------------------------------------
 // Host transforms
 
+/// Cached host twiddles for CPU-assisted concurrent NTTs (`[dir][log_n]`).
+fn cached_host_twiddles(dir: Dir, log_n: u32) -> &'static [midnight_curves::Fq] {
+    static TW: [[OnceLock<Vec<midnight_curves::Fq>>; MAX_LOG_N as usize + 1]; 2] = [
+        [const { OnceLock::new() }; MAX_LOG_N as usize + 1],
+        [const { OnceLock::new() }; MAX_LOG_N as usize + 1],
+    ];
+    TW[dir.index()][log_n as usize]
+        .get_or_init(|| {
+            let omega = std_root(log_n, dir).expect("log_n <= MAX_LOG_N");
+            // SAFETY: `Scalar` (`[u64; 4]`) and `midnight_curves::Fq` have
+            // identical layout (asserted in `msm.rs`).
+            let w: midnight_curves::Fq = unsafe { std::mem::transmute(omega) };
+            midnight_curves::fft::compute_twiddles(&w, log_n)
+        })
+        .as_slice()
+}
+
+/// Runs an NTT in place on `a` using the CPU share thread pool when multiple
+/// callers are queued on the GPU device lock simultaneously.
+fn transform_cpu<B: Backend>(
+    a: &mut [Scalar],
+    log_n: u32,
+    dir: Dir,
+    scale: Option<&Scalar>,
+) -> Result<u64, Error> {
+    if let Some(s) = scale
+        && !field::is_reduced(s)
+    {
+        return Err(Error::Unreduced("ntt: scale".into()));
+    }
+    if !field::all_reduced(a) {
+        return Err(Error::Unreduced("ntt: input".into()));
+    }
+    let Some(pool) = crate::msm::par::cpu_pool::<B>() else {
+        return Err(Error::Device("ntt: no cpu pool".into()));
+    };
+    let twiddles = cached_host_twiddles(dir, log_n);
+    struct ScrubPool(&'static rayon::ThreadPool);
+    impl Drop for ScrubPool {
+        fn drop(&mut self) {
+            self.0.broadcast(|_| crate::msm::secret::scrub_stack());
+        }
+    }
+    let _scrub = ScrubPool(pool);
+    pool.install(|| {
+        // SAFETY: `Scalar` (`[u64; 4]`) and `midnight_curves::Fq` have
+        // identical size and alignment (asserted in `msm.rs`).
+        let fq_a = unsafe {
+            std::slice::from_raw_parts_mut(a.as_mut_ptr() as *mut midnight_curves::Fq, a.len())
+        };
+        midnight_curves::fft::best_fft_with_twiddles(fq_a, twiddles, log_n);
+        if let Some(s) = scale {
+            a.par_chunks_mut(4096).for_each(|chunk| {
+                for x in chunk {
+                    *x = mul(x, s);
+                }
+            });
+        }
+    });
+    Ok(0)
+}
+
 /// The transform of a host slice through per-request buffers taken without
 /// the device ([`ctx::take_request_buffer`]), so the host copies of calls on
 /// several threads overlap each other's device work. `a` is written only after
@@ -749,11 +925,56 @@ fn transform_host<B: Backend>(
     dir: Dir,
     scale: Option<&Scalar>,
 ) -> Result<u64, Error> {
+    static QUEUED: AtomicUsize = AtomicUsize::new(0);
+    static CPU_BUSY: AtomicBool = AtomicBool::new(false);
+    struct QueueGuard;
+    impl Drop for QueueGuard {
+        fn drop(&mut self) {
+            QUEUED.fetch_sub(1, Relaxed);
+        }
+    }
+    let q = QUEUED.fetch_add(1, Relaxed) + 1;
+    let _qguard = QueueGuard;
+
     let ctx = ctx::context::<B>()?;
+
+    // When >= 3 callers queue on the GPU simultaneously (e.g. parallel domain
+    // IFFTs), serve one queued caller on the CPU pool in parallel with the GPU
+    // instead of serializing all callers behind the device lock.
+    if q >= 3
+        && log_n >= 16
+        && ctx.unified()
+        && crate::msm::par::cpu_pool::<B>().is_some()
+        && CPU_BUSY
+            .compare_exchange(false, true, Relaxed, Relaxed)
+            .is_ok()
+    {
+        struct BusyGuard;
+        impl Drop for BusyGuard {
+            fn drop(&mut self) {
+                CPU_BUSY.store(false, Relaxed);
+            }
+        }
+        let _bguard = BusyGuard;
+        if ctx::try_lock::<B>()?.is_none() {
+            crate::test_switch::hook_panic::<B>(class);
+            return transform_cpu::<B>(a, log_n, dir, scale);
+        }
+    }
+
     let bytes = std::mem::size_of_val(a);
     let mut data = ctx::take_request_buffer::<B>("ntt-data", bytes)?;
+    // Avoid `host_pool` thread contention for <= 8 MiB buffers when several
+    // NTT callers copy in parallel; a single core copies 8 MiB in ~0.25 ms.
+    let copy_in = |dst: &mut [Scalar], src: &[Scalar]| {
+        if src.len() <= (1 << 18) {
+            dst.copy_from_slice(src);
+        } else {
+            ctx::par_copy(dst, src);
+        }
+    };
     data.buf_mut()
-        .host_write(|d: &mut [Scalar]| ctx::par_copy(&mut d[..a.len()], a))?;
+        .host_write(|d: &mut [Scalar]| copy_in(&mut d[..a.len()], a))?;
     let tmp = if scratch_bytes(log_n) > 0 {
         Some(ctx::take_request_buffer::<B>("ntt-scratch", bytes)?)
     } else {
@@ -774,7 +995,8 @@ fn transform_host<B: Backend>(
             true,
         )?
     };
-    data.buf().host_read(|d: &[Scalar]| ctx::par_copy(a, &d[..a.len()]))?;
+    data.buf()
+        .host_read(|d: &[Scalar]| copy_in(a, &d[..a.len()]))?;
     data.give_back();
     if let Some(t) = tmp {
         t.give_back();
