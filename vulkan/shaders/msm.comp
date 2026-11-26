@@ -40,6 +40,18 @@
 #extension GL_KHR_shader_subgroup_shuffle_relative : require
 #endif
 
+#if defined(MSM_ACCUMULATE) || defined(MSM_INTEGRATE)
+// Both `g1_madd_sh` and `g1_add_sh` route all hot multiplications through a
+// single `g1_mul` call site with SRAM-staged `G1Xyzz`, so 2x unrolled 13-bit
+// Montgomery multiplication stays tiny in I-cache and compiles in <1 s.
+#define MONT_ROLL_OUTER_2X
+#elif defined(MSM_ACCUMULATE_FALLBACK) || defined(MSM_ONES)
+// `msm_ones` runs in ~0.6 ms (39 `g1_mul` sites) and `msm_accumulate_fallback`
+// is never taken on masked honest MSMs: keep both on compact 32-bit CIOS so
+// mobile drivers compile them in <1 s.
+#define MSM_FALLBACK_COMPACT
+#endif
+
 #include "fr.glsl"
 #include "g1.glsl"
 #include "msm.glsl"
@@ -189,7 +201,9 @@ uint booth_encode(uint wval, uint wmask, uint wbits) {
 // `scalars` is not read.
 void main() {
     const uint i = global_index();
-    if (i == 0u) U32_AT(pc.hot, 0u) = 0u;
+    if (i == 0u) {
+        for (uint k = 0u; k < 128u; k++) U32C_AT(pc.hot, k) = 0u;
+    }
     if (i >= pc.p.len) return;
 
     uint c;
@@ -202,10 +216,8 @@ void main() {
         if (pc.p.mode == MODE_MASKED) s = fr_add(s, mask_elem(mi));
     }
 
-    // out of Montgomery form (sppark `s.from()`): s * 1 * 2^-256
-    Fr raw_one = fr_zero();
-    raw_one.l[0] = 1u;
-    s = fr_mul(s, raw_one);
+    // out of Montgomery form (sppark `s.from()`): s * 2^-256
+    s = fr_from_mont(s);
 
     // sppark `abs()`: make the value "positive", keep the sign
     Fr t;
@@ -478,23 +490,36 @@ void main() {
         if ((lane & (off - 1u)) == 0u) g1_add(acc, down);
     }
     // then each run of 32 into its first invocation, through shared memory
+    // using a parallel log2(32 / ONES_LANES)-step binary tree reduction.
     if (ONES_LANES < 32u) {
         const uint lid = gl_LocalInvocationID.x;
         const uint stride = ONES_PARTS * ONES_LANES;
+        const uint run_slots = 32u / ONES_LANES;
         for (uint base = 0u; base < gl_WorkGroupSize.x; base += stride) {
-            if (lid >= base && lid < base + stride && (lid & (ONES_LANES - 1u)) == 0u) {
-                parts[(lid - base) / ONES_LANES] = acc;
+            const bool active_lane =
+                lid >= base && lid < base + stride && (lid & (ONES_LANES - 1u)) == 0u;
+            const uint slot = (lid - base) / ONES_LANES;
+            const uint sub = (lid & 31u) / ONES_LANES;
+            if (active_lane) {
+                parts[slot] = acc;
             }
+            memoryBarrierShared();
             barrier();
-            if (lid >= base && lid < base + stride && (lid & 31u) == 0u) {
-                const uint slot = (lid - base) / ONES_LANES;
-                for (uint j = 1u; j < 32u / ONES_LANES; j++) g1_add(acc, parts[slot + j]);
+            for (uint step = run_slots >> 1; step > 0u; step >>= 1) {
+                if (active_lane && sub < step) {
+                    g1_add(acc, parts[slot + step]);
+                    if (step > 1u) parts[slot] = acc;
+                }
+                memoryBarrierShared();
+                barrier();
             }
-            barrier();
         }
     }
 
-    if ((tid & 31u) == 0u) XYZZ_AT(pc.ones, tid / 32u) = acc;
+    if ((tid & 31u) == 0u) {
+        g1_reduce(acc);
+        XYZZ_AT(pc.ones, tid / 32u) = acc;
+    }
 }
 
 #elif defined(MSM_BUCKET_GUARD)
@@ -518,11 +543,282 @@ void main() {
     if (bucket_len(pc.hist, pc.p, t, idx) > pc.p.hot_limit) atomicExchange(U32_AT(pc.hot, 0u), 1u);
 }
 
+#elif defined(MSM_BIN_COUNT)
+
+// Global length-binning pass 1 (also replaces `msm_bucket_guard`):
+// - checks `len > hot_limit` and sets `hot[0] = 1`
+// - writes `g1_inf()` for empty buckets (`len == 0`) so `msm_accumulate` skips them
+// - counts non-empty buckets per exact length bin `1..62` and `63+` into `hot[1..=63]`.
+
+layout(push_constant) uniform Push {
+    uvec2 buckets;
+    uvec2 hist;
+    uvec2 hot;
+    AccParams p;
+} pc;
+
+shared uint sh_bin[64];
+
+void main() {
+    const uint t = global_index();
+    const uint lid = gl_LocalInvocationID.x;
+    const uint total = pc.p.nwins << pc.p.bits;
+    if (lid < 64u) sh_bin[lid] = 0u;
+    memoryBarrierShared();
+    barrier();
+    if (t < total) {
+        uint idx;
+        uint len = bucket_len(pc.hist, pc.p, t, idx);
+        if (len == 0u) {
+            XYZZ_AT(pc.buckets, t) = g1_inf();
+        } else {
+            if (len > pc.p.hot_limit) atomicExchange(U32C_AT(pc.hot, 0u), 1u);
+            atomicAdd(sh_bin[min(len, 63u)], 1u);
+        }
+    }
+    memoryBarrierShared();
+    barrier();
+    if (lid >= 1u && lid < 64u) {
+        uint c = sh_bin[lid];
+        if (c != 0u) atomicAdd(U32C_AT(pc.hot, lid), c);
+    }
+}
+
+#elif defined(MSM_BIN_SCAN)
+
+// Global length-binning pass 2: reads bin counts from `hot[1..=63]` and writes
+// exclusive prefix-sum offsets into disjoint `hot[65..=127]` in descending
+// length order (63 down to 1) so the longest buckets execute first; writes
+// total non-empty count to `hot[64]`. Writing to a disjoint range avoids
+// SPIRV-Cross / MoltenVK re-reading overwritten device addresses in-place.
+
+layout(push_constant) uniform Push {
+    uvec2 hot;
+} pc;
+
+void main() {
+    if (global_index() != 0u) return;
+    uint off = 0u;
+    for (uint b = 63u; b >= 1u; b--) {
+        uint c = U32C_AT(pc.hot, b);
+        U32C_AT(pc.hot, 64u + b) = off;
+        off += c;
+    }
+    U32C_AT(pc.hot, 64u) = off;
+    U32C_AT(pc.hot, 1u) = 0u;
+}
+
+#elif defined(MSM_BIN_SCATTER)
+
+// Global length-binning pass 3: scatters every non-empty bucket index `t` into
+// `order` grouped by exact bucket length (descending), giving ~99.8% SIMT lane
+// utilization in `msm_accumulate`.
+
+layout(push_constant) uniform Push {
+    uvec2 order;
+    uvec2 hist;
+    uvec2 hot;
+    AccParams p;
+} pc;
+
+shared uint sh_bin[64];
+shared uint sh_off[64];
+
+void main() {
+    const uint t = global_index();
+    const uint lid = gl_LocalInvocationID.x;
+    const uint total = pc.p.nwins << pc.p.bits;
+    if (lid < 64u) sh_bin[lid] = 0u;
+    memoryBarrierShared();
+    barrier();
+    uint b = 0u;
+    uint local_pos = 0u;
+    if (t < total) {
+        uint idx;
+        uint len = bucket_len(pc.hist, pc.p, t, idx);
+        if (len != 0u) {
+            b = min(len, 63u);
+            local_pos = atomicAdd(sh_bin[b], 1u);
+        }
+    }
+    memoryBarrierShared();
+    barrier();
+    if (lid >= 1u && lid < 64u) {
+        uint c = sh_bin[lid];
+        sh_off[lid] = c != 0u ? atomicAdd(U32C_AT(pc.hot, 64u + lid), c) : 0u;
+    }
+    memoryBarrierShared();
+    barrier();
+    if (b != 0u) {
+        U32_AT(pc.order, sh_off[b] + local_pos) = t;
+    }
+}
+
 #elif defined(MSM_ACCUMULATE)
 
-// sppark `accumulate`: one invocation per bucket (window y, bucket x) sums
-// its sorted points with mixed additions into XYZZ. The bucket of digit 1 in
-// window 0 is left to `msm_ones`.
+// Globally length-binned `accumulate`: every wave processes non-empty buckets
+// of the exact same length (descending, longest first), eliminating Poisson
+// SIMT tail divergence, shared-memory sorting, barriers, and empty buckets.
+// Stages the per-thread `G1Xyzz` accumulator + 1 scratch `Fp` in a fixed
+// 64-thread bank-conflict-free shared-memory tile (15 KiB, zero barriers),
+// cutting live registers across `g1_mul` from ~84 down to <= 24.
+
+layout(push_constant) uniform Push {
+    uvec2 buckets;
+    uvec2 points;
+    uvec2 digits;
+    uvec2 hist;
+    uvec2 hot;
+    uvec2 order;
+    AccParams p;
+} pc;
+
+const uint ACC_WG = 64u;
+const uint ACC_SLOTS = 5u;
+shared uint sh_fp[ACC_SLOTS * 12u * ACC_WG];
+
+Fp acc_ld(uint slot, uint lid) {
+    Fp r;
+    const uint base = slot * (12u * ACC_WG) + lid;
+    [[unroll]] for (uint c = 0u; c < 12u; c++) r.l[c] = sh_fp[base + c * ACC_WG];
+    return r;
+}
+
+void acc_st(uint slot, uint lid, Fp v) {
+    const uint base = slot * (12u * ACC_WG) + lid;
+    [[unroll]] for (uint c = 0u; c < 12u; c++) sh_fp[base + c * ACC_WG] = v.l[c];
+}
+
+// Fast `madd-2008-s` reading/writing `bucket` in `sh_fp[0..3]` and scratch in
+// `sh_fp[4]` (15 KiB <= 16 KiB, preserving 2 waves/SP on 32 KiB GPUs). Uses a
+// single `g1_mul` call site inside a 10-step loop so drivers that inline every
+// call (e.g. Qualcomm Adreno) emit only 1 copy of `fp_mul_lazy` instead of 10,
+// cutting shader code size ~10x and freeing live registers. Returns `false`
+// only on equal-point doubling (delegated to `msm_accumulate_fallback`).
+bool g1_madd_sh(inout bool inf, uint lid, uvec2 points, uint pt_idx, bool subtract) {
+    Fp regA = FP_AT(points, 2u * pt_idx);
+    bool p2x_zero = fp_is_zero(regA);
+    if (inf) {
+        Fp p2y = FP_AT(points, 2u * pt_idx + 1u);
+        if (p2x_zero && fp_is_zero(p2y)) return true;
+        acc_st(0u, lid, regA);
+        acc_st(1u, lid, p2y);
+        acc_st(2u, lid, fp_cneg(fp_one(), subtract));
+        acc_st(3u, lid, fp_one());
+        inf = false;
+        return true;
+    }
+
+    Fp regB;
+    [[dont_unroll]] for (uint st = 0u; st < 10u; st++) {
+        Fp ma, mb;
+        switch (st) {
+        case 0u: ma = regA; mb = acc_ld(3u, lid); break;          // p2x * ZZ
+        case 1u: ma = regB; mb = acc_ld(2u, lid); break;          // p2y * ZZZ
+        case 2u: ma = regA; mb = regA; break;                     // P * P
+        case 3u: ma = acc_ld(3u, lid); mb = regB; break;          // ZZ * PP
+        case 4u: ma = acc_ld(0u, lid); mb = regB; break;          // X1 * PP
+        case 5u: ma = regA; mb = regB; break;                     // P * PP
+        case 6u: ma = acc_ld(2u, lid); mb = regA; break;          // ZZZ * PPP
+        case 7u: ma = acc_ld(1u, lid); mb = regA; break;          // Y1 * PPP
+        case 8u: ma = acc_ld(4u, lid); mb = ma; break;            // R * R
+        default: ma = regA; mb = acc_ld(4u, lid); break;          // (Q - X3) * R
+        }
+        Fp prod = g1_mul(ma, mb);
+        switch (st) {
+        case 0u:
+            regA = fp_reduce_once(fp_sub_2p(prod, acc_ld(0u, lid))); // P
+            regB = FP_AT(points, 2u * pt_idx + 1u);                  // p2y
+            if (p2x_zero && fp_is_zero(regB)) return true;
+            break;
+        case 1u: {
+            Fp R = fp_sub_2p(fp_cneg_2p(prod, subtract), acc_ld(1u, lid));
+            if (fp_is_zero(regA)) {
+                if (!fp_is_zero(fp_reduce_once(R))) {
+                    inf = true;
+                    return true;
+                }
+                return false;
+            }
+            acc_st(4u, lid, R);
+            break;
+        }
+        case 2u: regB = prod; break;                              // PP
+        case 3u: acc_st(3u, lid, prod); break;                    // ZZ3
+        case 4u: acc_st(0u, lid, prod); break;                    // Q
+        case 5u: regA = prod; break;                              // PPP
+        case 6u: acc_st(2u, lid, prod); break;                    // ZZZ3
+        case 7u: acc_st(1u, lid, prod); break;                    // Y1 * PPP
+        case 8u: {
+            Fp Q = acc_ld(0u, lid);
+            Fp X3 = fp_sub_2p(prod, regA);
+            X3 = fp_sub_2p(X3, Q);
+            X3 = fp_sub_2p(X3, Q);
+            acc_st(0u, lid, X3);
+            regA = fp_sub_unred(Q, X3);
+            break;
+        }
+        default:
+            acc_st(1u, lid, fp_sub_2p(prod, acc_ld(1u, lid)));
+            break;
+        }
+    }
+    return true;
+}
+
+void main() {
+    const uint g = global_index();
+    const uint lid = gl_LocalInvocationID.x;
+    const AccParams p = pc.p;
+    const uint total = p.nwins << p.bits;
+    if (U32C_AT(pc.hot, 0u) != 0u) {
+        if (g < total) XYZZ_AT(pc.buckets, g) = g1_inf();
+        return;
+    }
+    const uint non_empty = U32C_AT(pc.hot, 64u);
+    if (g >= non_empty) return;
+    const uint t = U32_AT(pc.order, g);
+    const uint y = t >> p.bits;
+    uint idx;
+    uint len = bucket_len(pc.hist, p, t, idx);
+
+    uint digs = y * p.stride + idx;
+    uint digit = U32_AT(pc.digits, digs++);
+    G1Affine first = AFFINE_AT(pc.points, digit & 0x7fffffffu);
+    bool inf = g1_is_inf(first);
+    if (!inf) {
+        acc_st(0u, lid, first.x);
+        acc_st(1u, lid, first.y);
+        acc_st(2u, lid, fp_cneg(fp_one(), (digit >> 31) != 0u));
+        acc_st(3u, lid, fp_one());
+    }
+    while (--len != 0u) {
+        digit = U32_AT(pc.digits, digs++);
+        if (!g1_madd_sh(inf, lid, pc.points, digit & 0x7fffffffu, (digit >> 31) != 0u)) {
+            atomicExchange(U32C_AT(pc.hot, 1u), 1u);
+            G1Xyzz sentinel = g1_inf();
+            sentinel.X.l[11] = 0xffffffffu;
+            XYZZ_AT(pc.buckets, t) = sentinel;
+            return;
+        }
+    }
+    if (inf) {
+        XYZZ_AT(pc.buckets, t) = g1_inf();
+    } else {
+        G1Xyzz bucket;
+        bucket.X = fp_reduce_once(acc_ld(0u, lid));
+        bucket.Y = fp_reduce_once(acc_ld(1u, lid));
+        bucket.ZZZ = fp_reduce_once(acc_ld(2u, lid));
+        bucket.ZZ = fp_reduce_once(acc_ld(3u, lid));
+        XYZZ_AT(pc.buckets, t) = bucket;
+    }
+}
+
+#elif defined(MSM_ACCUMULATE_FALLBACK)
+
+// Cold doubling fallback for `msm_accumulate`: exits in one cached u32 read
+// (`hot[1] == 0`) on all masked honest MSMs; only runs full `g1_madd` on any
+// bucket flagged with sentinel `X.l[11] == 0xffffffffu` (equal-point doubling).
 
 layout(push_constant) uniform Push {
     uvec2 buckets;
@@ -533,55 +829,25 @@ layout(push_constant) uniform Push {
     AccParams p;
 } pc;
 
-// Fixed upper bound (`ACC_GROUP` = 256): avoids two spec-constant-sized
-// workgroup arrays overlapping in Qualcomm Adreno's shared-memory layout
-// (see `scan` above), while keeping shared memory at 2 KiB for high occupancy.
-shared uint lens[256];
-shared uint slot[256];
-
 void main() {
-    const uint g = global_index(), tid = gl_LocalInvocationID.x, tpg = gl_WorkGroupSize.x;
+    if (U32C_AT(pc.hot, 1u) == 0u) return;
+    const uint t = global_index();
     const AccParams p = pc.p;
-    const uint total = p.nwins << p.bits;
-    // Keep both `barrier()` calls in top-level unconditional control flow:
-    // an early `return` before `barrier()` wraps the barriers in a selection
-    // merge after `spirv-opt --merge-return`, which hangs Adreno.
-    const bool is_hot = U32_AT(pc.hot, 0u) != 0u;
+    if (t >= (p.nwins << p.bits)) return;
+    if (XYZZ_AT(pc.buckets, t).X.l[11] != 0xffffffffu) return;
     uint idx;
-    const uint mine = (!is_hot && g < total) ? bucket_len(pc.hist, p, g, idx) : 0u;
-    // the workgroup's buckets by load, longest first: each subgroup takes
-    // buckets of similar length (invocations past the end rank last)
-    lens[tid] = mine;
-    barrier();
-    uint rank = 0u;
-    for (uint j = 0u; j < tpg; j++) {
-        uint l = lens[j];
-        rank += (l > mine || (l == mine && j < tid)) ? 1u : 0u;
-    }
-    slot[rank] = tid;
-    barrier();
-    if (is_hot) {
-        if (g < total) XYZZ_AT(pc.buckets, g) = g1_inf();
-        return;
-    }
-    const uint t = g - tid + slot[tid];
-    if (t >= total) return;
-    const uint y = t >> p.bits;
     uint len = bucket_len(pc.hist, p, t, idx);
-
-    G1Xyzz bucket;
-    if (len != 0u) {
-        uint digs = y * p.stride + idx;
-        uint digit = U32_AT(pc.digits, digs++);
-        bucket = g1_from_affine(AFFINE_AT(pc.points, digit & 0x7fffffffu));
-        g1_cneg(bucket, (digit >> 31) != 0u);
-        while (--len != 0u) {
-            digit = U32_AT(pc.digits, digs++);
-            g1_madd(bucket, AFFINE_AT(pc.points, digit & 0x7fffffffu), (digit >> 31) != 0u);
-        }
-    } else {
-        bucket = g1_inf();
+    if (len == 0u) return;
+    const uint y = t >> p.bits;
+    uint digs = y * p.stride + idx;
+    uint digit = U32_AT(pc.digits, digs++);
+    G1Xyzz bucket = g1_from_affine(AFFINE_AT(pc.points, digit & 0x7fffffffu));
+    g1_cneg(bucket, (digit >> 31) != 0u);
+    while (--len != 0u) {
+        digit = U32_AT(pc.digits, digs++);
+        g1_madd(bucket, AFFINE_AT(pc.points, digit & 0x7fffffffu), (digit >> 31) != 0u);
     }
+    g1_reduce(bucket);
     XYZZ_AT(pc.buckets, t) = bucket;
 }
 
@@ -605,6 +871,99 @@ layout(push_constant) uniform Push {
     IntParams p;
 } pc;
 
+// Stage `res` (slots 0..3), `acc` (slots 4..7), and two scratch `Fp`s (slots
+// 8..9) in a bank-conflict-free 64-thread shared-memory tile (30 KiB <= 32 KiB,
+// zero barriers), cutting live registers in `g1_add_sh` from ~180 down to ~64
+// and eliminating global-memory spilling in `msm_integrate`.
+const uint INT_WG = 64u;
+const uint INT_SLOTS = 10u;
+shared uint sh_int[INT_SLOTS * 12u * INT_WG];
+
+Fp int_ld(uint slot, uint tid) {
+    Fp r;
+    const uint base = slot * (12u * INT_WG) + tid;
+    [[unroll]] for (uint c = 0u; c < 12u; c++) r.l[c] = sh_int[base + c * INT_WG];
+    return r;
+}
+
+void int_st(uint slot, uint tid, Fp v) {
+    const uint base = slot * (12u * INT_WG) + tid;
+    [[unroll]] for (uint c = 0u; c < 12u; c++) sh_int[base + c * INT_WG] = v.l[c];
+}
+
+Fp int_p2(bool from_dram, uint dram_idx, uint f, uint tid) {
+    return from_dram ? FP_AT(pc.buckets, 4u * dram_idx + f) : int_ld(4u + f, tid);
+}
+
+// SRAM-staged `add-2008-s`: `slots[dst..dst+4] += p2`, where `p2` comes either
+// from global `buckets[dram_idx]` (`from_dram == true`) or SRAM `acc` (slots
+// `4..7`). Uses compact 32-bit CIOS for the cold equal-point doubling branch.
+void g1_add_sh(inout bool p31_inf, uint dst, bool from_dram, uint dram_idx, bool p2_inf, uint tid) {
+    if (p2_inf) return;
+    if (p31_inf) {
+        [[unroll]] for (uint f = 0u; f < 4u; f++) {
+            int_st(dst + f, tid, int_p2(from_dram, dram_idx, f, tid));
+        }
+        p31_inf = false;
+        return;
+    }
+
+    int_st(dst + 0u, tid, g1_mul(int_ld(dst + 0u, tid), int_p2(from_dram, dram_idx, 3u, tid)));
+    int_st(8u, tid, fp_reduce_once(fp_sub_2p(
+        g1_mul(int_p2(from_dram, dram_idx, 0u, tid), int_ld(dst + 3u, tid)),
+        int_ld(dst + 0u, tid))));
+
+    int_st(dst + 1u, tid, g1_mul(int_ld(dst + 1u, tid), int_p2(from_dram, dram_idx, 2u, tid)));
+    int_st(9u, tid, fp_sub_2p(
+        g1_mul(int_p2(from_dram, dram_idx, 1u, tid), int_ld(dst + 2u, tid)),
+        int_ld(dst + 1u, tid)));
+
+    if (fp_is_zero(int_ld(8u, tid))) {
+        if (!fp_is_zero(fp_reduce_once(int_ld(9u, tid)))) {
+            p31_inf = true;
+            return;
+        }
+        Fp X1 = fp_reduce_once(int_p2(from_dram, dram_idx, 0u, tid));
+        Fp Y1 = fp_reduce_once(int_p2(from_dram, dram_idx, 1u, tid));
+        Fp U = fp_dbl(Y1);
+        Fp V = fp_mul_compact(U, U);
+        Fp W = fp_mul_compact(U, V);
+        Fp S = fp_mul_compact(X1, V);
+        Fp M = fp_reduce_once(fp_mul_compact(X1, X1));
+        M = fp_add(fp_dbl(M), M);
+        Fp X3 = fp_mul_compact(M, M);
+        X3 = fp_sub_2p(X3, S);
+        X3 = fp_sub_2p(X3, S);
+        int_st(dst + 0u, tid, X3);
+        Fp Y3 = fp_mul_compact(Y1, W);
+        S = fp_sub_unred(S, X3);
+        S = fp_mul_compact(S, M);
+        int_st(dst + 1u, tid, fp_sub_2p(S, Y3));
+        int_st(dst + 3u, tid, fp_mul_compact(int_p2(from_dram, dram_idx, 3u, tid), V));
+        int_st(dst + 2u, tid, fp_mul_compact(int_p2(from_dram, dram_idx, 2u, tid), W));
+        return;
+    }
+
+    Fp PP = g1_mul(int_ld(8u, tid), int_ld(8u, tid));
+    int_st(dst + 3u, tid, g1_mul(int_ld(dst + 3u, tid), PP));
+    int_st(dst + 0u, tid, g1_mul(int_ld(dst + 0u, tid), PP));
+    int_st(8u, tid, g1_mul(int_ld(8u, tid), PP));
+    int_st(dst + 2u, tid, g1_mul(int_ld(dst + 2u, tid), int_ld(8u, tid)));
+    int_st(dst + 1u, tid, g1_mul(int_ld(dst + 1u, tid), int_ld(8u, tid)));
+    int_st(dst + 3u, tid, g1_mul(int_ld(dst + 3u, tid), int_p2(from_dram, dram_idx, 3u, tid)));
+    int_st(dst + 2u, tid, g1_mul(int_ld(dst + 2u, tid), int_p2(from_dram, dram_idx, 2u, tid)));
+    Fp R2 = int_ld(9u, tid);
+    Fp X3 = g1_mul(R2, R2);
+    X3 = fp_sub_2p(X3, int_ld(8u, tid));
+    Fp Q = int_ld(dst + 0u, tid);
+    X3 = fp_sub_2p(X3, Q);
+    X3 = fp_sub_2p(X3, Q);
+    int_st(dst + 0u, tid, X3);
+    Q = fp_sub_unred(Q, X3);
+    Q = g1_mul(Q, R2);
+    int_st(dst + 1u, tid, fp_sub_2p(Q, int_ld(dst + 1u, tid)));
+}
+
 void main() {
     const uint gid = group_index(), tid = gl_LocalInvocationID.x, tpg = gl_WorkGroupSize.x;
     const IntParams p = pc.p;
@@ -620,34 +979,58 @@ void main() {
         mask = (1u << (p.wbits - lsbits)) - 1u;
     }
 
-    G1Xyzz res, acc = XYZZ_AT(pc.buckets, run + --i);
-    if ((i & mask) != 0u)
-        res = g1_inf();
-    else
-        res = acc;
+    const uint first_idx = run + --i;
+    Fp fzz = FP_AT(pc.buckets, 4u * first_idx + 3u);
+    Fp fzzz = FP_AT(pc.buckets, 4u * first_idx + 2u);
+    bool acc_inf = fp_is_zero(fzz) && fp_is_zero(fzzz);
+    bool res_inf = true;
+    if (!acc_inf) {
+        Fp fx = FP_AT(pc.buckets, 4u * first_idx + 0u);
+        Fp fy = FP_AT(pc.buckets, 4u * first_idx + 1u);
+        int_st(4u, tid, fx);
+        int_st(5u, tid, fy);
+        int_st(6u, tid, fzzz);
+        int_st(7u, tid, fzz);
+        if ((i & mask) == 0u) {
+            int_st(0u, tid, fx);
+            int_st(1u, tid, fy);
+            int_st(2u, tid, fzzz);
+            int_st(3u, tid, fzz);
+            res_inf = false;
+        }
+    }
 
-    G1Xyzz q = res;
     while (i-- != 0u) {
-        q = XYZZ_AT(pc.buckets, run + i);
+        const uint q_idx = run + i;
+        bool q_inf = fp_is_zero(FP_AT(pc.buckets, 4u * q_idx + 3u))
+                     && fp_is_zero(FP_AT(pc.buckets, 4u * q_idx + 2u));
         uint pc_ = (i & mask) != 0u ? 2u : 0u;
         do {
-            g1_add(q, acc);
-            if (pc_ == 1u) {
-                res = q;
-            } else {
-                acc = q;
-                if (pc_ == 0u) q = res;
-            }
+            bool is_res = (pc_ == 1u);
+            bool p31_inf = is_res ? res_inf : acc_inf;
+            g1_add_sh(p31_inf, is_res ? 0u : 4u, !is_res, q_idx, is_res ? acc_inf : q_inf, tid);
+            if (is_res) res_inf = p31_inf; else acc_inf = p31_inf;
         } while (++pc_ < 2u);
     }
 
-    // every invocation has read its run before the row is written; no
-    // invocation reads a record written here, so the records need no
-    // `coherent` (which MoltenVK cannot translate on a struct)
     memoryBarrierBuffer();
     barrier();
 
-    XYZZ_AT(pc.buckets, row + 2u * tid) = q;
+    G1Xyzz res = g1_inf();
+    if (!res_inf) {
+        res.X = fp_reduce_once(int_ld(0u, tid));
+        res.Y = fp_reduce_once(int_ld(1u, tid));
+        res.ZZZ = fp_reduce_once(int_ld(2u, tid));
+        res.ZZ = fp_reduce_once(int_ld(3u, tid));
+    }
+    G1Xyzz acc = g1_inf();
+    if (!acc_inf) {
+        acc.X = fp_reduce_once(int_ld(4u, tid));
+        acc.Y = fp_reduce_once(int_ld(5u, tid));
+        acc.ZZZ = fp_reduce_once(int_ld(6u, tid));
+        acc.ZZ = fp_reduce_once(int_ld(7u, tid));
+    }
+    XYZZ_AT(pc.buckets, row + 2u * tid) = res;
     XYZZ_AT(pc.buckets, row + 2u * tid + 1u) = acc;
 }
 

@@ -187,6 +187,8 @@ pub struct VulkanInfo {
     pub max_buffer_size: u64,
     /// `shaderInt64` (variant A).
     pub shader_int64: bool,
+    /// `shaderInt16` (16-bit integer types in shaders).
+    pub shader_int16: bool,
     /// `bufferDeviceAddress` (required).
     pub buffer_device_address: bool,
     /// `timestampValidBits` of the compute queue (0: no timestamps).
@@ -431,13 +433,26 @@ type Mem = vk::MemoryPropertyFlags;
 /// `(wanted, avoided)` memory flags, in order of preference.
 type Preferences = &'static [(Mem, Mem)];
 
-/// Device buffers of a unified device: mapped.
-const UNIFIED: Preferences = &[(
-    Mem::from_raw(
-        Mem::DEVICE_LOCAL.as_raw() | Mem::HOST_VISIBLE.as_raw() | Mem::HOST_COHERENT.as_raw(),
+/// Device buffers of a unified device: mapped, preferring host-cached coherent
+/// memory so CPU readbacks, copies, and SRS/key verification run at cached RAM
+/// speed without GPU penalty.
+const UNIFIED: Preferences = &[
+    (
+        Mem::from_raw(
+            Mem::DEVICE_LOCAL.as_raw()
+                | Mem::HOST_VISIBLE.as_raw()
+                | Mem::HOST_COHERENT.as_raw()
+                | Mem::HOST_CACHED.as_raw(),
+        ),
+        Mem::LAZILY_ALLOCATED,
     ),
-    Mem::LAZILY_ALLOCATED,
-)];
+    (
+        Mem::from_raw(
+            Mem::DEVICE_LOCAL.as_raw() | Mem::HOST_VISIBLE.as_raw() | Mem::HOST_COHERENT.as_raw(),
+        ),
+        Mem::LAZILY_ALLOCATED,
+    ),
+];
 /// Device buffers of a discrete device: device memory the host does not see
 /// first.
 const DEVICE_ONLY: Preferences = &[
@@ -543,7 +558,9 @@ impl Context {
         let mut v13 = vk::PhysicalDeviceVulkan13Features::default()
             .subgroup_size_control(c.info.subgroup_size_control)
             .compute_full_subgroups(c.info.compute_full_subgroups);
-        let features = vk::PhysicalDeviceFeatures::default().shader_int64(c.info.shader_int64);
+        let features = vk::PhysicalDeviceFeatures::default()
+            .shader_int64(c.info.shader_int64)
+            .shader_int16(c.info.shader_int16);
         let priorities = [1.0f32];
         let queues = [vk::DeviceQueueCreateInfo::default()
             .queue_family_index(c.family)
@@ -619,6 +636,7 @@ impl Context {
         // SAFETY: as above.
         unsafe { instance.get_physical_device_features2(p, &mut features) };
         let shader_int64 = features.features.shader_int64 == vk::TRUE;
+        let shader_int16 = features.features.shader_int16 == vk::TRUE;
         // SAFETY: valid physical device.
         let exts = unsafe { instance.enumerate_device_extension_properties(p) };
         let exts = init_error("vkEnumerateDeviceExtensionProperties", exts)?;
@@ -635,7 +653,7 @@ impl Context {
             .unwrap_or(0);
         let host_mapped_device = memory.memory_types[..memory.memory_type_count as usize]
             .iter()
-            .any(|t| t.property_flags.contains(UNIFIED[0].0));
+            .any(|t| UNIFIED.iter().any(|(want, _)| t.property_flags.contains(*want)));
         let shares_memory = matches!(
             base.device_type,
             vk::PhysicalDeviceType::INTEGRATED_GPU | vk::PhysicalDeviceType::CPU
@@ -674,6 +692,7 @@ impl Context {
             max_memory_allocation_size: v11.max_memory_allocation_size,
             max_buffer_size: v13.max_buffer_size,
             shader_int64,
+            shader_int16,
             buffer_device_address: f12.buffer_device_address == vk::TRUE,
             timestamp_valid_bits: family_props.timestamp_valid_bits,
             timestamp_period: limits.timestamp_period,
@@ -1002,6 +1021,7 @@ impl Context {
         let req = unsafe { d.get_buffer_memory_requirements(buffer) };
         let mut memory = Err(Error::OutOfMemory);
         let mut host = false;
+        let mut cached = false;
         for t in self.memory_types(req.memory_type_bits, preferences) {
             let mut flags = vk::MemoryAllocateFlagsInfo::default()
                 .flags(vk::MemoryAllocateFlags::DEVICE_ADDRESS);
@@ -1014,9 +1034,11 @@ impl Context {
                 d.allocate_memory(&alloc, None)
             });
             if !matches!(memory, Err(Error::OutOfMemory)) {
-                host = s.memory.memory_types[t as usize].property_flags.contains(
+                let props = s.memory.memory_types[t as usize].property_flags;
+                host = props.contains(
                     vk::MemoryPropertyFlags::HOST_VISIBLE | vk::MemoryPropertyFlags::HOST_COHERENT,
                 );
+                cached = props.contains(vk::MemoryPropertyFlags::HOST_CACHED);
                 break;
             }
         }
@@ -1036,6 +1058,7 @@ impl Context {
             len,
             size: req.size,
             mapped: None,
+            host_cached: false,
             address: 0,
         };
         // SAFETY: the memory was allocated for this buffer's requirements.
@@ -1048,6 +1071,7 @@ impl Context {
                 d.map_memory(memory, 0, vk::WHOLE_SIZE, vk::MemoryMapFlags::empty())
             })?;
             b.mapped = NonNull::new(p.cast());
+            b.host_cached = cached;
         }
         let i = vk::BufferDeviceAddressInfo::default().buffer(buffer);
         // SAFETY: a buffer with SHADER_DEVICE_ADDRESS usage bound to memory
@@ -1162,6 +1186,27 @@ impl Context {
                     vk::PipelineStageFlags::TOP_OF_PIPE,
                     submit.query,
                     0,
+                );
+            }
+            // Make host writes to mapped unified (especially HOST_CACHED)
+            // buffers visible to device reads before the first command runs.
+            if self.info.unified_memory {
+                let from_host = [vk::MemoryBarrier::default()
+                    .src_access_mask(vk::AccessFlags::HOST_WRITE)
+                    .dst_access_mask(
+                        vk::AccessFlags::SHADER_READ
+                            | vk::AccessFlags::SHADER_WRITE
+                            | vk::AccessFlags::TRANSFER_READ
+                            | vk::AccessFlags::TRANSFER_WRITE,
+                    )];
+                d.cmd_pipeline_barrier(
+                    submit.cmd,
+                    vk::PipelineStageFlags::HOST,
+                    vk::PipelineStageFlags::COMPUTE_SHADER | vk::PipelineStageFlags::TRANSFER,
+                    vk::DependencyFlags::empty(),
+                    &from_host,
+                    &[],
+                    &[],
                 );
             }
         }
@@ -1299,6 +1344,7 @@ pub struct Buffer {
     /// The bytes of the memory allocation.
     size: u64,
     mapped: Option<NonNull<u8>>,
+    host_cached: bool,
     address: u64,
 }
 
@@ -1328,6 +1374,11 @@ impl Buffer {
     /// The host address of the mapping, at least [`Buffer::len`] bytes.
     pub fn mapped_ptr(&self) -> Option<NonNull<u8>> {
         self.mapped
+    }
+
+    /// Whether the host mapping is CPU-cached (`HOST_CACHED`).
+    pub fn host_cached(&self) -> bool {
+        self.host_cached
     }
 }
 

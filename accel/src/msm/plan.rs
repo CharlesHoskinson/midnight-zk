@@ -91,6 +91,76 @@ pub fn plan(n: usize, t: &Tuning) -> Plan {
 /// The denominator of the shares in [`Tuning::msm_shares`].
 pub const SHARE_DEN: usize = 64;
 
+/// Current aggregate CPU frequency cap as a percentage of hardware peak
+/// (`1..=100`), read from Linux/Android `cpufreq` sysfs. Independent of any
+/// witness or proof data. Returns `100` on other hosts or when sysfs is
+/// unavailable.
+#[cfg(any(target_os = "linux", target_os = "android"))]
+fn cpu_capacity_pct() -> u32 {
+    use std::sync::OnceLock;
+
+    struct CpuFreq {
+        cpus: Vec<(usize, u64)>,
+        total_max: u64,
+    }
+
+    fn read_u64(path: &str) -> Option<u64> {
+        std::fs::read_to_string(path).ok()?.trim().parse().ok()
+    }
+
+    static INFO: OnceLock<Option<CpuFreq>> = OnceLock::new();
+    let Some(info) = INFO.get_or_init(|| {
+        let mut cpus = Vec::new();
+        let mut total_max = 0u64;
+        for i in 0..256 {
+            let max_path = format!("/sys/devices/system/cpu/cpu{i}/cpufreq/cpuinfo_max_freq");
+            let Some(max_f) = read_u64(&max_path).filter(|&v| v > 0) else {
+                if i >= 16 && cpus.is_empty() {
+                    break;
+                }
+                continue;
+            };
+            let cur_path = format!("/sys/devices/system/cpu/cpu{i}/cpufreq/scaling_max_freq");
+            if read_u64(&cur_path).is_some() {
+                cpus.push((i, max_f));
+                total_max = total_max.saturating_add(max_f);
+            }
+        }
+        (total_max > 0).then_some(CpuFreq { cpus, total_max })
+    }) else {
+        return 100;
+    };
+
+    let mut total_cur = 0u64;
+    for &(i, max_f) in &info.cpus {
+        let cur_path = format!("/sys/devices/system/cpu/cpu{i}/cpufreq/scaling_max_freq");
+        let Some(cur) = read_u64(&cur_path) else {
+            return 100;
+        };
+        total_cur = total_cur.saturating_add(cur.min(max_f));
+    }
+    ((total_cur * 100) / info.total_max).clamp(1, 100) as u32
+}
+
+#[cfg(not(any(target_os = "linux", target_os = "android")))]
+fn cpu_capacity_pct() -> u32 {
+    100
+}
+
+/// Adjusts a tuned device share (in `SHARE_DEN`-ths) when CPU clocks are
+/// thermally capped while the GPU continues at full speed. Uses a single
+/// threshold (`< 70%` of peak CPU clock capacity) so cool runs are untouched
+/// and the mask cache (`MSM(r)` keyed by `m`) stores at most one extra entry.
+fn adjust_share(frac: usize, cpu_pct: u32) -> usize {
+    if frac >= SHARE_DEN || cpu_pct >= 70 {
+        return frac;
+    }
+    const THROTTLED_RATIO: usize = 58;
+    let num = frac * 100 * SHARE_DEN;
+    let den = frac * 100 + THROTTLED_RATIO * (SHARE_DEN - frac);
+    ((num + den / 2) / den).clamp(frac, SHARE_DEN - 4)
+}
+
 /// The device share `m` of an MSM of `n` points: the device computes `[0, m)`
 /// and the CPU `[m, n)`. `{ENV_PREFIX}_MSM_CPU_SHARE=off` or no CPU pool gives
 /// `m = n`.
@@ -108,6 +178,20 @@ pub fn device_share<B: Backend>(n: usize, table: bool) -> usize {
     }
     // in range: `lo <= k.min(hi) <= hi`, one entry per log2
     let e = shares[(k.min(hi) - lo) as usize];
-    let frac = if table { e.1 } else { e.2 };
+    let frac = adjust_share(if table { e.1 } else { e.2 }, cpu_capacity_pct());
     (n * frac / SHARE_DEN).clamp(1, n)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::{SHARE_DEN, adjust_share};
+
+    #[test]
+    fn adjust_share_preserves_cool_and_full_gpu_and_shifts_when_throttled() {
+        assert_eq!(adjust_share(37, 100), 37);
+        assert_eq!(adjust_share(37, 70), 37);
+        assert_eq!(adjust_share(SHARE_DEN, 50), SHARE_DEN);
+        assert_eq!(adjust_share(37, 54), 45);
+        assert_eq!(adjust_share(39, 54), 47);
+    }
 }

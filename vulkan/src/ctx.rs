@@ -140,14 +140,15 @@ fn env_on(name: &str) -> bool {
 }
 
 /// The arithmetic variant: [`ARITH_ENV`], else A where the device has
-/// `shaderInt64`.
+/// `shaderInt64` and `shaderInt16`.
 fn choose_variant(info: &device::VulkanInfo) -> Result<Variant, String> {
+    let has_64 = info.shader_int64 && info.shader_int16;
     match std::env::var(ARITH_ENV).as_deref() {
-        Ok("64") if info.shader_int64 => Ok(Variant::Int64),
-        Ok("64") => Err(format!("{ARITH_ENV}=64 on a device without shaderInt64")),
+        Ok("64") if has_64 => Ok(Variant::Int64),
+        Ok("64") => Err(format!("{ARITH_ENV}=64 on a device without shaderInt64/shaderInt16")),
         Ok("32") => Ok(Variant::Int32),
         Ok(v) => Err(format!("{ARITH_ENV}={v}: expected 64 or 32")),
-        Err(_) if info.shader_int64 => Ok(Variant::Int64),
+        Err(_) if has_64 => Ok(Variant::Int64),
         Err(_) => Ok(Variant::Int32),
     }
 }
@@ -229,6 +230,10 @@ impl RawBuffer for VulkanBuffer {
 
     fn host_ptr(&self) -> Option<NonNull<u8>> {
         self.0.mapped_ptr()
+    }
+
+    fn host_cached(&self) -> bool {
+        self.0.host_cached()
     }
 
     fn zero_all(&self) -> Result<(), Error> {
@@ -535,7 +540,15 @@ impl<'a> Encoder<'a, Vulkan> for VulkanCommand<'a> {
         args: &[Arg<'a>],
         params: &[u8],
     ) -> Result<(), Error> {
-        let group = DISPATCH_GROUP.min(max_group(self.vk.dev.info()));
+        // `quotient_numerator` keeps its hot program scratch slots in a fixed
+        // 64-thread workgroup shared-memory tile (16 KiB) for zero-DRAM-traffic
+        // intermediates and full-wave occupancy on Adreno & Apple GPUs.
+        let cap = if kernel == "quotient_numerator" {
+            64
+        } else {
+            DISPATCH_GROUP
+        };
+        let group = cap.min(max_group(self.vk.dev.info()));
         self.encode(
             kernel,
             Grid::Threads(threads as u64),
@@ -613,6 +626,7 @@ static HOST: HostState<Vulkan> = HostState::new();
 impl Backend for Vulkan {
     const NAME: &'static str = "vulkan";
     const ENV_PREFIX: &'static str = "MIDNIGHT_VULKAN";
+    const MSM_LENGTH_BINS: bool = true;
     type Raw = VulkanBuffer;
     type Cmd<'a> = VulkanCommand<'a>;
     /// The constants of the device's class ([`crate::tuning::for_device`]),
@@ -693,14 +707,24 @@ impl Backend for Vulkan {
         }
         let info = self.dev.info();
         let mut limit = max_group(info);
-        // Qualcomm Adreno (vendor 0x5143): high-register G1 kernels with
-        // barriers deadlock at 256 invocations (4 waves of 64) due to
-        // register-file residency limits; 128 invocations (2 waves) runs
-        // cleanly.
-        if info.vendor_id == 0x5143
-            && matches!(kernel, "msm_accumulate" | "msm_integrate" | "msm_ones")
-        {
-            limit = limit.min(128);
+        // `msm_accumulate` (15 KiB) and `msm_integrate` (12 KiB) stage per-thread
+        // `G1Xyzz` state in fixed 64-thread bank-conflict-free shared-memory tiles.
+        if matches!(kernel, "msm_accumulate" | "msm_integrate") {
+            limit = limit.min(64);
+        }
+        // Qualcomm Adreno (vendor 0x5143): cap high-register G1 kernels at 128
+        // invocations (2 waves of 64), and cap radix-sort workgroups at 256 (4
+        // waves of 64) to cut `group_exclusive_sum` barrier depth and reduce
+        // shared-memory atomic collisions in `msm_sort_lower`.
+        if info.vendor_id == 0x5143 {
+            if matches!(kernel, "msm_accumulate_fallback" | "msm_ones") {
+                limit = limit.min(128);
+            } else if matches!(
+                kernel,
+                "msm_sort_count" | "msm_sort_scan" | "msm_sort_scatter" | "msm_sort_lower"
+            ) {
+                limit = limit.min(256);
+            }
         }
         Ok(limit)
     }

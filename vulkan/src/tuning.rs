@@ -83,34 +83,37 @@ pub(crate) const TUNING: Tuning = Tuning {
 };
 
 /// `(log2 n, wbits, chunks)` of the MSM on Qualcomm Adreno GPUs.
+/// Avoids `wbits = 14` (19 windows, 2x buckets of `wbits = 13`'s 20 windows)
+/// and `wbits = 16` below `2^21` (16 windows, 2x buckets of `wbits = 15`'s
+/// exact `255 / 15 = 17` windows) to minimize `g1_madd + 2 * g1_add` work and
+/// bucket DRAM footprint.
 const ADRENO_MSM_WINDOWS: &[(u32, u32, usize)] = &[
     (13, 11, 1),
     (14, 11, 1),
     (15, 12, 1),
     (16, 13, 1),
     (17, 13, 1),
-    (18, 14, 1),
+    (18, 15, 1),
     (19, 15, 1),
     (20, 15, 1),
     (21, 16, 1),
     (22, 16, 1),
 ];
 
-/// The device share of the MSM on Qualcomm Adreno GPUs (in 64ths): at k=15..18
-/// mobile CPU cores keep pace with Adreno (~44-56% GPU), while at k>=19
-/// prolonged CPU load heats the CPU cores faster than the GPU so a higher GPU
-/// share (44-50/64) prevents the GPU from stalling on CPU.
+/// The device share of the MSM on Qualcomm Adreno GPUs (in 64ths): balanced
+/// so GPU (with length-binned lazy-Fp accumulation) and 8-core Oryon CPU
+/// shares finish together without overloading GPU thermals at k >= 18.
 const ADRENO_MSM_SHARES: &[(u32, usize, usize)] = &[
-    (13, 28, 28),
-    (14, 28, 28),
+    (13, 30, 30),
+    (14, 30, 30),
     (15, 32, 32),
-    (16, 36, 36),
+    (16, 35, 35),
     (17, 36, 36),
-    (18, 36, 36),
-    (19, 44, 44),
-    (20, 50, 50),
-    (21, 50, 50),
-    (22, 50, 50),
+    (18, 37, 37),
+    (19, 39, 39),
+    (20, 41, 41),
+    (21, 44, 44),
+    (22, 46, 46),
 ];
 
 /// The constants of Qualcomm Adreno GPUs (vendor 0x5143), measured on
@@ -127,8 +130,14 @@ pub(crate) const ADRENO: Tuning = Tuning {
     },
     msm_windows: ADRENO_MSM_WINDOWS,
     msm_shares: ADRENO_MSM_SHARES,
-    // 4 workgroups per window keeps Adreno's shader processors busy in integrate
-    msm_integrate_groups: 4,
+    // With masked scalars (`s + r`), bucket 1 of window 0 holds only ~m/2^(w-1)
+    // points; 4 workgroups (512 threads, 16 output records) keep `msm_ones`
+    // sub-millisecond while minimizing CPU `collect()` work.
+    msm_ones_groups: 4,
+    // 2 workgroups of 64 threads per window (`2 * nwins` = 34-40 single-wave
+    // workgroups) keeps Adreno busy while cutting host `collect()` and
+    // `copy_partials` contention in half during the parallel CPU MSM share.
+    msm_integrate_groups: 2,
     ..TUNING
 };
 

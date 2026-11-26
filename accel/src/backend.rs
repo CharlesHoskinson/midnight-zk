@@ -100,6 +100,10 @@ pub trait Backend: Sized + Send + Sync + 'static {
     /// The prefix of the backend's environment variables (`{ENV_PREFIX}=off`,
     /// `{ENV_PREFIX}_MIN_K`, ...).
     const ENV_PREFIX: &'static str;
+    /// Whether the backend implements global length-binned MSM bucket
+    /// accumulation (`msm_bin_count` / `msm_bin_scan` / `msm_bin_scatter` +
+    /// 6-buffer `msm_accumulate`).
+    const MSM_LENGTH_BINS: bool = false;
     /// A device buffer.
     type Raw: RawBuffer;
     /// The encoder of one command buffer ([`Backend::run`]).
@@ -165,6 +169,11 @@ pub trait RawBuffer: Send + Sync + 'static {
     /// The host address of the contents, when the host can read and write
     /// them in place.
     fn host_ptr(&self) -> Option<NonNull<u8>>;
+    /// Whether the host mapping (if any) is CPU-cached (fast for direct reads
+    /// such as `memcmp` without avoiding read-back).
+    fn host_cached(&self) -> bool {
+        true
+    }
     /// Zeroes the whole allocation. The caller has exclusive use of the
     /// buffer (no host reference, no GPU work). Never panics.
     fn zero_all(&self) -> Result<(), Error> {
