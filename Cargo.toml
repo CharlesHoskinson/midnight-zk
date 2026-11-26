@@ -12,6 +12,8 @@ members = [
     "metal",
     "gpu-conformance",
     "bench/gpu-prover",
+    "accel",
+    "vulkan",
 ]
 
 [workspace.package]
