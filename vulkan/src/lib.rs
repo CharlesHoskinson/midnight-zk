@@ -13,7 +13,8 @@
 
 //! Vulkan backend for the accelerator hooks of `midnight-proofs` (feature
 //! `gpu`): BLS12-381 G1 MSM, scalar-field NTT and the quotient on any Vulkan
-//! 1.3 GPU with `bufferDeviceAddress`. It has the entry points of
+//! 1.3 GPU with `bufferDeviceAddress`, or an Android Vulkan 1.1+ GPU with
+//! the equivalent feature. It has the entry points of
 //! `midnight-metal` (the hook fields of `midnight_proofs::gpu::GpuHooks`)
 //! over the generic host side `midnight-accel`, with [`Vulkan`] as the
 //! backend.
@@ -95,7 +96,9 @@
 //!   run that path on an integrated GPU.
 //!
 //! Build time: `MIDNIGHT_VULKAN_GLSL`, `MIDNIGHT_VULKAN_SPIRV_OPT` and
-//! `MIDNIGHT_VULKAN_REQUIRE_SPIRV` (see `build.rs`).
+//! `MIDNIGHT_VULKAN_REQUIRE_SPIRV` (see `build.rs`). On Android, set
+//! `MIDNIGHT_VULKAN_TRACE_PIPELINES=1` at build time to log pipeline compiler
+//! inputs, results and timing to logcat under the `MidnightVk` tag.
 
 #![deny(missing_docs)]
 #![deny(missing_debug_implementations)]

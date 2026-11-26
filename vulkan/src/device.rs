@@ -90,7 +90,7 @@ pub enum Variant {
 pub enum Error {
     /// The Vulkan loader library could not be loaded.
     Loader(String),
-    /// No Vulkan 1.3 GPU with a compute queue and `bufferDeviceAddress`.
+    /// No compatible Vulkan GPU with a compute queue and `bufferDeviceAddress`.
     NoDevice,
     /// The crate was built without SPIR-V (the shader tools were missing).
     NoSpirv,
@@ -119,7 +119,7 @@ impl fmt::Display for Error {
             Error::Loader(e) => write!(f, "the Vulkan loader could not be loaded: {e}"),
             Error::NoDevice => write!(
                 f,
-                "no Vulkan 1.3 GPU with a compute queue and bufferDeviceAddress"
+                "no compatible Vulkan GPU with a compute queue and bufferDeviceAddress"
             ),
             Error::NoSpirv => write!(
                 f,
@@ -253,6 +253,7 @@ struct Shared {
     physical: vk::PhysicalDevice,
     device: ash::Device,
     memory: vk::PhysicalDeviceMemoryProperties,
+    get_buffer_address: vk::PFN_vkGetBufferDeviceAddress,
     failed: AtomicBool,
     /// Bytes of device memory allocated by this context.
     allocated: AtomicU64,
@@ -368,6 +369,27 @@ impl Submit {
 /// compilation on drivers such as Qualcomm Adreno).
 pub const PIPELINE_CACHE_ENV: &str = "MIDNIGHT_VULKAN_PIPELINE_CACHE";
 
+/// Emits diagnostic pipeline compiler events to Android logcat.
+#[cfg(target_os = "android")]
+fn trace_pipeline(message: fmt::Arguments<'_>) {
+    if option_env!("MIDNIGHT_VULKAN_TRACE_PIPELINES") != Some("1") {
+        return;
+    }
+    #[link(name = "log")]
+    unsafe extern "C" {
+        fn __android_log_write(
+            priority: std::ffi::c_int,
+            tag: *const c_char,
+            message: *const c_char,
+        ) -> std::ffi::c_int;
+    }
+    if let Ok(message) = std::ffi::CString::new(message.to_string()) {
+        const ANDROID_LOG_INFO: std::ffi::c_int = 4;
+        // SAFETY: tag and message are live NUL-terminated strings.
+        unsafe { __android_log_write(ANDROID_LOG_INFO, c"MidnightVk".as_ptr(), message.as_ptr()) };
+    }
+}
+
 /// The pipeline cache key.
 type Key = (&'static str, Variant, PipelineOptions);
 
@@ -382,7 +404,7 @@ pub struct Context {
     submit: Mutex<Submit>,
     /// The command buffer of fills and read-backs.
     aux: Mutex<Submit>,
-    pipelines: Mutex<HashMap<Key, Arc<Pipeline>>>,
+    pipelines: Mutex<HashMap<Key, Result<Arc<Pipeline>>>>,
 }
 
 impl fmt::Debug for Context {
@@ -426,6 +448,8 @@ struct Candidate {
     family: u32,
     info: VulkanInfo,
     portability_subset: bool,
+    api_version: u32,
+    subgroup_extension: bool,
 }
 
 type Mem = vk::MemoryPropertyFlags;
@@ -502,10 +526,23 @@ impl Context {
             names.push(vk::KHR_PORTABILITY_ENUMERATION_NAME.as_ptr());
             flags |= vk::InstanceCreateFlags::ENUMERATE_PORTABILITY_KHR;
         }
+        let api_version = if cfg!(target_os = "android") {
+            // SAFETY: the loader is live. Android 11 reports Vulkan 1.1.
+            let supported = init_error("vkEnumerateInstanceVersion", unsafe {
+                entry.try_enumerate_instance_version()
+            })?
+            .unwrap_or(vk::API_VERSION_1_0);
+            if supported < vk::API_VERSION_1_1 {
+                return Err(Error::NoDevice);
+            }
+            supported.min(vk::API_VERSION_1_3)
+        } else {
+            vk::API_VERSION_1_3
+        };
         let app = vk::ApplicationInfo::default()
             .application_name(c"midnight-vulkan")
             .engine_name(c"midnight-vulkan")
-            .api_version(vk::API_VERSION_1_3);
+            .api_version(api_version);
         let create = vk::InstanceCreateInfo::default()
             .application_info(&app)
             .enabled_extension_names(&names)
@@ -515,7 +552,7 @@ impl Context {
         let instance = init_error("vkCreateInstance", unsafe {
             entry.create_instance(&create, None)
         })?;
-        match Self::create_device(&instance, options) {
+        match Self::create_device(&instance, api_version, options) {
             Ok((device, memory, candidate)) => {
                 Self::finish(entry, instance, device, memory, candidate)
             }
@@ -529,6 +566,7 @@ impl Context {
 
     fn create_device(
         instance: &ash::Instance,
+        api_version: u32,
         options: Options,
     ) -> Result<(ash::Device, vk::PhysicalDeviceMemoryProperties, Candidate)> {
         // SAFETY: valid instance.
@@ -537,7 +575,7 @@ impl Context {
         })?;
         let mut best: Option<(u32, Candidate)> = None;
         for (i, p) in physicals.into_iter().enumerate() {
-            let Some(c) = Self::candidate(instance, p, &options)? else {
+            let Some(c) = Self::candidate(instance, p, api_version, &options)? else {
                 continue;
             };
             if options.select.as_deref().is_some_and(|s| !selects(s, i, &c.info.name)) {
@@ -555,6 +593,11 @@ impl Context {
 
         let mut v12 = vk::PhysicalDeviceVulkan12Features::default()
             .buffer_device_address(c.info.buffer_device_address);
+        let mut bda = vk::PhysicalDeviceBufferDeviceAddressFeatures::default()
+            .buffer_device_address(c.info.buffer_device_address);
+        let mut subgroup = vk::PhysicalDeviceSubgroupSizeControlFeatures::default()
+            .subgroup_size_control(c.info.subgroup_size_control)
+            .compute_full_subgroups(c.info.compute_full_subgroups);
         let mut v13 = vk::PhysicalDeviceVulkan13Features::default()
             .subgroup_size_control(c.info.subgroup_size_control)
             .compute_full_subgroups(c.info.compute_full_subgroups);
@@ -572,12 +615,26 @@ impl Context {
         if c.info.memory_budget_ext {
             exts.push(vk::EXT_MEMORY_BUDGET_NAME.as_ptr());
         }
-        let create = vk::DeviceCreateInfo::default()
+        if c.api_version < vk::API_VERSION_1_2 {
+            exts.push(vk::KHR_BUFFER_DEVICE_ADDRESS_NAME.as_ptr());
+        }
+        if c.subgroup_extension {
+            exts.push(vk::EXT_SUBGROUP_SIZE_CONTROL_NAME.as_ptr());
+        }
+        let mut create = vk::DeviceCreateInfo::default()
             .queue_create_infos(&queues)
             .enabled_extension_names(&exts)
-            .enabled_features(&features)
-            .push_next(&mut v12)
-            .push_next(&mut v13);
+            .enabled_features(&features);
+        create = if c.api_version >= vk::API_VERSION_1_2 {
+            create.push_next(&mut v12)
+        } else {
+            create.push_next(&mut bda)
+        };
+        if c.api_version >= vk::API_VERSION_1_3 {
+            create = create.push_next(&mut v13);
+        } else if c.subgroup_extension {
+            create = create.push_next(&mut subgroup);
+        }
         // SAFETY: every enabled feature and extension is supported (queried
         // in `candidate`); the create info outlives the call.
         let device = init_error("vkCreateDevice", unsafe {
@@ -588,30 +645,60 @@ impl Context {
         Ok((device, memory, c))
     }
 
-    /// The device `p` if it is usable: Vulkan 1.3, a GPU (or a CPU
+    /// The device `p` if it is usable: a GPU (or a CPU
     /// implementation when allowed), with a compute queue and
     /// `bufferDeviceAddress`.
     fn candidate(
         instance: &ash::Instance,
         p: vk::PhysicalDevice,
+        instance_api: u32,
         options: &Options,
     ) -> Result<Option<Candidate>> {
-        let mut v11 = vk::PhysicalDeviceVulkan11Properties::default();
-        let mut v12 = vk::PhysicalDeviceVulkan12Properties::default();
+        // SAFETY: valid physical device.
+        let base = unsafe { instance.get_physical_device_properties(p) };
+        let api_version = instance_api.min(base.api_version);
+        let minimum_api = if cfg!(target_os = "android") {
+            vk::API_VERSION_1_1
+        } else {
+            vk::API_VERSION_1_3
+        };
+        if api_version < minimum_api || type_rank(base.device_type, options.allow_cpu).is_none() {
+            return Ok(None);
+        }
+        // SAFETY: valid physical device.
+        let exts = init_error("vkEnumerateDeviceExtensionProperties", unsafe {
+            instance.enumerate_device_extension_properties(p)
+        })?;
+        let has = |name: &CStr| exts.iter().any(|e| e.extension_name_as_c_str() == Ok(name));
+        if api_version < vk::API_VERSION_1_2 && !has(vk::KHR_BUFFER_DEVICE_ADDRESS_NAME) {
+            return Ok(None);
+        }
+        let core_13 = api_version >= vk::API_VERSION_1_3;
+        let subgroup_extension = !core_13 && has(vk::EXT_SUBGROUP_SIZE_CONTROL_NAME);
+        let driver_properties =
+            api_version >= vk::API_VERSION_1_2 || has(vk::KHR_DRIVER_PROPERTIES_NAME);
+        let mut subgroup = vk::PhysicalDeviceSubgroupProperties::default();
+        let mut allocation = vk::PhysicalDeviceMaintenance3Properties::default();
+        let mut driver = vk::PhysicalDeviceDriverProperties::default();
+        let mut subgroup_control = vk::PhysicalDeviceSubgroupSizeControlProperties::default();
         let mut v13 = vk::PhysicalDeviceVulkan13Properties::default();
         let mut props = vk::PhysicalDeviceProperties2::default()
-            .push_next(&mut v11)
-            .push_next(&mut v12)
-            .push_next(&mut v13);
+            .push_next(&mut subgroup)
+            .push_next(&mut allocation);
+        if driver_properties {
+            props = props.push_next(&mut driver);
+        }
+        if core_13 {
+            props = props.push_next(&mut v13);
+        } else if subgroup_extension {
+            props = props.push_next(&mut subgroup_control);
+        }
         // SAFETY: valid physical device; the chain outlives the call.
         unsafe { instance.get_physical_device_properties2(p, &mut props) };
-        let base = props.properties;
-        if vk::api_version_major(base.api_version) < 1
-            || (vk::api_version_major(base.api_version) == 1
-                && vk::api_version_minor(base.api_version) < 3)
-            || type_rank(base.device_type, options.allow_cpu).is_none()
-        {
-            return Ok(None);
+        if core_13 {
+            subgroup_control.min_subgroup_size = v13.min_subgroup_size;
+            subgroup_control.max_subgroup_size = v13.max_subgroup_size;
+            subgroup_control.required_subgroup_size_stages = v13.required_subgroup_size_stages;
         }
         // SAFETY: valid physical device.
         let families = unsafe { instance.get_physical_device_queue_family_properties(p) };
@@ -629,18 +716,23 @@ impl Context {
             return Ok(None);
         };
 
-        let mut f12 = vk::PhysicalDeviceVulkan12Features::default();
+        let mut bda = vk::PhysicalDeviceBufferDeviceAddressFeatures::default();
         let mut f13 = vk::PhysicalDeviceVulkan13Features::default();
-        let mut features =
-            vk::PhysicalDeviceFeatures2::default().push_next(&mut f12).push_next(&mut f13);
-        // SAFETY: as above.
+        let mut subgroup_features = vk::PhysicalDeviceSubgroupSizeControlFeatures::default();
+        let mut features = vk::PhysicalDeviceFeatures2::default().push_next(&mut bda);
+        if core_13 {
+            features = features.push_next(&mut f13);
+        } else if subgroup_extension {
+            features = features.push_next(&mut subgroup_features);
+        }
+        // SAFETY: valid physical device; the chain outlives the call.
         unsafe { instance.get_physical_device_features2(p, &mut features) };
         let shader_int64 = features.features.shader_int64 == vk::TRUE;
         let shader_int16 = features.features.shader_int16 == vk::TRUE;
-        // SAFETY: valid physical device.
-        let exts = unsafe { instance.enumerate_device_extension_properties(p) };
-        let exts = init_error("vkEnumerateDeviceExtensionProperties", exts)?;
-        let has = |name: &CStr| exts.iter().any(|e| e.extension_name_as_c_str() == Ok(name));
+        if core_13 {
+            subgroup_features.subgroup_size_control = f13.subgroup_size_control;
+            subgroup_features.compute_full_subgroups = f13.compute_full_subgroups;
+        }
         let portability_subset = has(vk::KHR_PORTABILITY_SUBSET_NAME);
         // SAFETY: valid physical device.
         let memory = unsafe { instance.get_physical_device_memory_properties(p) };
@@ -673,15 +765,19 @@ impl Context {
             ),
             driver: format!(
                 "{} {}",
-                c_string(v12.driver_name_as_c_str()),
-                c_string(v12.driver_info_as_c_str())
-            ),
-            subgroup_size: v11.subgroup_size,
-            min_subgroup_size: v13.min_subgroup_size,
-            max_subgroup_size: v13.max_subgroup_size,
-            subgroup_size_control: f13.subgroup_size_control == vk::TRUE
-                && v13.required_subgroup_size_stages.contains(vk::ShaderStageFlags::COMPUTE),
-            compute_full_subgroups: f13.compute_full_subgroups == vk::TRUE,
+                c_string(driver.driver_name_as_c_str()),
+                c_string(driver.driver_info_as_c_str())
+            )
+            .trim()
+            .to_string(),
+            subgroup_size: subgroup.subgroup_size,
+            min_subgroup_size: subgroup_control.min_subgroup_size,
+            max_subgroup_size: subgroup_control.max_subgroup_size,
+            subgroup_size_control: subgroup_features.subgroup_size_control == vk::TRUE
+                && subgroup_control
+                    .required_subgroup_size_stages
+                    .contains(vk::ShaderStageFlags::COMPUTE),
+            compute_full_subgroups: subgroup_features.compute_full_subgroups == vk::TRUE,
             max_compute_shared_memory_size: limits.max_compute_shared_memory_size,
             max_push_constants_size: limits.max_push_constants_size,
             max_compute_work_group_count: limits.max_compute_work_group_count,
@@ -689,11 +785,16 @@ impl Context {
             max_compute_work_group_invocations: limits.max_compute_work_group_invocations,
             min_storage_buffer_offset_alignment: limits.min_storage_buffer_offset_alignment,
             max_storage_buffer_range: limits.max_storage_buffer_range,
-            max_memory_allocation_size: v11.max_memory_allocation_size,
-            max_buffer_size: v13.max_buffer_size,
+            max_memory_allocation_size: allocation.max_memory_allocation_size,
+            // Vulkan 1.1 does not separately report a buffer size limit.
+            max_buffer_size: if core_13 {
+                v13.max_buffer_size
+            } else {
+                allocation.max_memory_allocation_size
+            },
             shader_int64,
             shader_int16,
-            buffer_device_address: f12.buffer_device_address == vk::TRUE,
+            buffer_device_address: bda.buffer_device_address == vk::TRUE,
             timestamp_valid_bits: family_props.timestamp_valid_bits,
             timestamp_period: limits.timestamp_period,
             memory_budget_ext: has(vk::EXT_MEMORY_BUDGET_NAME),
@@ -708,6 +809,8 @@ impl Context {
             family: family as u32,
             info,
             portability_subset,
+            api_version,
+            subgroup_extension,
         }))
     }
 
@@ -719,12 +822,39 @@ impl Context {
         memory: vk::PhysicalDeviceMemoryProperties,
         c: Candidate,
     ) -> Result<Context> {
+        let address_command = if c.api_version >= vk::API_VERSION_1_2 {
+            c"vkGetBufferDeviceAddress"
+        } else {
+            c"vkGetBufferDeviceAddressKHR"
+        };
+        // SAFETY: the device is valid and the name is either the core command
+        // or its extension alias. Both have the same Vulkan ABI.
+        let get_buffer_address =
+            unsafe { instance.get_device_proc_addr(device.handle(), address_command.as_ptr()) };
+        let Some(get_buffer_address) = get_buffer_address else {
+            // SAFETY: the device and instance have no child handles.
+            unsafe {
+                device.destroy_device(None);
+                instance.destroy_instance(None);
+            }
+            return Err(Error::Unsupported(
+                address_command.to_string_lossy().into_owned(),
+            ));
+        };
+        // SAFETY: the queried command has the VkGetBufferDeviceAddress
+        // signature.
+        let get_buffer_address = unsafe {
+            std::mem::transmute::<unsafe extern "system" fn(), vk::PFN_vkGetBufferDeviceAddress>(
+                get_buffer_address,
+            )
+        };
         let shared = Arc::new(Shared {
             _entry: entry,
             instance,
             physical: c.physical,
             device,
             memory,
+            get_buffer_address,
             failed: AtomicBool::new(false),
             allocated: AtomicU64::new(0),
             in_flight: Mutex::new(()),
@@ -825,7 +955,7 @@ impl Context {
     /// The pipelines created so far, in no particular order.
     pub fn pipelines(&self) -> Vec<Arc<Pipeline>> {
         let cache = self.pipelines.lock().unwrap_or_else(|e| e.into_inner());
-        cache.values().cloned().collect()
+        cache.values().filter_map(|p| p.as_ref().ok().cloned()).collect()
     }
 
     /// The compute pipeline of `kernel` in `variant`, created at first use.
@@ -843,12 +973,44 @@ impl Context {
         let key = (shader.name, variant, options);
         let mut cache = self.pipelines.lock().unwrap_or_else(|e| e.into_inner());
         if let Some(p) = cache.get(&key) {
-            return Ok(p.clone());
+            return p.clone();
         }
-        let p = Arc::new(self.create_pipeline(shader, variant, options)?);
-        cache.insert(key, p.clone());
-        self.save_pipeline_cache();
-        Ok(p)
+        let result = self.create_pipeline(shader, variant, options).map(Arc::new);
+        if result.is_ok() || self.should_memoize_pipeline_error(key, &result) {
+            cache.insert(key, result.clone());
+        }
+        if result.is_ok() {
+            self.save_pipeline_cache();
+        }
+        result
+    }
+
+    /// Retain the linker failure reproduced on the Adreno 660 stock Android
+    /// driver. The caller still gets the same error and can fall back to CPU.
+    fn should_memoize_pipeline_error(&self, key: Key, result: &Result<Arc<Pipeline>>) -> bool {
+        cfg!(target_os = "android")
+            && self.info.vendor_id == 0x5143
+            && self.info.device_id == 0x0606_0001
+            && matches!(self.info.api_version, (1, 1, _))
+            && matches!(
+                key,
+                (
+                    "msm_ones",
+                    Variant::Int32,
+                    PipelineOptions {
+                        workgroup: 128,
+                        subgroup: Some(64),
+                        spec: [1, 0, 0]
+                    },
+                )
+            )
+            && matches!(
+                result,
+                Err(Error::Vulkan {
+                    call: "vkCreateComputePipelines",
+                    result: vk::Result::ERROR_UNKNOWN,
+                })
+            )
     }
 
     fn save_pipeline_cache(&self) {
@@ -858,8 +1020,10 @@ impl Context {
         if self.pipeline_cache == vk::PipelineCache::null() {
             return;
         }
-        // SAFETY: valid device and pipeline cache handle; serialized by `self.pipelines`.
-        let Ok(bytes) = (unsafe { self.shared.device.get_pipeline_cache_data(self.pipeline_cache) })
+        // SAFETY: valid device and pipeline cache handle; serialized by
+        // `self.pipelines`.
+        let Ok(bytes) =
+            (unsafe { self.shared.device.get_pipeline_cache_data(self.pipeline_cache) })
         else {
             return;
         };
@@ -959,11 +1123,23 @@ impl Context {
         let create = [vk::ComputePipelineCreateInfo::default()
             .stage(stage)
             .layout(self.pipeline_layout)];
+        #[cfg(target_os = "android")]
+        trace_pipeline(format_args!(
+            "compile start kernel={} variant={variant:?} options={options:?}",
+            shader.name,
+        ));
         let t0 = Instant::now();
         // SAFETY: valid device, module and layout; the create info outlives
         // the call.
         let r = unsafe { d.create_compute_pipelines(self.pipeline_cache, &create, None) };
         let creation = t0.elapsed();
+        #[cfg(target_os = "android")]
+        trace_pipeline(format_args!(
+            "compile finish kernel={} variant={variant:?} options={options:?} result={:?} elapsed_ms={:.3}",
+            shader.name,
+            r.as_ref().map_or_else(|(_, error)| *error, |_| vk::Result::SUCCESS),
+            creation.as_secs_f64() * 1e3,
+        ));
         // SAFETY: the module is no longer needed once the pipeline exists.
         unsafe { d.destroy_shader_module(module, None) };
         let pipeline = s.check("vkCreateComputePipelines", r.map_err(|(_, e)| e))?[0];
@@ -1076,7 +1252,7 @@ impl Context {
         let i = vk::BufferDeviceAddressInfo::default().buffer(buffer);
         // SAFETY: a buffer with SHADER_DEVICE_ADDRESS usage bound to memory
         // allocated with DEVICE_ADDRESS.
-        b.address = unsafe { d.get_buffer_device_address(&i) };
+        b.address = unsafe { (s.get_buffer_address)(d.handle(), &i) };
         Ok(b)
     }
 
@@ -1794,10 +1970,13 @@ mod tests {
         c.fill(&b, 0, None, 0x0102_0304).unwrap();
         c.fill(&b, 8, Some(4), 0).unwrap();
         let mut bytes = Vec::new();
-        assert!(c.read_chunks(&b, |p| {
-            bytes.extend_from_slice(p);
-            true
-        }).unwrap());
+        assert!(
+            c.read_chunks(&b, |p| {
+                bytes.extend_from_slice(p);
+                true
+            })
+            .unwrap()
+        );
         let words: Vec<u32> =
             bytes.chunks(4).map(|w| u32::from_ne_bytes(w.try_into().unwrap())).collect();
         assert_eq!(words.len(), 1025);
