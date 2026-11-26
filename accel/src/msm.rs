@@ -68,6 +68,7 @@ macro_rules! trace {
 
 pub mod checks;
 pub mod collect;
+pub mod cpu_glv;
 pub mod effective;
 pub mod par;
 pub mod pipeline;
@@ -214,12 +215,15 @@ fn table_path<B: Backend>(
     let Some(points) = store.device() else {
         return Err(Error::Device("msm: the table was not uploaded".into()).into());
     };
+    let phi = t.phi_x(bases);
     let r = split(
         &mut s,
         Points::Table(points),
         scalars,
         bases,
         Some(&t.masks),
+        phi,
+        t.has_identity,
         trace,
     )?;
     drop(store);
@@ -249,6 +253,8 @@ fn one_shot_path<B: Backend>(
         scalars,
         bases,
         None,
+        None,
+        true,
         trace,
     )?)
 }
